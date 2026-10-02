@@ -468,6 +468,81 @@ Potential::lapw_external_xc_response(Density const& density__, Density const& de
     return map.adjoint(response);
 }
 
+xc_point_derivatives_t
+Potential::external_xc_quadrature_direction(xc_geometry_direction_t const& direction__) const
+{
+    int failed = !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_quadrature_direction_ ||
+                 direction__.atoms.size() != static_cast<size_t>(ctx_.unit_cell().num_atoms());
+    std::vector<double> lo(direction__.lattice.begin(), direction__.lattice.end());
+    for (auto const& r : direction__.atoms) {
+        lo.insert(lo.end(), r.begin(), r.end());
+    }
+    for (auto x : lo) {
+        failed |= !std::isfinite(x);
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("quadrature direction requires a host callback and finite matching atom/cell directions");
+    }
+    auto hi = lo;
+    ctx_.comm().allreduce<double, mpi::op_t::min>(lo.data(), lo.size());
+    ctx_.comm().allreduce<double, mpi::op_t::max>(hi.data(), hi.size());
+    if (lo != hi) {
+        RTE_THROW("quadrature atom/cell directions differ between context ranks");
+    }
+    auto const& q = *ctx_.cb().external_xc_points_;
+    q.validate(ctx_);
+    xc_point_derivatives_t result(q);
+    std::string message;
+    try {
+        ctx_.cb().external_xc_quadrature_direction_(ctx_, q, direction__, result);
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    failed |= result.coordinates.size() != q.coordinates.size() ||
+              result.block_centres.size() != q.block_centres.size() ||
+              result.energy_weights.size() != q.energy_weights.size() ||
+              result.descriptor_weights.size() != q.descriptor_weights.size();
+    for (auto const* a : {&result.coordinates, &result.block_centres}) {
+        for (auto const& r : *a) {
+            for (auto x : r) {
+                failed |= !std::isfinite(x);
+            }
+        }
+    }
+    for (auto const* a : {&result.energy_weights, &result.descriptor_weights}) {
+        for (auto x : *a) {
+            failed |= !std::isfinite(x);
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("host quadrature direction failed or returned invalid output: " + message);
+    }
+    return result;
+}
+
+lapw_xc_field_adjoint_t
+Potential::lapw_external_xc_geometry_response(Density const& density__,
+                                              xc_geometry_direction_t const& direction__) const
+{
+    auto quadrature = external_xc_quadrature_direction(direction__);
+    mdarray<double, 2> atoms({3, ctx_.unit_cell().num_atoms()});
+    r3::matrix<double> lattice;
+    for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
+        for (int x = 0; x < 3; x++) {
+            atoms(x, ia) = direction__.atoms[ia][x];
+        }
+    }
+    for (int y = 0; y < 3; y++) {
+        for (int x = 0; x < 3; x++) {
+            lattice(x, y) = direction__.lattice[x + 3 * y];
+        }
+    }
+    return lapw_external_xc_geometry_response(density__, quadrature, atoms, lattice);
+}
+
 lapw_xc_field_adjoint_t
 Potential::lapw_external_xc_geometry_response(Density const& density__,
                                               xc_point_derivatives_t const& quadrature_direction__,
@@ -611,6 +686,31 @@ Potential::check_external_xc_point_hessian(Density const& density__, double step
     for (size_t i = 0; i < q.block_centres.size(); i++) {
         for (int x = 0; x < 3; x++) {
             geometry.block_centres[i][x] = 0.03 * std::cos(0.17 * (i + x + 1));
+        }
+    }
+    if (ctx_.cb().external_xc_quadrature_direction_) {
+        xc_geometry_direction_t host(ctx_.unit_cell().num_atoms());
+        for (size_t ia = 0; ia < host.atoms.size(); ia++) {
+            for (int x = 0; x < 3; x++) {
+                host.atoms[ia][x] = 0.04 * std::sin(0.23 * (ia + x + 1));
+            }
+        }
+        for (size_t i = 0; i < host.lattice.size(); i++) {
+            host.lattice[i] = 0.02 * std::cos(0.17 * (i + 1));
+        }
+        // Keep independent point variations as well, to resolve symmetry-cancelled Hessian blocks.
+        auto tangent = external_xc_quadrature_direction(host);
+        for (int p = 0; p < nr; p++) {
+            geometry.energy_weights[p] += tangent.energy_weights[p];
+            geometry.descriptor_weights[p] += tangent.descriptor_weights[p];
+            for (int x = 0; x < 3; x++) {
+                geometry.coordinates[p][x] += tangent.coordinates[p][x];
+            }
+        }
+        for (size_t b = 0; b < q.block_centres.size(); b++) {
+            for (int x = 0; x < 3; x++) {
+                geometry.block_centres[b][x] += tangent.block_centres[b][x];
+            }
         }
     }
     response.rho.zero();

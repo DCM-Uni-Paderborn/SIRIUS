@@ -85,6 +85,19 @@ struct xc_geometry_derivatives_t
     }
 };
 
+/// Replicated Cartesian atom and lattice-column directions, in bohr.
+/** Atom and cell directions are independent; no affine atom displacement is implied. */
+struct xc_geometry_direction_t
+{
+    std::vector<std::array<double, 3>> atoms;
+    std::array<double, 9> lattice{};
+
+    explicit xc_geometry_direction_t(int num_atoms__)
+        : atoms(num_atoms__)
+    {
+    }
+};
+
 /// Total XC energy and primitive-field derivatives.
 /** energy is the same globally reduced energy on every context rank.
  *  For the FFT callback, derivatives are divided by the grid quadrature weight.
@@ -142,6 +155,10 @@ using xc_response_callback_t = std::function<void(Simulation_context const&, xc_
 /// Pull back local point covectors, including field sampling, to replicated atom/cell derivatives.
 using xc_quadrature_pullback_t = std::function<void(Simulation_context const&, xc_point_set_t const&,
                                                     xc_point_derivatives_t const&, xc_geometry_derivatives_t&)>;
+
+/// Differentiate the host's distributed quadrature at fixed row topology and radial/angular rules.
+using xc_quadrature_direction_callback_t = std::function<void(Simulation_context const&, xc_point_set_t const&,
+                                                              xc_geometry_direction_t const&, xc_point_derivatives_t&)>;
 
 void
 validate_external_xc_context(Simulation_context const& ctx__);

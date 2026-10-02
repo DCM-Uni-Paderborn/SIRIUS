@@ -343,6 +343,15 @@ class Potential : public Field4D
     lapw_xc_field_adjoint_t
     lapw_external_xc_response(Density const& density__, Density const& density_response__) const;
 
+    /// Host quadrature tangent for independent, replicated Cartesian atom/cell directions.
+    xc_point_derivatives_t
+    external_xc_quadrature_direction(xc_geometry_direction_t const& direction__) const;
+
+    /// XC geometry contribution using the registered host quadrature tangent.
+    /** Physical fields and radial rules remain fixed; not a complete host geometry RHS. */
+    lapw_xc_field_adjoint_t
+    lapw_external_xc_geometry_response(Density const& density__, xc_geometry_direction_t const& direction__) const;
+
     /// Geometry-induced XC covector response with the physical fields held fixed.
     /** Combines the model Hessian with forward sampling and its differentiated
      *  transpose. Point/weight/block directions and replicated Cartesian atom/cell

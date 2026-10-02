@@ -1379,14 +1379,9 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         auto original_quadrature = ctx->cb().external_xc_points_;
         xc_point_derivatives_t geometry_direction(*original_quadrature);
         r3::vector<double> translation(0.04, 0.02, -0.03);
-        mdarray<double, 2> atom_directions({3, ctx->unit_cell().num_atoms()});
-        r3::matrix<double> lattice_direction;
         std::vector<r3::vector<double>> original_atoms;
         for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
             original_atoms.push_back(ctx->unit_cell().atom(ia).position());
-            for (int x = 0; x < 3; x++) {
-                atom_directions(x, ia) = translation[x];
-            }
         }
         for (size_t p = 0; p < geometry_direction.coordinates.size(); p++) {
             for (int x = 0; x < 3; x++) {
@@ -1395,9 +1390,62 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             geometry_direction.energy_weights[p]     = 0.02 * original_quadrature->energy_weights[p];
             geometry_direction.descriptor_weights[p] = 0.03 * original_quadrature->descriptor_weights[p];
         }
-        auto geometry_response = xc_samples(potential.lapw_external_xc_geometry_response(
-                density, geometry_direction, atom_directions, lattice_direction));
-        auto geometry_sample   = [&](double step) {
+        auto host_tangent = [](auto const&, auto const& q, auto const& d, auto& out) {
+            for (size_t p = 0; p < q.coordinates.size(); p++) {
+                out.coordinates[p]        = d.atoms.front();
+                out.energy_weights[p]     = 0.5 * d.atoms.front()[0] * q.energy_weights[p];
+                out.descriptor_weights[p] = 1.5 * d.atoms.front()[1] * q.descriptor_weights[p];
+            }
+        };
+        ctx->cb().external_xc_quadrature_direction_ = host_tangent;
+        xc_geometry_direction_t host_direction(ctx->unit_cell().num_atoms());
+        for (auto& r : host_direction.atoms) {
+            r = {translation[0], translation[1], translation[2]};
+        }
+        auto host_quadrature = potential.external_xc_quadrature_direction(host_direction);
+        double host_error{0};
+        for (size_t p = 0; p < geometry_direction.coordinates.size(); p++) {
+            for (int x = 0; x < 3; x++) {
+                host_error = std::max(host_error, std::abs(host_quadrature.coordinates[p][x] - translation[x]));
+            }
+            host_error = std::max(
+                    {host_error, std::abs(host_quadrature.energy_weights[p] - geometry_direction.energy_weights[p]),
+                     std::abs(host_quadrature.descriptor_weights[p] - geometry_direction.descriptor_weights[p])});
+        }
+        check("host tangent matches the prescribed quadrature direction",
+              host_quadrature.block_centres != geometry_direction.block_centres ? 1 : host_error, 1e-13);
+        auto geometry_response = xc_samples(potential.lapw_external_xc_geometry_response(density, host_direction));
+        auto bad_host          = host_direction;
+        if (ctx->comm().rank() == 0) {
+            bad_host.atoms.clear();
+        }
+        reject("wrong host geometry shape rejected collectively",
+               [&] { potential.external_xc_quadrature_direction(bad_host); });
+        bad_host = host_direction;
+        if (ctx->comm().rank() == 0) {
+            bad_host.lattice[0] = std::numeric_limits<double>::quiet_NaN();
+        }
+        reject("nonfinite host geometry direction rejected collectively",
+               [&] { potential.external_xc_quadrature_direction(bad_host); });
+        if (ctx->comm().size() > 1) {
+            bad_host = host_direction;
+            if (ctx->comm().rank() == 0) {
+                bad_host.atoms[0][0] += 1;
+            }
+            reject("inconsistent host geometry replicas rejected collectively",
+                   [&] { potential.external_xc_quadrature_direction(bad_host); });
+        }
+        ctx->cb().external_xc_quadrature_direction_ = [](auto const& c, auto const&, auto const&, auto& out) {
+            if (c.comm().rank() == 0) {
+                out.energy_weights[0] = std::numeric_limits<double>::quiet_NaN();
+            }
+        };
+        reject("nonfinite host quadrature tangent rejected collectively",
+               [&] { potential.external_xc_quadrature_direction(host_direction); });
+        ctx->cb().external_xc_quadrature_direction_ = nullptr;
+        reject("missing host tangent is not silently treated as fixed quadrature",
+               [&] { potential.external_xc_quadrature_direction(host_direction); });
+        auto geometry_sample = [&](double step) {
             auto displacement = step * r3::dot(ctx->unit_cell().inverse_lattice_vectors(), translation);
             for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
                 ctx->unit_cell().atom(ia).set_position(original_atoms[ia] + displacement);

@@ -5819,6 +5819,45 @@ call sirius_set_xc_point_geometry_callbacks_aux(handler_ptr,field_fptr,pullback_
 end subroutine sirius_set_xc_point_geometry_callbacks
 
 !
+!> @brief Register a host quadrature forward derivative after the point XC evaluator and before context initialization. Its C signature is void direction(void* user_data, int nr, int nb, int natom, int fcomm, const int* block_sizes, const double* delta_atoms, const double* delta_lattice, double* delta_coordinates, double* delta_energy_weights, double* delta_descriptor_weights, double* delta_block_centres, int* status). Atom (3,natom) and lattice-column (3,3) directions are replicated Cartesian bohr arrays. They are independent, with no implicit affine atom motion. Outputs have the local point callback's Fortran shapes and start at zero. Differentiate both independent weights at fixed row topology and radial/angular rules. The callback is collective, including empty ranks. Set status nonzero on failure without unwinding across the C ABI. A null pointer disables it.
+!> @param [in] handler Simulation context handler.
+!> @param [in] fptr C-interoperable host quadrature direction callback.
+!> @param [in] user_data Caller-owned state retained until context destruction.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_quadrature_direction_callback(handler,fptr,user_data,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+type(C_FUNPTR), value, intent(in) :: fptr
+type(C_PTR), value, intent(in) :: user_data
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_quadrature_direction_callback_aux(handler,fptr,user_data,&
+&error_code)&
+&bind(C, name="sirius_set_xc_quadrature_direction_callback")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_FUNPTR), value :: fptr
+type(C_PTR), value :: user_data
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_quadrature_direction_callback_aux(handler_ptr,fptr,user_data,&
+&error_code_ptr)
+end subroutine sirius_set_xc_quadrature_direction_callback
+
+!
 !> @brief Register a fixed-geometry XC Hessian-vector evaluator after the point XC callback and before context initialization. Its C signature is void response(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, const double* delta_rho, const double* delta_gradient, const double* delta_tau, double* delta_vrho, double* delta_vgradient, double* delta_vtau, int* status). Fields and directions have the point callback's Fortran array shapes. Return raw directional derivatives of the entire discrete XC energy's field covectors, including nonlocal coupling. The call is collective, including empty ranks. Outputs start at zero. Set status nonzero on failure without unwinding across the C ABI. A null pointer disables the response.
 !> @param [in] handler Simulation context handler.
 !> @param [in] fptr C-interoperable XC response evaluator.

@@ -5639,10 +5639,11 @@ sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data
                 if (ctx.initialized()) {
                     RTE_THROW("register external XC before initializing the context");
                 }
-                ctx.cb().external_xc_geometry_          = nullptr;
-                ctx.cb().external_xc_pullback_          = nullptr;
-                ctx.cb().external_xc_response_          = nullptr;
-                ctx.cb().external_xc_geometry_response_ = false;
+                ctx.cb().external_xc_geometry_             = nullptr;
+                ctx.cb().external_xc_pullback_             = nullptr;
+                ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                ctx.cb().external_xc_response_             = nullptr;
+                ctx.cb().external_xc_geometry_response_    = false;
                 if (!fptr__) {
                     ctx.cb().external_xc_ = nullptr;
                     ctx.cb().external_xc_points_.reset();
@@ -5767,20 +5768,22 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                     RTE_THROW("register external point XC before initializing the context");
                 }
                 if (!fptr__) {
-                    ctx.cb().external_xc_geometry_          = nullptr;
-                    ctx.cb().external_xc_pullback_          = nullptr;
-                    ctx.cb().external_xc_response_          = nullptr;
-                    ctx.cb().external_xc_geometry_response_ = false;
-                    ctx.cb().external_xc_                   = nullptr;
+                    ctx.cb().external_xc_geometry_             = nullptr;
+                    ctx.cb().external_xc_pullback_             = nullptr;
+                    ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                    ctx.cb().external_xc_response_             = nullptr;
+                    ctx.cb().external_xc_geometry_response_    = false;
+                    ctx.cb().external_xc_                      = nullptr;
                     ctx.cb().external_xc_points_.reset();
                     return;
                 }
                 auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
                                                 descriptor_weights__, block_sizes__, block_centres__);
-                ctx.cb().external_xc_geometry_          = nullptr;
-                ctx.cb().external_xc_pullback_          = nullptr;
-                ctx.cb().external_xc_response_          = nullptr;
-                ctx.cb().external_xc_geometry_response_ = false;
+                ctx.cb().external_xc_geometry_             = nullptr;
+                ctx.cb().external_xc_pullback_             = nullptr;
+                ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                ctx.cb().external_xc_response_             = nullptr;
+                ctx.cb().external_xc_geometry_response_    = false;
                 using callback_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
                                             int const*, double const*, double const*, double const*, double const*,
                                             double*, double*, double*, double*, int*);
@@ -5986,6 +5989,83 @@ sirius_set_xc_point_geometry_callbacks(void* const* handler__, void (*field_fptr
                              out.atoms.empty() ? nullptr : out.atoms.front().data(), out.lattice.data(), &status);
                     if (status) {
                         RTE_THROW("external XC quadrature pullback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_quadrature_direction_callback:
+  doc: >-
+    Register a host quadrature forward derivative after the point XC evaluator
+    and before context initialization. Its C signature is
+    void direction(void* user_data, int nr, int nb, int natom, int fcomm,
+    const int* block_sizes, const double* delta_atoms, const double* delta_lattice,
+    double* delta_coordinates, double* delta_energy_weights,
+    double* delta_descriptor_weights, double* delta_block_centres, int* status).
+    Atom (3,natom) and lattice-column (3,3) directions are replicated Cartesian
+    bohr arrays. They are independent, with no implicit affine atom motion.
+    Outputs have the local point callback's Fortran shapes and start at zero.
+    Differentiate both independent weights at fixed row topology and radial/angular
+    rules. The callback is collective, including empty ranks. Set status nonzero
+    on failure without unwinding across the C ABI. A null pointer disables it.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable host quadrature direction callback.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_quadrature_direction_callback(void* const* handler__, void (*fptr__)(), void* user_data__,
+                                            int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx = get_sim_ctx(handler__);
+                int invalid =
+                        ctx.initialized() || (fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int enabled_min = bool(fptr__), enabled_max = enabled_min;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || enabled_min != enabled_max) {
+                    RTE_THROW(
+                            "register the quadrature direction collectively after point XC and before initialization");
+                }
+                if (!fptr__) {
+                    ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                    return;
+                }
+                using direction_t = void (*)(void*, int, int, int, int, int const*, double const*, double const*,
+                                             double*, double*, double*, double*, int*);
+                auto callback     = reinterpret_cast<direction_t>(fptr__);
+                ctx.cb().external_xc_quadrature_direction_ = [callback, user_data__](auto const& c, auto const& p,
+                                                                                     auto const& d, auto& out) {
+                    int status{0};
+                    callback(user_data__, static_cast<int>(p.coordinates.size()),
+                             static_cast<int>(p.block_sizes.size()), c.unit_cell().num_atoms(),
+                             MPI_Comm_c2f(c.comm().native()), p.block_sizes.data(),
+                             d.atoms.empty() ? nullptr : d.atoms.front().data(), d.lattice.data(),
+                             out.coordinates.empty() ? nullptr : out.coordinates.front().data(),
+                             out.energy_weights.data(), out.descriptor_weights.data(),
+                             out.block_centres.empty() ? nullptr : out.block_centres.front().data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC quadrature direction returned status " + std::to_string(status));
                     }
                 };
             },

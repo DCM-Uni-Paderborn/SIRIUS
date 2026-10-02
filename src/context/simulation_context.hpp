@@ -117,6 +117,7 @@ struct callback_functions_t
     bool external_xc_geometry_response_{false};
     xc_callback_t external_xc_geometry_{nullptr};
     xc_quadrature_pullback_t external_xc_pullback_{nullptr};
+    xc_quadrature_direction_callback_t external_xc_quadrature_direction_{nullptr};
     std::shared_ptr<xc_point_set_t const> external_xc_points_;
 };
 
