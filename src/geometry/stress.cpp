@@ -21,6 +21,122 @@
 
 namespace sirius {
 
+namespace {
+
+template <typename T>
+r3::matrix<double>
+external_xc_stress(Simulation_context& ctx, Density const& density, Potential& potential, K_point_set const& ks)
+{
+    auto geometry    = potential.external_xc_geometry(density);
+    auto const& cell = ctx.unit_cell();
+    r3::matrix<double> result;
+    for (int mu = 0; mu < 3; mu++) {
+        for (int nu = 0; nu < 3; nu++) {
+            for (int j = 0; j < 3; j++) {
+                result(mu, nu) += geometry.lattice[mu + 3 * j] * cell.lattice_vectors()(nu, j);
+            }
+            for (int ia = 0; ia < cell.num_atoms(); ia++) {
+                auto r = dot(cell.lattice_vectors(), cell.atom(ia).position());
+                result(mu, nu) += geometry.atoms[ia][mu] * r[nu];
+            }
+        }
+    }
+    result *= 1.0 / cell.omega();
+
+    // The geometry callback holds smooth Fourier fields fixed. Normalized PW
+    // orbitals add -rho and -tau on diagonal strains. PAW Q is electrostatic,
+    // and frozen atom-local fields must not be scaled with the cell volume.
+    mdarray<std::complex<double>, 2> augmentation;
+    if (cell.num_paw_atoms()) {
+        augmentation = density.generate_rho_aug();
+    }
+    double normalization{0};
+    for (int ig = 0; ig < ctx.gvec().count(); ig++) {
+        double multiplicity = ctx.gvec().reduced() && ctx.gvec().offset() + ig != 0 ? 2 : 1;
+        for (int j = 0; j < ctx.num_spins(); j++) {
+            auto rho = density.component(j).rg().f_pw_local(ig);
+            if (cell.num_paw_atoms()) {
+                rho -= augmentation(ig, j);
+            }
+            auto v = j == 0 ? potential.xc_potential().rg().f_pw_local(ig)
+                            : potential.effective_magnetic_field(0).rg().f_pw_local(ig);
+            normalization +=
+                    multiplicity * std::real(std::conj(v) * rho +
+                                             std::conj(potential.kinetic_potential().component(j).rg().f_pw_local(ig)) *
+                                                     density.kinetic_density().component(j).rg().f_pw_local(ig));
+        }
+    }
+    ctx.comm().allreduce(&normalization, 1);
+    for (int mu = 0; mu < 3; mu++) {
+        result(mu, mu) -= normalization;
+    }
+
+    // d tau / d epsilon_mu,nu also contains
+    // -sum_nk f_nk w_k Re[(D_mu psi)* D_nu psi]. Contract on the same coarse
+    // FFT grid as the variational kinetic-density operator.
+    std::vector<Smooth_periodic_function<T>> vtau;
+    for (int s = 0; s < ctx.num_spins(); s++) {
+        vtau.emplace_back(ctx.spfft_coarse<T>(), ctx.gvec_coarse_fft_sptr());
+        for (int ig = 0; ig < ctx.gvec_coarse().count(); ig++) {
+            int fine = ctx.gvec().gvec_base_mapping(ig);
+            auto t   = potential.kinetic_potential().scalar().rg().f_pw_local(fine);
+            if (ctx.num_spins() == 2) {
+                t += double(1 - 2 * s) * potential.kinetic_potential().vector(0).rg().f_pw_local(fine);
+            }
+            vtau.back().f_pw_local(ig) = static_cast<std::complex<T>>(t);
+        }
+        vtau.back().fft_transform(1);
+    }
+    r3::matrix<double> metric;
+    for (auto it : ks.spl_num_kpoints()) {
+        auto kp        = ks.get<T>(it.i);
+        auto& fft      = kp->spfft_transform();
+        auto const& gk = *kp->gkvec_fft_sptr();
+        int nr         = fft.local_slice_size();
+        std::vector<std::complex<T>> work(gk.count());
+        mdarray<std::complex<T>, 2> gradient({nr, 3});
+        for (int s = 0; s < ctx.num_spins(); s++) {
+            int nb = kp->num_occupied_bands(s);
+            if (!nb) {
+                continue;
+            }
+            wf::Wave_functions_fft<T> psi(kp->gkvec_fft_sptr(), kp->spinor_wave_functions(), wf::spin_index(s),
+                                          wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+            for (int ib = 0; ib < psi.num_wf_local(); ib++) {
+                auto band = psi.spl_num_wf().global_index(ib);
+                auto phi  = psi.at(memory_t::host, 0, wf::band_index(ib));
+                for (int x = 0; x < 3; x++) {
+                    for (int ig = 0; ig < gk.count(); ig++) {
+                        work[ig] = std::complex<T>(0, static_cast<T>(gk.gkvec_cart(ig)[x])) * phi[ig];
+                    }
+                    fft.backward(reinterpret_cast<T const*>(work.data()), SPFFT_PU_HOST);
+                    auto ptr = fft.space_domain_data(SPFFT_PU_HOST);
+                    for (int ir = 0; ir < nr; ir++) {
+                        gradient(ir, x) = fft.type() == SPFFT_TRANS_R2C
+                                                  ? std::complex<T>(ptr[ir], 0)
+                                                  : reinterpret_cast<std::complex<T> const*>(ptr)[ir];
+                    }
+                }
+                double weight = kp->weight() * kp->band_occupancy(band, s) /
+                                (cell.omega() * fft.dim_x() * fft.dim_y() * fft.dim_z());
+                for (int mu = 0; mu < 3; mu++) {
+                    for (int nu = 0; nu < 3; nu++) {
+                        for (int ir = 0; ir < nr; ir++) {
+                            metric(mu, nu) -= weight * vtau[s].value(ir) *
+                                              std::real(std::conj(gradient(ir, mu)) * gradient(ir, nu));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ctx.comm().allreduce(&metric(0, 0), 9);
+    result += metric;
+    return result;
+}
+
+} // namespace
+
 template <typename T, typename F>
 void
 Stress::calc_stress_nonloc_aux()
@@ -75,10 +191,10 @@ Stress::calc_stress_nonloc_aux()
 r3::matrix<double>
 Stress::calc_stress_total()
 {
-    if (ctx_.cb().external_xc_) {
-        RTE_THROW("external XC cell derivatives are not connected to stress yet");
+    if (ctx_.cb().external_xc_ && ctx_.full_potential()) {
+        RTE_THROW("external LAPW XC stress requires basis and boundary derivatives");
     }
-    if (ctx_.meta_gga()) {
+    if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
         RTE_THROW("meta-GGA cell derivatives are not connected to stress yet");
     }
     calc_stress_kin();
@@ -224,6 +340,11 @@ Stress::calc_stress_core()
 {
     stress_core_.zero();
 
+    if (ctx_.cb().external_xc_) {
+        // Frozen AE core fields are differentiated by the point reconstruction.
+        return stress_core_;
+    }
+
     bool empty = true;
 
     /* check if the core atomic wave functions are set up or not */
@@ -289,6 +410,21 @@ r3::matrix<double>
 Stress::calc_stress_xc()
 {
     stress_xc_.zero();
+
+    if (ctx_.cb().external_xc_) {
+        if (ctx_.full_potential()) {
+            RTE_THROW("external LAPW XC stress requires basis and boundary derivatives");
+        }
+        if (ctx_.cfg().parameters().precision_wf() == "fp32") {
+#if defined(SIRIUS_USE_FP32)
+            stress_xc_ = external_xc_stress<float>(ctx_, density_, potential_, kset_);
+#endif
+        } else {
+            stress_xc_ = external_xc_stress<double>(ctx_, density_, potential_, kset_);
+        }
+        symmetrize_stress_tensor(ctx_.unit_cell().symmetry(), stress_xc_);
+        return stress_xc_;
+    }
 
     /* Calculating the exchange functional contribution can be tricky when vdw functional is present.
      * The contribution to the stress tensor coming from vdw has three terms. The first term is common
@@ -434,6 +570,9 @@ Stress::calc_stress_us()
     }
 
     potential_.fft_transform(-1);
+    if (ctx_.cb().external_xc_) {
+        potential_.xc_potential().rg().fft_transform(-1);
+    }
 
     la::lib_t la{la::lib_t::none};
     memory_t qmem{memory_t::none};
@@ -503,8 +642,12 @@ Stress::calc_stress_us()
                         double g = gvc.length();
 
                         for (int ia = 0; ia < atom_type.num_atoms(); ia++) {
-                            auto z = phase_factors(ia, igloc) * potential_.component(ispin).rg().f_pw_local(igloc) *
-                                     (-gvc[mu] / g);
+                            auto v = potential_.component(ispin).rg().f_pw_local(igloc);
+                            if (ctx_.cb().external_xc_) {
+                                v -= ispin == 0 ? potential_.xc_potential().rg().f_pw_local(igloc)
+                                                : potential_.effective_magnetic_field(ispin - 1).rg().f_pw_local(igloc);
+                            }
+                            auto z                   = phase_factors(ia, igloc) * v * (-gvc[mu] / g);
                             v_tmp(ia, 2 * igloc)     = z.real();
                             v_tmp(ia, 2 * igloc + 1) = z.imag();
                         }

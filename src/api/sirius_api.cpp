@@ -5665,8 +5665,8 @@ sirius_set_xc_point_callback:
     supplied quadrature. CPU scalar/collinear PW and PAW are supported, without
     symmetry reduction. PAW requires explicitly supplied positive core tau.
     Nonrelativistic FP-LAPW fields are also supported. PW and PAW atomic forces
-    additionally require the point geometry callbacks. FP-LAPW forces, stress
-    and SOC are not supported by this point path.
+    and stress additionally require the point geometry callbacks. FP-LAPW forces
+    and stress, and SOC are not supported by this point path.
   arguments:
     handler:
       type: ctx_handler
@@ -5729,12 +5729,12 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                 if (!fptr__) {
                     ctx.cb().external_xc_geometry_ = nullptr;
                     ctx.cb().external_xc_pullback_ = nullptr;
-                    ctx.cb().external_xc_ = nullptr;
+                    ctx.cb().external_xc_          = nullptr;
                     ctx.cb().external_xc_points_.reset();
                     return;
                 }
                 auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
-                                               descriptor_weights__, block_sizes__, block_centres__);
+                                                descriptor_weights__, block_sizes__, block_centres__);
                 ctx.cb().external_xc_geometry_ = nullptr;
                 ctx.cb().external_xc_pullback_ = nullptr;
                 using callback_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
@@ -5749,11 +5749,11 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                     auto const& p = *in.points;
                     int status{0};
                     callback(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
-                                    MPI_Comm_c2f(c.comm().native()),
+                             MPI_Comm_c2f(c.comm().native()),
                              p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
-                                    p.descriptor_weights.data(), p.block_sizes.data(),
+                             p.descriptor_weights.data(), p.block_sizes.data(),
                              p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
-                                    in.tau, &out.energy, out.vrho, out.vgradient, out.vtau, &status);
+                             in.tau, &out.energy, out.vrho, out.vgradient, out.vtau, &status);
                     if (status) {
                         RTE_THROW("external point XC callback returned status " + std::to_string(status));
                     }
@@ -5815,8 +5815,9 @@ sirius_update_xc_point_set:
 */
 void
 sirius_update_xc_point_set(void* const* handler__, int const* num_points__, int const* num_blocks__,
-                         double const* coordinates__, double const* energy_weights__, double const* descriptor_weights__,
-                         int const* block_sizes__, double const* block_centres__, int* error_code__)
+                           double const* coordinates__, double const* energy_weights__,
+                           double const* descriptor_weights__, int const* block_sizes__, double const* block_centres__,
+                           int* error_code__)
 {
     call_sirius(
             [&]() {
@@ -5827,7 +5828,7 @@ sirius_update_xc_point_set(void* const* handler__, int const* num_points__, int 
                     RTE_THROW("updating XC points requires an initialized external point XC context");
                 }
                 auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
-                                               descriptor_weights__, block_sizes__, block_centres__);
+                                                descriptor_weights__, block_sizes__, block_centres__);
                 ctx.cb().external_xc_points_ = std::move(points);
             },
             error_code__);
@@ -5855,7 +5856,7 @@ sirius_set_xc_point_geometry_callbacks:
     Callbacks are collective, including empty ranks. Outputs start at zero.
     Set status nonzero on failure without unwinding across the C ABI.
     Both null pointers disable geometry evaluation. For PW and PAW, these callbacks
-    supply the explicit XC contribution to atomic forces. FP-LAPW forces and stress
+    supply the explicit XC contribution to atomic forces and stress. FP-LAPW forces and stress
     require additional basis and geometry responses.
   arguments:
     handler:

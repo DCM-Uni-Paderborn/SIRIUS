@@ -25,6 +25,10 @@ test_functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc
     mpi::Communicator comm(in.points ? ctx.comm().native() : ctx.spfft<double>().communicator());
     comm.allreduce(&moment, 1);
     double volume = ctx.unit_cell().omega();
+    if (in.points) {
+        volume = std::accumulate(in.points->descriptor_weights.begin(), in.points->descriptor_weights.end(), 0.0);
+        comm.allreduce(&volume, 1);
+    }
     double e{0};
     for (int s = 0; s < in.num_spins; s++) {
         for (int ir = 0; ir < nr; ir++) {
@@ -33,13 +37,21 @@ test_functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc
             double w     = in.points ? in.points->energy_weights[ir] : in.point_weight;
             double d     = in.points ? in.points->descriptor_weights[ir] : in.point_weight;
             double scale = in.points ? 1 : 1 / in.point_weight;
-            e += w * (0.7 * n * n + 0.3 * t * t + 0.2 * n * t);
-            out.vrho[j] = scale * w * (1.4 * n + 0.2 * t);
-            out.vtau[j] = scale * (w * (0.6 * t + 0.2 * n) + d * 0.4 * moment / volume);
+            double local = 0.7 * n * n + 0.3 * t * t + 0.2 * n * t;
+            out.vrho[j]  = scale * w * (1.4 * n + 0.2 * t);
+            out.vtau[j]  = scale * (w * (0.6 * t + 0.2 * n) + d * 0.4 * moment / volume);
             for (int x = 0; x < 3; x++) {
                 int k = ir + nr * (x + 3 * s);
-                e += w * 0.1 * in.gradient[k] * in.gradient[k];
+                local += 0.1 * in.gradient[k] * in.gradient[k];
                 out.vgradient[k] = scale * w * 0.2 * in.gradient[k];
+            }
+            e += w * local;
+            if (out.geometry) {
+                out.geometry->energy_weights[ir] += local;
+                out.geometry->descriptor_weights[ir] += 0.4 * moment * t / volume;
+                if (s == 0) {
+                    out.geometry->descriptor_weights[ir] -= 0.2 * moment * moment / (volume * volume);
+                }
             }
         }
     }
@@ -787,32 +799,44 @@ test_external_scf(bool exact, bool external, bool paw = false)
 }
 
 int
-test_external_forces(bool paw, int mag)
+test_external_geometry(bool paw, int mag, bool strain, bool gamma)
 {
     auto calculate = [&](double displacement, bool get_force) {
         std::array<double, 3> direction{0.7, -0.4, 0.2};
+        r3::matrix<double> deformation{{0.3, 0.1, -0.07}, {0.1, -0.2, 0.06}, {-0.07, 0.06, 0.15}};
         auto setup = [&](Simulation_context& ctx) {
+            if (gamma) {
+                ctx.cfg().mixer().beta(0.2);
+            }
             std::array<double, 3> lengths{8, 9, 10};
-            ctx.unit_cell().atom(0).set_position({0.2 + displacement * direction[0] / lengths[0],
-                                                  0.3 + displacement * direction[1] / lengths[1],
-                                                  0.4 + displacement * direction[2] / lengths[2]});
+            if (strain) {
+                auto lattice = ctx.unit_cell().lattice_vectors();
+                lattice += dot(deformation, lattice) * displacement;
+                ctx.unit_cell().set_lattice_vectors(lattice);
+            } else {
+                ctx.unit_cell().atom(0).set_position({0.2 + displacement * direction[0] / lengths[0],
+                                                      0.3 + displacement * direction[1] / lengths[1],
+                                                      0.4 + displacement * direction[2] / lengths[2]});
+            }
             ctx.unit_cell().add_atom("He", {0.48, 0.51, 0.59});
-            auto q = std::make_shared<xc_point_set_t>(ctx);
+            auto const& lattice = ctx.unit_cell().lattice_vectors();
+            auto q              = std::make_shared<xc_point_set_t>(ctx);
             // Atom-following blocks sample the full cell. Unoccupied point ranks
             // and k-point ranks must still participate in the geometry pullback.
             if (ctx.comm().rank() == 0) {
                 for (int ia = 0; ia < 2; ia++) {
-                    auto r = ctx.unit_cell().atom(ia).position();
-                    q->block_centres.push_back({lengths[0] * r[0], lengths[1] * r[1], lengths[2] * r[2]});
+                    auto r      = ctx.unit_cell().atom(ia).position();
+                    auto centre = dot(lattice, r);
+                    q->block_centres.push_back({centre[0], centre[1], centre[2]});
                     q->block_sizes.push_back(64);
                     for (int z = 0; z < 4; z++) {
                         for (int y = 0; y < 4; y++) {
                             for (int x = 0; x < 4; x++) {
-                                q->coordinates.push_back({lengths[0] * (r[0] + 0.037 + x / 4.0),
-                                                          lengths[1] * (r[1] + 0.029 + y / 4.0),
-                                                          lengths[2] * (r[2] + 0.041 + z / 4.0)});
-                                q->energy_weights.push_back(720.0 / 128);
-                                q->descriptor_weights.push_back(720.0 / 128);
+                                auto p = dot(lattice,
+                                             r + r3::vector<double>(0.037 + x / 4.0, 0.029 + y / 4.0, 0.041 + z / 4.0));
+                                q->coordinates.push_back({p[0], p[1], p[2]});
+                                q->energy_weights.push_back(lattice.det() / 128);
+                                q->descriptor_weights.push_back(lattice.det() / 128);
                             }
                         }
                     }
@@ -822,11 +846,24 @@ test_external_forces(bool paw, int mag)
             ctx.cb().external_xc_geometry_ = test_functional;
             ctx.cb().external_xc_pullback_ = [](auto const& c, auto const& points, auto const& d, auto& result) {
                 int offset{0};
+                auto inverse = r3::inverse(c.unit_cell().lattice_vectors());
                 for (size_t ia = 0; ia < points.block_sizes.size(); ia++) {
                     for (int x = 0; x < 3; x++) {
                         result.atoms[ia][x] += d.block_centres[ia][x];
                         for (int i = 0; i < points.block_sizes[ia]; i++) {
-                            result.atoms[ia][x] += d.coordinates[offset + i][x];
+                            int p = offset + i;
+                            result.atoms[ia][x] += d.coordinates[p][x];
+                            r3::vector<double> relative;
+                            for (int j = 0; j < 3; j++) {
+                                relative[j] = points.coordinates[p][j] - points.block_centres[ia][j];
+                            }
+                            auto fractional = dot(inverse, relative);
+                            for (int j = 0; j < 3; j++) {
+                                result.lattice[x + 3 * j] += d.coordinates[p][x] * fractional[j] +
+                                                             (d.energy_weights[p] * points.energy_weights[p] +
+                                                              d.descriptor_weights[p] * points.descriptor_weights[p]) *
+                                                                     inverse(j, x);
+                            }
                         }
                     }
                     offset += points.block_sizes[ia];
@@ -834,27 +871,42 @@ test_external_forces(bool paw, int mag)
                 for (auto& r : result.atoms) {
                     c.comm().allreduce(r.data(), 3);
                 }
+                c.comm().allreduce(result.lattice.data(), 9);
             };
         };
-        auto ctx = test_context(false, mag, true, true, false, true, mag ? 0.6 : 0, paw, false, "gaussian", 0, setup);
+        auto ctx = test_context(gamma, mag, true, !gamma, strain && !gamma, true, mag ? 0.6 : 0, paw, false, "gaussian",
+                                0, setup);
         K_point_set ks(*ctx);
-        ks.add_kpoint({0.07, 0.03, 0.02}, 0.4);
-        ks.add_kpoint({-0.06, 0.02, -0.04}, 0.6);
+        if (gamma) {
+            ks.add_kpoint({0, 0, 0}, 1);
+        } else {
+            ks.add_kpoint({0.07, 0.03, 0.02}, 0.4);
+            ks.add_kpoint({-0.06, 0.02, -0.04}, 0.6);
+        }
         ks.initialize();
         DFT_ground_state gs(ks);
         gs.initial_state();
         auto result = gs.find(1e-11, 1e-12, 1e-11, 150, false);
         if (!result.at("converged").get<bool>()) {
-            RTE_THROW("force finite-difference SCF did not converge");
+            RTE_THROW("geometry finite-difference SCF did not converge");
         }
         double derivative{0};
         if (get_force) {
-            auto e        = gs.total_energy();
-            auto const& f = gs.forces().calc_forces_total();
-            for (int x = 0; x < 3; x++) {
-                derivative -= f(x, 0) * direction[x];
-                if (!std::isfinite(f(x, 0)) || std::abs(f(x, 0) + f(x, 1)) > 2e-7) {
-                    RTE_THROW("external XC forces violate translation invariance");
+            auto e = gs.total_energy();
+            if (strain) {
+                auto stress = gs.stress().calc_stress_total();
+                for (int mu = 0; mu < 3; mu++) {
+                    for (int nu = 0; nu < 3; nu++) {
+                        derivative += ctx->unit_cell().omega() * stress(mu, nu) * deformation(mu, nu);
+                    }
+                }
+            } else {
+                auto const& f = gs.forces().calc_forces_total();
+                for (int x = 0; x < 3; x++) {
+                    derivative -= f(x, 0) * direction[x];
+                    if (!std::isfinite(f(x, 0)) || std::abs(f(x, 0) + f(x, 1)) > 2e-7) {
+                        RTE_THROW("external XC forces violate translation invariance");
+                    }
                 }
             }
             if (e != gs.total_energy()) {
@@ -863,12 +915,16 @@ test_external_forces(bool paw, int mag)
             ctx->cb().external_xc_geometry_ = nullptr;
             bool rejected{false};
             try {
-                gs.forces().calc_forces_total();
+                if (strain) {
+                    gs.stress().calc_stress_total();
+                } else {
+                    gs.forces().calc_forces_total();
+                }
             } catch (std::exception const&) {
                 rejected = true;
             }
             if (!rejected) {
-                RTE_THROW("forces accepted an incomplete external XC geometry registration");
+                RTE_THROW("geometry derivative accepted an incomplete external XC registration");
             }
         }
         // With fractional occupations the variational force differentiates E-TS.
@@ -880,8 +936,9 @@ test_external_forces(bool paw, int mag)
         double fd    = (calculate(h, false)[0] - calculate(-h, false)[0]) / (2 * h);
         double error = std::abs(fd - centre[1]);
         if (mpi::Communicator::world().rank() == 0) {
-            std::cout << "External XC total force PAW=" << paw << " spin=" << mag << " h=" << h
-                      << " derivative=" << centre[1] << " FD=" << fd << " error=" << error << '\n';
+            std::cout << "External XC " << (strain ? "strain" : "force") << " PAW=" << paw << " spin=" << mag
+                      << " gamma=" << gamma << " h=" << h << " derivative=" << centre[1] << " FD=" << fd
+                      << " error=" << error << '\n';
         }
         failures += !std::isfinite(error) || error > 2e-6;
     }
@@ -964,8 +1021,14 @@ main(int argc, char** argv)
     sirius::initialize(true);
     int result{0};
     if (argc == 2 && std::string(argv[1]) == "forces") {
-        result += call_test("external PW forces", test_external_forces, false, 0);
-        result += call_test("external PAW forces", test_external_forces, true, 1);
+        result += call_test("external PW forces", test_external_geometry, false, 0, false, false);
+        result += call_test("external PAW forces", test_external_geometry, true, 1, false, false);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    if (argc == 2 && std::string(argv[1]) == "stress") {
+        result += call_test("external PW stress", test_external_geometry, false, 0, true, true);
+        result += call_test("external PAW stress", test_external_geometry, true, 1, true, false);
         sirius::finalize();
         return std::min(result, 1);
     }
@@ -999,8 +1062,10 @@ main(int argc, char** argv)
     for (bool exact : {false, true}) {
         result += call_test("PAW SCF energy accounting", test_external_scf, exact, true, true);
     }
-    result += call_test("external PW forces", test_external_forces, false, 0);
-    result += call_test("external PAW forces", test_external_forces, true, 1);
+    result += call_test("external PW forces", test_external_geometry, false, 0, false, false);
+    result += call_test("external PAW forces", test_external_geometry, true, 1, false, false);
+    result += call_test("external PW stress", test_external_geometry, false, 0, true, true);
+    result += call_test("external PAW stress", test_external_geometry, true, 1, true, false);
     for (double moment : {2.0, -2.0, 1.2}) {
         result += call_test("fixed-spin occupations", test_fixed_spin_occupancy, moment);
     }
