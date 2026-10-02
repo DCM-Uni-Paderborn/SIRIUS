@@ -61,7 +61,8 @@ class Atom_symmetry_class
     /// Raw spherical density/tau derivatives, also used by the radial core solver.
     std::array<std::vector<double>, 2> spherical_xc_derivatives_;
 
-    using core_states_t = std::map<int, std::vector<radial_core_state_t>>;
+    using core_states_t  = std::map<int, std::vector<radial_core_state_t>>;
+    using enu_response_t = std::map<std::pair<int, int>, double>;
 
     /// List of radial functions for the LAPW basis.
     /** This array stores all the radial functions (AW and LO) and their derivatives. Radial derivatives of functions
@@ -94,6 +95,9 @@ class Atom_symmetry_class
     /// List of radial descriptor sets used to construct local orbitals.
     mutable std::vector<local_orbital_descriptor> lo_descriptors_;
 
+    void
+    update_enu_descriptors();
+
     core_states_t
     generate_core_radial_states(std::vector<double> const* direction__ = nullptr, core_states_t* response__ = nullptr,
                                 std::array<std::vector<double>, 2> const& xc_directions__ = {}) const;
@@ -101,21 +105,23 @@ class Atom_symmetry_class
     radial_solver_result_t
     solve_radial(relativity_t rel__, int dme__, int l__, double energy__, core_states_t const& core__,
                  std::vector<double> const* direction__ = nullptr, radial_solver_result_t* response__ = nullptr,
-                 core_states_t const* core_response__ = nullptr) const;
+                 core_states_t const* core_response__ = nullptr, double energy_direction__ = 0) const;
 
     /// Generate radial functions for augmented waves
     int
     generate_aw_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__, mdarray<double, 2>& sd__,
                                  core_states_t const& core__, std::vector<double> const* direction__ = nullptr,
                                  radial_basis_response_t* response__  = nullptr,
-                                 core_states_t const* core_response__ = nullptr) const;
+                                 core_states_t const* core_response__ = nullptr,
+                                 enu_response_t const* enu_response__ = nullptr) const;
 
     /// Generate local orbital raidal functions
     int
     generate_lo_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__, core_states_t const& core__,
                                  std::vector<double> const* direction__ = nullptr,
                                  radial_basis_response_t* response__    = nullptr,
-                                 core_states_t const* core_response__   = nullptr) const;
+                                 core_states_t const* core_response__   = nullptr,
+                                 enu_response_t const* enu_response__   = nullptr) const;
 
     /// Orthogonalize the radial functions.
     void
@@ -160,10 +166,12 @@ class Atom_symmetry_class
     /// Differentiate the nonrelativistic AW/LO construction without changing the stored basis or energies.
     /** Directions are changes in the spherical potential and optional raw density/tau XC covectors on the MT
      *  grid. Empty XC directions mean zero. Core projection includes the induced core-orbital response without
-     *  adding quadrature weights to the covectors. The free-atom reference remains fixed. */
+     *  adding quadrature weights to the covectors. Automatic linearisation energies follow the potential
+     *  unless update_enu__ is false. The free-atom reference remains fixed. */
     radial_basis_response_t
     radial_basis_potential_response(std::vector<double> const& direction__,
-                                    std::array<std::vector<double>, 2> const& xc_directions__ = {}) const;
+                                    std::array<std::vector<double>, 2> const& xc_directions__ = {},
+                                    bool update_enu__                                         = true) const;
 
     void
     sync_radial_functions(mpi::Communicator const& comm__, int const rank__);

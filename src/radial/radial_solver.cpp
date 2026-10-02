@@ -33,7 +33,7 @@ find_enu(relativity_t rel__, int zn__, int n__, int l__, Radial_grid<double> con
     std::vector<double> dpdr(np);
     std::vector<double> dqdr(np);
 
-    double constexpr enu_tol{1e-9};
+    double constexpr enu_tol{1e-11};
 
     std::stringstream sinfo;
     sinfo << "find_enu()" << std::endl
@@ -183,13 +183,16 @@ find_enu(relativity_t rel__, int zn__, int n__, int l__, Radial_grid<double> con
             enu_out.ebot =
                     solver.integrate_forward_until(rel__, (e1 + e2) / 2, l__, 0, chi_p, chi_q, p, dpdr, q, dqdr, false,
                                                    [&e1, &e2, sd, &surface_deriv](int iter, int nn, double& enu) {
+                                                       if (std::abs(e1 - e2) < enu_tol) {
+                                                           return true;
+                                                       }
                                                        if (surface_deriv() * sd > 0) {
                                                            e2 = enu;
                                                        } else {
                                                            e1 = enu;
                                                        }
                                                        enu = (e1 + e2) / 2.0;
-                                                       return std::abs(surface_deriv()) < enu_tol;
+                                                       return false;
                                                    });
             switch (enu__.auto_enu) {
                 case 1: {
@@ -213,6 +216,40 @@ find_enu(relativity_t rel__, int zn__, int n__, int l__, Radial_grid<double> con
     }
 
     return enu_out;
+}
+
+double
+linearization_energy_response(int zn__, int l__, Radial_grid<double> const& grid__,
+                              std::vector<double> const& potential__, enu_search_t const& enu__,
+                              std::vector<double> const& direction__)
+{
+    if (enu__.auto_enu < 1 || enu__.auto_enu > 3 || potential__.size() != static_cast<size_t>(grid__.num_points()) ||
+        !std::all_of(potential__.begin(), potential__.end(), [](double x) { return std::isfinite(x); })) {
+        RTE_THROW("invalid automatic linearisation energy response");
+    }
+    Radial_solver solver(zn__, potential__, grid__);
+    std::vector<double> unit(grid__.num_points(), 1);
+    auto boundary_response = [&](double energy, bool bottom) {
+        auto response = solver.solve_potential_response(0, l__, energy, direction__);
+        auto shift    = solver.solve_potential_response(0, l__, energy, unit);
+        auto boundary = [&](std::array<double, 3> const& u) { return bottom ? u[0] + grid__.last() * u[1] : u[0]; };
+        // F is u(R) at the band top and p'(R) at the bottom. Since V and E enter
+        // as V-E, implicit differentiation gives dE = D_V F[dV] / D_V F[1].
+        double denominator = boundary(shift.uderiv);
+        double residual    = boundary(response.value.uderiv) / denominator;
+        double derivative  = boundary(response.uderiv) / denominator;
+        if (!std::isfinite(residual) || !std::isfinite(derivative) || std::abs(residual) > 1e-7) {
+            RTE_THROW("linearisation energy response requires a converged boundary root");
+        }
+        return derivative;
+    };
+    double top = boundary_response(enu__.etop, false);
+    if (enu__.auto_enu == 3) {
+        // The coarse bottom bracket is a fixed offset from etop on each search branch.
+        return top;
+    }
+    double bottom = boundary_response(enu__.ebot, true);
+    return enu__.auto_enu == 1 ? (top + bottom) / 2 : bottom;
 }
 
 enu_search_t

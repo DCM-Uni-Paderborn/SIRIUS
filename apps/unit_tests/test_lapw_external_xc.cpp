@@ -80,7 +80,7 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
 
 auto
 context(int mag, bool distributed_fft, bool second_variation, bool core = false, bool relativistic_core = false,
-        double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false)
+        double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false, int auto_enu = 0)
 {
     auto config                               = R"({"parameters": {
         "electronic_structure_method": "full_potential_lapwlo", "use_symmetry": false,
@@ -114,11 +114,11 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     type.free_atom_density(rho);
     type.set_free_atom_radial_grid(std::move(grid));
     for (int l = 0; l <= 3; l++) {
-        type.add_aw_descriptor(std::max(core ? 2 : 1, l + 1), l, -0.3, 0, 0);
-        type.add_aw_descriptor(std::max(core ? 2 : 1, l + 1), l, -0.3, 1, 0);
+        type.add_aw_descriptor(std::max(core ? 2 : 1, l + 1), l, -0.3, 0, auto_enu);
+        type.add_aw_descriptor(std::max(core ? 2 : 1, l + 1), l, -0.3, 1, auto_enu);
     }
-    type.add_lo_descriptor(0, core ? 2 : 1, 0, -0.7, 0, 0);
-    type.add_lo_descriptor(0, core ? 2 : 1, 0, -0.7, 1, 0);
+    type.add_lo_descriptor(0, core ? 2 : 1, 0, -0.7, 0, auto_enu);
+    type.add_lo_descriptor(0, core ? 2 : 1, 0, -0.7, 1, auto_enu);
     if (core) {
         type.set_configuration(1, 0, 1, 2.0, true);
     }
@@ -802,6 +802,72 @@ test_lapw_force_response(int mag, double pw_cutoff)
 }
 
 int
+test_lapw_linearization_response()
+{
+    auto ctx = context(0, mpi::Communicator::world().size() > 1, false, false, false, 0, 5.0, false, 1);
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0.07, -0.03, 0.02}, 1);
+    ks.initialize();
+    DFT_ground_state gs(ks);
+    gs.initial_state();
+    gs.potential().update_atomic_potential();
+    ctx->unit_cell().generate_radial_functions(ctx->out());
+    ctx->unit_cell().generate_radial_integrals();
+    auto& cls        = ctx->unit_cell().atom_symmetry_class(0);
+    auto base        = cls.spherical_potential();
+    auto const& grid = cls.atom_type().radial_grid();
+    std::vector<double> direction(grid.num_points());
+    for (int ir = 0; ir < grid.num_points(); ir++) {
+        direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+    }
+    int failures{0};
+    auto check = [&](char const* name, double error, double tolerance) {
+        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+        std::cout << name << ": " << error << " (limit " << tolerance << ")\n";
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    // Test moving and frozen linearisation energies against the same occupied-state contraction.
+    for (bool update_enu : {false, true}) {
+        double analytic = gs.forces().lapw_radial_basis_derivative({direction}, {}, update_enu);
+        auto sample     = [&](double step) {
+            auto v = base;
+            for (size_t ir = 0; ir < v.size(); ir++) {
+                v[ir] += step * direction[ir];
+            }
+            cls.set_spherical_potential(v);
+            if (cls.generate_radial_functions(relativity_t::none, update_enu)) {
+                RTE_THROW("linearisation response fixture failed");
+            }
+            cls.set_spherical_potential(base);
+            ctx->unit_cell().generate_radial_integrals();
+            Hamiltonian0<double> h0(gs.potential(), false);
+            h0.generate_pw_coefs(gs.potential());
+            double value{0};
+            for (auto it : ks.spl_num_kpoints()) {
+                auto kp = ks.get<double>(it.i);
+                auto hk = h0(*kp);
+                int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                hk.set_fv_h_o(0, h, o);
+                value += occupied_lapw_lagrangian(*ctx, *kp, 0, h, o);
+            }
+            ctx->comm().allreduce(&value, 1);
+            return value;
+        };
+        std::cout << "LAPW Lagrangian update_enu=" << update_enu << '\n';
+        for (double step : {1e-2, 5e-3}) {
+            double fd = (sample(step) - sample(-step)) / (2 * step);
+            check("automatic-energy Lagrangian derivative", std::abs(fd - analytic), 2e-7);
+            check("relative automatic-energy Lagrangian derivative", std::abs((fd - analytic) / analytic), 2e-5);
+        }
+        check("nonzero automatic-energy Lagrangian derivative", std::abs(analytic) > 1e-5 ? 0 : 1, 0);
+        sample(0);
+    }
+    return failures;
+}
+
+int
 test_core_guard()
 {
     auto ctx = context(0, false, true, true, true);
@@ -892,6 +958,7 @@ main(int argc, char** argv)
         }
     }
     result += call_test("external LAPW core response guard", test_core_guard);
+    result += call_test("external LAPW linearisation response", test_lapw_linearization_response);
     result += call_test("replicated LAPW eigenvector redistribution", test_replicated_eigenvector_remap);
     sirius::finalize();
     return std::min(result, 1);

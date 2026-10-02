@@ -597,6 +597,61 @@ test_radial_potential_response()
 }
 
 int
+test_linearization_energy_response()
+{
+    int failures{0};
+    auto check = [&](char const* name, double error, double tolerance) {
+        std::cout << name << ": " << error << " (limit " << tolerance << ")\n";
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    auto grid = Radial_grid_factory<double>(radial_grid_t::power, 1601, 1e-6, 3.0, 2.0);
+    std::vector<double> v(grid.num_points()), direction(grid.num_points());
+    for (int ir = 0; ir < grid.num_points(); ir++) {
+        v[ir]         = -2 / grid[ir] + 0.2 * std::exp(-grid[ir]);
+        direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+    }
+    for (int mode : {1, 2, 3}) {
+        for (int l : {0, 1, 2}) {
+            enu_search_t initial{-0.3, -0.3, -0.3, mode};
+            auto base       = find_enu(relativity_t::none, 2, l + 1, l, grid, v, initial);
+            double analytic = linearization_energy_response(2, l, grid, v, base, direction);
+            std::cout << "Linearisation energy response mode=" << mode << " l=" << l << '\n';
+            check("nonzero linearisation energy response", std::abs(analytic) > 1e-3 ? 0 : 1, 0);
+            check("constant potential shifts linearisation energy",
+                  std::abs(linearization_energy_response(2, l, grid, v, base,
+                                                         std::vector<double>(grid.num_points(), 1)) -
+                           1),
+                  2e-12);
+            check("zero linearisation energy response",
+                  std::abs(linearization_energy_response(2, l, grid, v, base,
+                                                         std::vector<double>(grid.num_points(), 0))),
+                  0);
+            for (double step : {1e-3, 5e-4}) {
+                auto sample = [&](double h) {
+                    auto shifted = v;
+                    for (int ir = 0; ir < grid.num_points(); ir++) {
+                        shifted[ir] += h * direction[ir];
+                    }
+                    return find_enu(relativity_t::none, 2, l + 1, l, grid, shifted, base).enu;
+                };
+                check("boundary-root energy derivative",
+                      std::abs(analytic - (sample(step) - sample(-step)) / (2 * step)), 2e-6);
+            }
+            auto invalid = base;
+            invalid.etop += 0.1;
+            bool rejected{false};
+            try {
+                linearization_energy_response(2, l, grid, v, invalid, direction);
+            } catch (std::exception const&) {
+                rejected = true;
+            }
+            check("unconverged energy root rejected", rejected ? 0 : 1, 0);
+        }
+    }
+    return failures;
+}
+
+int
 test_radial_basis_response()
 {
     int failures{0};
@@ -609,10 +664,12 @@ test_radial_basis_response()
         bool core;
         bool orthogonalize;
         int part; // Potential, density covector, tau covector, or all three.
+        int auto_enu{0};
     };
-    for (auto [core, orthogonalize, part] :
+    for (auto [core, orthogonalize, part, auto_enu] :
          {setup_t{false, false, 0}, setup_t{false, true, 0}, setup_t{true, false, 0}, setup_t{true, true, 0},
-          setup_t{true, true, 1}, setup_t{true, true, 2}, setup_t{true, true, 3}}) {
+          setup_t{true, true, 1}, setup_t{true, true, 2}, setup_t{true, true, 3}, setup_t{false, true, 0, 1},
+          setup_t{false, true, 0, 2}, setup_t{false, true, 0, 3}, setup_t{true, true, 3, 1}}) {
         Simulation_parameters parameters;
         parameters.valence_relativity("none");
         parameters.core_relativity("none");
@@ -642,14 +699,15 @@ test_radial_basis_response()
         }
         for (int l = 0; l <= 3; l++) {
             for (int order = 0; order < (l < 2 ? 3 : (l == 2 ? 2 : 1)); order++) {
-                type.add_aw_descriptor(l + 1, l, -0.3, order, 0);
+                type.add_aw_descriptor(std::max(core ? 2 : 1, l + 1), l, -0.3, order, auto_enu);
             }
         }
         // Two and three boundary conditions, with two LOs of the same l to test orthogonalization.
         for (int l : {0, 1}) {
             for (int lo : {0, 1}) {
                 for (int order = 0; order < 2 + lo; order++) {
-                    type.add_lo_descriptor(2 * l + lo, l + 1, l, lo ? 0.8 : -0.7, order, 0);
+                    type.add_lo_descriptor(2 * l + lo, std::max(core ? 2 : 1, l + 1), l, lo ? 0.8 : -0.7, order,
+                                           auto_enu);
                 }
             }
         }
@@ -719,8 +777,23 @@ test_radial_basis_response()
             return values;
         };
         auto baseline = sample(0);
-        auto response = cls.radial_basis_potential_response(direction, xc_direction);
-        auto zero     = cls.radial_basis_potential_response(std::vector<double>(grid.num_points(), 0));
+        auto energies = [&]() {
+            std::vector<double> values;
+            for (int l = 0; l < cls.num_aw_descriptors(); l++) {
+                for (auto const& d : cls.aw_descriptor(l)) {
+                    values.push_back(d.enu);
+                }
+            }
+            for (int i = 0; i < cls.num_lo_descriptors(); i++) {
+                for (auto const& d : cls.lo_descriptor(i).rsd_set) {
+                    values.push_back(d.enu);
+                }
+            }
+            return values;
+        };
+        auto baseline_energies = energies();
+        auto response          = cls.radial_basis_potential_response(direction, xc_direction);
+        auto zero              = cls.radial_basis_potential_response(std::vector<double>(grid.num_points(), 0));
         std::vector<double> analytic(response.radial_functions.begin(), response.radial_functions.end());
         analytic.insert(analytic.end(), response.surface_derivatives.begin(), response.surface_derivatives.end());
         double null_error{0}, norm_error{0}, boundary_error{0}, unchanged{0};
@@ -744,14 +817,15 @@ test_radial_basis_response()
             }
         }
         std::cout << "Radial basis response core=" << core << " orthogonalize=" << orthogonalize << " part=" << part
-                  << '\n';
+                  << " auto_enu=" << auto_enu << '\n';
         check("unchanged stored radial basis", unchanged, 0);
+        check("unchanged stored linearisation energies", baseline_energies == energies() ? 0 : 1, 0);
         check("unchanged stored radial fields",
               cls.spherical_potential() == potential && cls.spherical_xc_derivatives() == fields ? 0 : 1, 0);
         check("zero basis response", null_error, 0);
         check("basis normalization response", norm_error, 2e-9);
         check("LO boundary response", boundary_error, 2e-10);
-        double step = core ? 1e-3 : 1e-4;
+        double step = auto_enu ? 1e-2 : (core ? 1e-3 : 1e-4);
         for (double h : {step, step / 2}) {
             auto plus = sample(h), minus = sample(-h);
             double error{0}, peak{0};
@@ -840,6 +914,7 @@ main(int argc, char** argv)
     int result = call_test("test_radial_core_solver", test_radial_core_solver);
     result += call_test("test_radial_core_response", test_radial_core_response);
     result += call_test("test_radial_potential_response", test_radial_potential_response);
+    result += call_test("test_linearization_energy_response", test_linearization_energy_response);
     result += call_test("test_radial_basis_response", test_radial_basis_response);
     sirius::finalize();
     return result;

@@ -1334,6 +1334,12 @@ enu_search_t
 find_enu(relativity_t rel__, int zn__, int n__, int l__, Radial_grid<double> const& radial_grid__,
          std::vector<double> const& v__, enu_search_t const& enu__);
 
+/// Differentiate the nonrelativistic boundary conditions defining a stored linearisation energy.
+double
+linearization_energy_response(int zn__, int l__, Radial_grid<double> const& grid__,
+                              std::vector<double> const& potential__, enu_search_t const& enu__,
+                              std::vector<double> const& direction__);
+
 }; // namespace sirius
 
 #endif // __RADIAL_SOLVER_HPP__
