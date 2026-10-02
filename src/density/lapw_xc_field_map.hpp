@@ -95,6 +95,47 @@ class LAPW_xc_field_map
         check(invalid, "LAPW XC field map: invalid point covectors");
     }
 
+    void
+    check_geometry_direction(std::vector<r3::vector<double>> const& points__, mdarray<double, 2> const& atoms__,
+                             r3::matrix<double> const& lattice__) const
+    {
+        bool invalid = points__.size() != static_cast<size_t>(num_points_) || atoms__.size(0) != 3 ||
+                       atoms__.size(1) != ctx_.unit_cell().num_atoms();
+        for (auto const& p : points__) {
+            for (int x = 0; x < 3; x++) {
+                invalid |= !std::isfinite(p[x]);
+            }
+        }
+        std::vector<double> lo, hi;
+        for (size_t i = 0; i < atoms__.size(); i++) {
+            invalid |= !std::isfinite(atoms__[i]);
+            lo.push_back(atoms__[i]);
+        }
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                invalid |= !std::isfinite(lattice__(x, y));
+                lo.push_back(lattice__(x, y));
+            }
+        }
+        check(invalid, "LAPW XC geometry response: incompatible or nonfinite direction");
+        hi = lo;
+        ctx_.comm().allreduce<double, mpi::op_t::min>(lo.data(), lo.size());
+        ctx_.comm().allreduce<double, mpi::op_t::max>(hi.data(), hi.size());
+        check(lo != hi, "LAPW XC geometry response: atom or lattice directions differ between ranks");
+    }
+
+    std::vector<r3::vector<double>>
+    displacement_directions(source_t const& source__, int ia__, std::vector<r3::vector<double>> const& points__,
+                            mdarray<double, 2> const& atoms__, r3::matrix<double> const& lattice__) const
+    {
+        std::vector<r3::vector<double>> result;
+        r3::vector<double> atom({atoms__(0, ia__), atoms__(1, ia__), atoms__(2, ia__)});
+        for (size_t j = 0; j < source__.targets.size(); j++) {
+            result.push_back(points__[source__.targets[j]] - atom - r3::dot(lattice__, source__.images[j]));
+        }
+        return result;
+    }
+
   public:
     LAPW_xc_field_map(Density const& density__, std::vector<r3::vector<double>> const& points__)
         : ctx_(density__.ctx())
@@ -215,6 +256,65 @@ class LAPW_xc_field_map
         return result;
     }
 
+    /// Geometry direction of the sampled fields, at fixed physical MT fields and Fourier coefficients.
+    /** Point directions are local. Cartesian atom and lattice directions are
+     *  replicated on the context communicator. MT radii, radial grids and
+     *  point-domain membership are fixed; basis and boundary responses are separate.
+     */
+    xc_point_fields_t
+    geometry_response(std::vector<Smooth_periodic_function<double>> const& rho__,
+                      std::vector<Smooth_periodic_function<double>> const& tau__,
+                      std::vector<r3::vector<double>> const& point_directions__,
+                      mdarray<double, 2> const& atom_directions__, r3::matrix<double> const& lattice_direction__) const
+    {
+        int ns = ctx_.num_spins();
+        check(rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns),
+              "LAPW XC geometry response: incompatible spin fields");
+        check_geometry_direction(point_directions__, atom_directions__, lattice_direction__);
+        xc_point_fields_t result(num_points_, ns);
+        std::vector<r3::vector<double>> interstitial_directions;
+        for (auto p : interstitial_targets_) {
+            interstitial_directions.push_back(point_directions__[p]);
+        }
+        for (int s = 0; s < ns; s++) {
+            auto r = interstitial_->geometry_response(rho__[s], interstitial_directions, lattice_direction__);
+            auto t = interstitial_->geometry_response(tau__[s], interstitial_directions, lattice_direction__);
+            for (size_t j = 0; j < interstitial_targets_.size(); j++) {
+                int p            = interstitial_targets_[j];
+                result.rho(p, s) = r[j][0];
+                result.tau(p, s) = t[j][0];
+                for (int x = 0; x < 3; x++) {
+                    result.gradient(p, x, s) = r[j][x + 1];
+                }
+            }
+        }
+        bool failed{false};
+        try {
+            for (size_t ia = 0; ia < sources_.size(); ia++) {
+                auto const& source = sources_[ia];
+                auto directions    = displacement_directions(source, static_cast<int>(ia), point_directions__,
+                                                             atom_directions__, lattice_direction__);
+                for (size_t j = 0; j < source.targets.size(); j++) {
+                    int p = source.targets[j];
+                    for (int s = 0; s < ns; s++) {
+                        auto r           = source.rho[s].position_response(source.displacements[j], directions[j]);
+                        auto t           = source.tau[s].position_response(source.displacements[j], directions[j]);
+                        result.rho(p, s) = r[0];
+                        result.tau(p, s) = t[0];
+                        for (int x = 0; x < 3; x++) {
+                            result.gradient(p, x, s) = r[x + 1];
+                        }
+                    }
+                }
+            }
+        } catch (std::exception const&) {
+            failed = true;
+        }
+        check(failed, "LAPW XC geometry response: MT evaluation failed on a context rank");
+        check_covectors(result);
+        return result;
+    }
+
     /// Geometry response at fixed Fourier coefficients and physical MT fields.
     /** Point-domain membership and MT radii remain fixed. This differentiates
      *  sampling within each domain, not crossings of the MT boundary or the
@@ -278,19 +378,16 @@ class LAPW_xc_field_map
         return result;
     }
 
-    /// Adjoint of the discrete, fixed-geometry field selection and sampling.
-    /** MT gradients return through the spherical interpolation transpose, not
-     *  through a separately discretized divergence. Interstitial potentials
-     *  already exclude MT points and must not acquire a second sphere mask.
-     *  Core covectors are retained for the separate radial core response. Local
-     *  valence covectors are not contracted with this snapshot's radial basis,
-     *  which may be updated before the next Hamiltonian is built.
-     */
+  private:
     lapw_xc_field_adjoint_t
-    adjoint(xc_point_fields_t const& d__) const
+    adjoint_impl(xc_point_fields_t const& d__, std::vector<r3::vector<double>> const* point_directions__,
+                 mdarray<double, 2> const* atom_directions__, r3::matrix<double> const* lattice_direction__) const
     {
         int ns = ctx_.num_spins();
         check_covectors(d__);
+        if (point_directions__) {
+            check_geometry_direction(*point_directions__, *atom_directions__, *lattice_direction__);
+        }
         lapw_xc_field_adjoint_t result;
         bool failed{false};
         try {
@@ -300,6 +397,11 @@ class LAPW_xc_field_map
                 result.local.emplace_back();
                 result.core.push_back(
                         {std::vector<double>(type.num_mt_points()), std::vector<double>(type.num_mt_points())});
+                std::vector<r3::vector<double>> directions;
+                if (point_directions__) {
+                    directions = displacement_directions(source, static_cast<int>(ia), *point_directions__,
+                                                         *atom_directions__, *lattice_direction__);
+                }
                 for (int s = 0; s < ns; s++) {
                     std::vector<std::array<double, 4>> dr(source.targets.size()), dt(source.targets.size());
                     for (size_t j = 0; j < source.targets.size(); j++) {
@@ -307,8 +409,14 @@ class LAPW_xc_field_map
                         dr[j] = {d__.rho(p, s), d__.gradient(p, 0, s), d__.gradient(p, 1, s), d__.gradient(p, 2, s)};
                         dt[j] = {d__.tau(p, s), 0, 0, 0};
                     }
-                    result.local.back()[0].push_back(source.rho[s].adjoint(source.displacements, dr));
-                    result.local.back()[1].push_back(source.tau[s].adjoint(source.displacements, dt));
+                    result.local.back()[0].push_back(
+                            point_directions__
+                                    ? source.rho[s].geometry_adjoint_response(source.displacements, dr, directions)
+                                    : source.rho[s].adjoint(source.displacements, dr));
+                    result.local.back()[1].push_back(
+                            point_directions__
+                                    ? source.tau[s].geometry_adjoint_response(source.displacements, dt, directions)
+                                    : source.tau[s].adjoint(source.displacements, dt));
                     for (int ir = 0; ir < type.num_mt_points(); ir++) {
                         result.core.back()[0][ir] += result.local.back()[0][s](0, ir) / (ns * y00);
                         result.core.back()[1][ir] += result.local.back()[1][s](0, ir) / (ns * y00);
@@ -349,6 +457,12 @@ class LAPW_xc_field_map
             }
         }
         validate();
+        std::vector<r3::vector<double>> interstitial_directions;
+        if (point_directions__) {
+            for (auto p : interstitial_targets_) {
+                interstitial_directions.push_back((*point_directions__)[p]);
+            }
+        }
         for (int s = 0; s < ns; s++) {
             result.rho.emplace_back(ctx_.spfft<double>(), ctx_.gvec_fft_sptr());
             result.tau.emplace_back(ctx_.spfft<double>(), ctx_.gvec_fft_sptr());
@@ -358,8 +472,15 @@ class LAPW_xc_field_map
                 dr[j] = {d__.rho(p, s), d__.gradient(p, 0, s), d__.gradient(p, 1, s), d__.gradient(p, 2, s)};
                 dt[j] = {d__.tau(p, s), 0, 0, 0};
             }
-            interstitial_->adjoint(dr, result.rho.back());
-            interstitial_->adjoint(dt, result.tau.back());
+            if (point_directions__) {
+                interstitial_->geometry_adjoint_response(dr, interstitial_directions, *lattice_direction__,
+                                                         result.rho.back());
+                interstitial_->geometry_adjoint_response(dt, interstitial_directions, *lattice_direction__,
+                                                         result.tau.back());
+            } else {
+                interstitial_->adjoint(dr, result.rho.back());
+                interstitial_->adjoint(dt, result.tau.back());
+            }
         }
         bool invalid{false};
         for (auto const* fields : {&result.rho, &result.tau}) {
@@ -371,6 +492,30 @@ class LAPW_xc_field_map
         }
         check(invalid, "LAPW XC field map: nonfinite interstitial adjoint");
         return result;
+    }
+
+  public:
+    /// Transpose of fixed-geometry sampling, before contraction with the current radial basis.
+    /** Raw MT/core covectors and volume-normalized interstitial potentials.
+     *  Gradients use the interpolation transpose, not a separate divergence.
+     *  Interstitial covectors must not acquire a second sphere mask.
+     */
+    lapw_xc_field_adjoint_t
+    adjoint(xc_point_fields_t const& d__) const
+    {
+        return adjoint_impl(d__, nullptr, nullptr, nullptr);
+    }
+
+    /// Geometry derivative of the sampling transpose, at fixed raw point covectors.
+    /** Includes reciprocal-vector, phase, periodic-image and inverse-volume
+     *  terms. Model Hessian and basis/boundary responses are separate.
+     */
+    lapw_xc_field_adjoint_t
+    geometry_adjoint_response(xc_point_fields_t const& d__, std::vector<r3::vector<double>> const& point_directions__,
+                              mdarray<double, 2> const& atom_directions__,
+                              r3::matrix<double> const& lattice_direction__) const
+    {
+        return adjoint_impl(d__, &point_directions__, &atom_directions__, &lattice_direction__);
     }
 };
 

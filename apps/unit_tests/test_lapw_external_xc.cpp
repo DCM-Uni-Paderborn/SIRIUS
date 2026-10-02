@@ -1376,6 +1376,65 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         auto point_errors                        = potential.check_external_xc_point_hessian(density, 1e-3);
         check("joint field/quadrature Hessian matches raw covector finite differences",
               std::max(point_errors[0], point_errors[1]), 2e-8);
+        auto original_quadrature = ctx->cb().external_xc_points_;
+        xc_point_derivatives_t geometry_direction(*original_quadrature);
+        r3::vector<double> translation(0.04, 0.02, -0.03);
+        mdarray<double, 2> atom_directions({3, ctx->unit_cell().num_atoms()});
+        r3::matrix<double> lattice_direction;
+        std::vector<r3::vector<double>> original_atoms;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            original_atoms.push_back(ctx->unit_cell().atom(ia).position());
+            for (int x = 0; x < 3; x++) {
+                atom_directions(x, ia) = translation[x];
+            }
+        }
+        for (size_t p = 0; p < geometry_direction.coordinates.size(); p++) {
+            for (int x = 0; x < 3; x++) {
+                geometry_direction.coordinates[p][x] = translation[x];
+            }
+            geometry_direction.energy_weights[p]     = 0.02 * original_quadrature->energy_weights[p];
+            geometry_direction.descriptor_weights[p] = 0.03 * original_quadrature->descriptor_weights[p];
+        }
+        auto geometry_response = xc_samples(potential.lapw_external_xc_geometry_response(
+                density, geometry_direction, atom_directions, lattice_direction));
+        auto geometry_sample   = [&](double step) {
+            auto displacement = step * r3::dot(ctx->unit_cell().inverse_lattice_vectors(), translation);
+            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                ctx->unit_cell().atom(ia).set_position(original_atoms[ia] + displacement);
+            }
+            auto next                = std::make_shared<xc_point_set_t>(*ctx);
+            next->coordinates        = original_quadrature->coordinates;
+            next->energy_weights     = original_quadrature->energy_weights;
+            next->descriptor_weights = original_quadrature->descriptor_weights;
+            next->block_sizes        = original_quadrature->block_sizes;
+            next->block_centres      = original_quadrature->block_centres;
+            for (size_t p = 0; p < next->coordinates.size(); p++) {
+                for (int x = 0; x < 3; x++) {
+                    next->coordinates[p][x] += step * geometry_direction.coordinates[p][x];
+                }
+                next->energy_weights[p] += step * geometry_direction.energy_weights[p];
+                next->descriptor_weights[p] += step * geometry_direction.descriptor_weights[p];
+            }
+            ctx->cb().external_xc_points_ = next;
+            displaced.xc(density);
+            auto values                   = xc_samples(*displaced.lapw_xc_derivatives());
+            ctx->cb().external_xc_points_ = original_quadrature;
+            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                ctx->unit_cell().atom(ia).set_position(original_atoms[ia]);
+            }
+            return values;
+        };
+        // Moving fractional atom positions and Cartesian points needs a step above coordinate roundoff.
+        for (double h : {1e-3, 5e-4}) {
+            auto plus = geometry_sample(h), minus = geometry_sample(-h);
+            check("joint geometry/XC production covectors match finite differences",
+                  potential_response_error(geometry_response, plus, minus, h), 2e-7);
+        }
+        check("geometry XC response preserves reference potential and energy",
+              xc_samples(*potential.lapw_xc_derivatives()) != saved || potential.energy_exc(density) != saved_energy
+                      ? 1
+                      : 0,
+              0);
         auto const& quadrature = *ctx->cb().external_xc_points_;
         int nr = static_cast<int>(quadrature.coordinates.size()), ns = ctx->num_spins();
         xc_point_fields_t fields(nr, ns), raw_response(nr, ns);

@@ -45,6 +45,51 @@ test_spline_transpose(int n__)
 }
 
 int
+test_sampling_geometry(Spheric_function_interpolator const& sampler, Spheric_function_interpolator const& dsampler,
+                       std::vector<r3::vector<double>> const& points,
+                       std::vector<std::array<double, 4>> const& covectors, Flm const& field_direction)
+{
+    std::vector<r3::vector<double>> directions;
+    double lhs{0}, rhs{0}, error{0};
+    for (size_t p = 0; p < points.size(); p++) {
+        directions.emplace_back(0.1 * r3::vector<double>(points[p][1], -points[p][2], points[p][0]));
+        auto response = dsampler.position_response(points[p], directions.back());
+        for (int k = 0; k < 4; k++) {
+            lhs += covectors[p][k] * response[k];
+        }
+    }
+    auto reverse = sampler.geometry_adjoint_response(points, covectors, directions);
+    for (size_t i = 0; i < reverse.size(); i++) {
+        rhs += reverse[i] * field_direction[i];
+    }
+    error             = std::abs(lhs - rhs) / std::max(1.0, std::abs(lhs));
+    bool dual_failure = !std::isfinite(error) || error > 2e-10;
+    // Gradient sampling is C1 at the inner join; its transpose-direction FD is only first-order there.
+    for (double h : {1e-5, 5e-6}) {
+        auto plus = points, minus = points;
+        for (size_t p = 0; p < points.size(); p++) {
+            plus[p] += h * directions[p];
+            minus[p] -= h * directions[p];
+            auto dp = sampler.position_response(points[p], directions[p]);
+            auto fp = sampler.value_gradient(plus[p]), fm = sampler.value_gradient(minus[p]);
+            for (int k = 0; k < 4; k++) {
+                double e = std::abs(dp[k] - (fp[k] - fm[k]) / (2 * h)) / std::max(1.0, std::abs(dp[k]));
+                error    = std::max(error, e);
+            }
+        }
+        auto rp = sampler.adjoint(plus, covectors), rm = sampler.adjoint(minus, covectors);
+        double peak{0}, fd_error{0};
+        for (size_t i = 0; i < reverse.size(); i++) {
+            peak     = std::max(peak, std::abs(reverse[i]));
+            fd_error = std::max(fd_error, std::abs(reverse[i] - (rp[i] - rm[i]) / (2 * h)));
+        }
+        error = std::max(error, fd_error / std::max(1.0, peak));
+    }
+    std::cout << "sampling geometry forward/transpose response: " << error << '\n';
+    return dual_failure || !std::isfinite(error) || error > 2e-6;
+}
+
+int
 test_spheric_interpolation()
 {
     std::vector<double> x{0.02, 0.09, 0.2, 0.45, 0.75, 1.1, 1.8, 2.4, 3.0};
@@ -122,6 +167,8 @@ test_spheric_interpolation()
         }
     }
     check("combined value/gradient adjoint", std::abs(lhs - rhs), 2e-12);
+    failures += test_sampling_geometry(sampler, dsampler, {points.begin(), points.end() - 2},
+                                       {weights.begin(), weights.end() - 2}, direction);
 
     // A source atom and one of its periodic images both contribute to each target.
     std::vector<r3::vector<double>> displacements;
@@ -261,6 +308,7 @@ test_inner_extension(spheric_inner_extension_t mode)
     double adjoint = std::abs(lhs - rhs) / std::max(1.0, std::abs(lhs));
     std::cout << "inner multipole value/gradient and adjoint: " << error << ' ' << adjoint << '\n';
     int failures = !std::isfinite(error) || error > 2e-10 || !std::isfinite(adjoint) || adjoint > 2e-11;
+    failures += test_sampling_geometry(sampler, dsampler, points, covectors, direction);
 
     // Value gradients must also be the spatial derivatives when crossing the join at r_first.
     double gradient_error{0}, curvature_error{0}, hessian_error{0};

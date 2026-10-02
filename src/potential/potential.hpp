@@ -343,6 +343,19 @@ class Potential : public Field4D
     lapw_xc_field_adjoint_t
     lapw_external_xc_response(Density const& density__, Density const& density_response__) const;
 
+    /// Geometry-induced XC covector response with the physical fields held fixed.
+    /** Combines the model Hessian with forward sampling and its differentiated
+     *  transpose. Point/weight/block directions and replicated Cartesian atom/cell
+     *  directions are independent. Radial grids, MT radii and domain membership
+     *  are fixed. The model must expose explicit geometry dependence through its
+     *  point inputs, not hidden context terms. Nuclear, basis and boundary
+     *  responses belong to the host solve.
+     */
+    lapw_xc_field_adjoint_t
+    lapw_external_xc_geometry_response(Density const& density__, xc_point_derivatives_t const& quadrature_direction__,
+                                       mdarray<double, 2> const& atom_directions__,
+                                       r3::matrix<double> const& lattice_direction__) const;
+
     /// Radial-solver potential directions induced by physical rho/tau variations.
     /** Returns the spherical Hartree response and raw core XC covector response
      *  in atom-class order, using the same projection as update_atomic_potential().

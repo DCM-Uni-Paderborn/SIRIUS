@@ -835,6 +835,100 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
         check("MT/interstitial geometry point FD", point_error, 2e-7);
         check("geometry atom FD including physical core fields", atom_error, 2e-7);
         check("geometry all nine fixed-Cartesian cell components FD", cell_error, 2e-7);
+
+        std::vector<r3::vector<double>> point_directions;
+        mdarray<double, 2> atom_directions({3, ctx.unit_cell().num_atoms()});
+        r3::matrix<double> lattice_direction;
+        for (size_t p = 0; p < ids.size(); p++) {
+            point_directions.emplace_back(0.13 + 0.02 * ids[p], -0.04, 0.07);
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                atom_directions(x, ia) = 0.03 * std::sin(x + ia + 0.7);
+            }
+            for (int y = 0; y < 3; y++) {
+                lattice_direction(x, y) = 0.02 * std::cos(x + 2 * y + 0.4);
+            }
+        }
+        auto response = geometry_map.geometry_response(rho, tau, point_directions, atom_directions, lattice_direction);
+        auto reverse_response =
+                geometry_map.geometry_adjoint_response(covectors, point_directions, atom_directions, lattice_direction);
+        double forward{0}, backward{0};
+        for (size_t i = 0; i < response.rho.size(); i++) {
+            forward += response.rho[i] * covectors.rho[i] + response.tau[i] * covectors.tau[i];
+        }
+        for (size_t i = 0; i < response.gradient.size(); i++) {
+            forward += response.gradient[i] * covectors.gradient[i];
+        }
+        for (size_t p = 0; p < ids.size(); p++) {
+            backward += r3::dot(geometry.points[p], point_directions[p]);
+        }
+        comm.allreduce(&forward, 1);
+        comm.allreduce(&backward, 1);
+        for (size_t i = 0; i < atom_directions.size(); i++) {
+            backward += geometry.atoms[i] * atom_directions[i];
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                backward += geometry.lattice(x, y) * lattice_direction(x, y);
+            }
+        }
+        check("geometry forward/adjoint duality", fd_error(forward, backward), 2e-10);
+        for (double h : {1e-5, 5e-6}) {
+            auto shifted = [&](double step) {
+                auto trial_cell   = cell;
+                auto trial_points = geometry_points;
+                for (int x = 0; x < 3; x++) {
+                    for (int y = 0; y < 3; y++) {
+                        trial_cell(x, y) += step * lattice_direction(x, y);
+                    }
+                }
+                set_cell(trial_cell);
+                for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                    auto atom = atoms[ia];
+                    for (int x = 0; x < 3; x++) {
+                        atom[x] += step * atom_directions(x, ia);
+                    }
+                    ctx.unit_cell().atom(ia).set_position(r3::dot(r3::inverse(trial_cell), atom));
+                }
+                for (size_t p = 0; p < ids.size(); p++) {
+                    trial_points[p] += step * point_directions[p];
+                }
+                LAPW_xc_field_map trial(density, trial_points);
+                auto result = std::make_pair(trial.sample(rho, tau), trial.adjoint(covectors));
+                set_cell(cell);
+                return result;
+            };
+            auto plus = shifted(h), minus = shifted(-h);
+            double response_error{0};
+            auto compare = [&](auto const& d, auto const& p, auto const& m) {
+                double peak{0}, error{0};
+                for (size_t i = 0; i < d.size(); i++) {
+                    peak  = std::max(peak, std::abs(d[i]));
+                    error = std::max(error, std::abs(d[i] - (p[i] - m[i]) / (2 * h)));
+                }
+                response_error = std::max(response_error, error / std::max(1.0, peak));
+            };
+            compare(response.rho, plus.first.rho, minus.first.rho);
+            compare(response.tau, plus.first.tau, minus.first.tau);
+            compare(response.gradient, plus.first.gradient, minus.first.gradient);
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                compare(reverse_response.rho[s].f_pw_local(), plus.second.rho[s].f_pw_local(),
+                        minus.second.rho[s].f_pw_local());
+                compare(reverse_response.tau[s].f_pw_local(), plus.second.tau[s].f_pw_local(),
+                        minus.second.tau[s].f_pw_local());
+            }
+            for (size_t ia = 0; ia < reverse_response.local.size(); ia++) {
+                for (int part = 0; part < 2; part++) {
+                    for (int s = 0; s < ctx.num_spins(); s++) {
+                        compare(reverse_response.local[ia][part][s], plus.second.local[ia][part][s],
+                                minus.second.local[ia][part][s]);
+                    }
+                    compare(reverse_response.core[ia][part], plus.second.core[ia][part], minus.second.core[ia][part]);
+                }
+            }
+            check("joint field-sampling/transpose geometry response FD", response_error, 2e-7);
+        }
     }
 
     failures += test_lapw_hamiltonian(ctx, map.adjoint(derivatives), map.adjoint(derivatives));
@@ -1279,6 +1373,24 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
     reject("collective wrong-spin rejection", [&] { map.sample(comm.rank() == 0 ? empty : rho, tau); });
     reject("geometry collective wrong-spin rejection",
            [&] { map.geometry_adjoint(comm.rank() == 0 ? empty : rho, tau, derivatives); });
+    std::vector<r3::vector<double>> zero_points(points.size());
+    mdarray<double, 2> zero_atoms({3, ctx.unit_cell().num_atoms()});
+    zero_atoms.zero();
+    r3::matrix<double> zero_lattice;
+    auto bad_directions = zero_points;
+    if (comm.rank() == 0) {
+        bad_directions.emplace_back();
+    }
+    reject("geometry response collective wrong-buffer rejection",
+           [&] { map.geometry_response(rho, tau, bad_directions, zero_atoms, zero_lattice); });
+    reject("geometry transpose response collective wrong-buffer rejection",
+           [&] { map.geometry_adjoint_response(derivatives, bad_directions, zero_atoms, zero_lattice); });
+    if (comm.size() > 1) {
+        zero_atoms(0, 0) = comm.rank() == 0 ? 1 : 0;
+        reject("geometry response inconsistent atom-direction rejection",
+               [&] { map.geometry_response(rho, tau, zero_points, zero_atoms, zero_lattice); });
+        zero_atoms.zero();
+    }
     xc_point_fields_t bad(points.size() + (comm.rank() == 0 ? 1 : 0), ctx.num_spins());
     bad.rho.zero();
     bad.tau.zero();
