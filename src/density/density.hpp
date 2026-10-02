@@ -337,7 +337,8 @@ class Density : public Field4D
 
     std::unique_ptr<Density>
     lapw_density_matrix_fields_impl(K_point_set& ks__, std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
-                                    std::vector<radial_basis_response_t> const* radial__) const;
+                                    std::vector<radial_basis_response_t> const* radial__,
+                                    xc_geometry_direction_t const* geometry__) const;
 
   public:
     /// External XC enables tau automatically; it can also be requested for orbital-field diagnostics.
@@ -523,6 +524,20 @@ class Density : public Field4D
     lapw_density_matrix_radial_response(K_point_set& ks__,
                                         std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
                                         std::vector<radial_basis_response_t> const& radial__) const;
+
+    /// Geometry contribution at fixed independent PW/LO density matrices and radial functions.
+    /** Returns only the field-map derivative. Includes cell normalization, the
+     *  reciprocal kinetic metric and AW matching. FFT fields use fixed fractional
+     *  coordinates; MT fields use fixed atom-local Cartesian coordinates and radii.
+     *  Moving sampling points, the interstitial mask and radial/core relaxation are
+     *  separate contributions. Directions are replicated over the context communicator
+     *  and contain independent Cartesian atom displacements and lattice-column changes.
+     *  Matrix layout follows lapw_density_matrix_fields. Ground-state data remain unchanged.
+     */
+    std::unique_ptr<Density>
+    lapw_density_matrix_geometry_response(K_point_set& ks__,
+                                          std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                          xc_geometry_direction_t const& direction__) const;
 
     /// PAW partial-wave valence tau from the current projector density matrix.
     /** Element 0 contains AE fields and element 1 pseudo fields, with the same

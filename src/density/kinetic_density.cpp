@@ -642,7 +642,7 @@ std::unique_ptr<Density>
 Density::lapw_density_matrix_fields(K_point_set& ks__,
                                     std::vector<mdarray<std::complex<double>, 3>> const& matrices__) const
 {
-    return lapw_density_matrix_fields_impl(ks__, matrices__, nullptr);
+    return lapw_density_matrix_fields_impl(ks__, matrices__, nullptr, nullptr);
 }
 
 std::unique_ptr<Density>
@@ -650,19 +650,39 @@ Density::lapw_density_matrix_radial_response(K_point_set& ks__,
                                              std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
                                              std::vector<radial_basis_response_t> const& radial__) const
 {
-    return lapw_density_matrix_fields_impl(ks__, matrices__, &radial__);
+    return lapw_density_matrix_fields_impl(ks__, matrices__, &radial__, nullptr);
+}
+
+std::unique_ptr<Density>
+Density::lapw_density_matrix_geometry_response(K_point_set& ks__,
+                                               std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                               xc_geometry_direction_t const& direction__) const
+{
+    return lapw_density_matrix_fields_impl(ks__, matrices__, nullptr, &direction__);
 }
 
 std::unique_ptr<Density>
 Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
                                          std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
-                                         std::vector<radial_basis_response_t> const* radial__) const
+                                         std::vector<radial_basis_response_t> const* radial__,
+                                         xc_geometry_direction_t const* geometry__) const
 {
     int invalid = &ks__.ctx() != &ctx_ || !ctx_.full_potential() || !has_kinetic_density() ||
                   ctx_.processing_unit() != device_t::CPU || ctx_.cfg().parameters().precision_wf() != "fp64" ||
                   ctx_.num_mag_dims() == 3 || ctx_.so_correction() || ctx_.valence_relativity() != relativity_t::none ||
                   ctx_.spfft<double>().processing_unit() != SPFFT_PU_HOST || ctx_.gvec_coarse().reduced() ||
                   matrices__.size() != ks__.spl_num_kpoints().local_size();
+    std::vector<double> geometry_values;
+    if (geometry__) {
+        invalid |= geometry__->atoms.size() != unit_cell_.num_atoms();
+        geometry_values.assign(geometry__->lattice.begin(), geometry__->lattice.end());
+        for (auto const& atom : geometry__->atoms) {
+            geometry_values.insert(geometry_values.end(), atom.begin(), atom.end());
+        }
+        for (auto x : geometry_values) {
+            invalid |= !std::isfinite(x);
+        }
+    }
     if (radial__) {
         invalid |= (unit_cell_.num_core_electrons() != 0 && ctx_.core_relativity() != relativity_t::none) ||
                    radial__->size() != unit_cell_.num_atom_symmetry_classes();
@@ -712,8 +732,27 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
     }
     ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
     if (invalid) {
-        RTE_THROW("LAPW coefficient fields require finite Hermitian scalar/collinear CPU fp64 PW/LO matrices");
+        RTE_THROW("LAPW coefficient fields require finite Hermitian scalar/collinear CPU fp64 PW/LO matrices "
+                  "and matching finite radial/geometry directions");
     }
+    r3::matrix<double> strain;
+    if (geometry__) {
+        auto root = geometry_values;
+        ctx_.comm().bcast(root.data(), root.size(), 0);
+        invalid = root != geometry_values;
+        ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+        if (invalid) {
+            RTE_THROW("LAPW field geometry directions must agree across the context communicator");
+        }
+        r3::matrix<double> lattice;
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                lattice(x, y) = geometry__->lattice[x + 3 * y];
+            }
+        }
+        strain = dot(lattice, unit_cell_.inverse_lattice_vectors());
+    }
+    double volume_response = strain(0, 0) + strain(1, 1) + strain(2, 2);
     size_t matrix_k{0};
     for (auto it : ks__.spl_num_kpoints()) {
         auto const& kp = *ks__.get<double>(it.i);
@@ -741,7 +780,7 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
         int n = unit_cell_.atom(ia).type().mt_basis_size();
         dm.emplace_back(std::array<index_range, 3>{n, n, ns});
         dm.back().zero();
-        if (radial__) {
+        if (radial__ || geometry__) {
             ddm.emplace_back(std::array<index_range, 3>{n, n, ns});
             ddm.back().zero();
         }
@@ -753,20 +792,23 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
         auto const& p  = matrices__[ik++];
         int n = kp.gklo_basis_size(), npw = kp.gkvec().num_gvec();
         for (int i = 0; !radial__ && i < kp.gkvec().count(); i++) {
-            int row = kp.gkvec().offset() + i;
-            auto gi = kp.gkvec().gvec(gvec_index_t::local(i));
-            auto qi = kp.gkvec().gkvec_cart(gvec_index_t::local(i));
+            int row  = kp.gkvec().offset() + i;
+            auto gi  = kp.gkvec().gvec(gvec_index_t::local(i));
+            auto qi  = kp.gkvec().gkvec_cart(gvec_index_t::local(i));
+            auto dqi = geometry__ ? dot(transpose(strain), qi) * -1.0 : r3::vector<double>{0, 0, 0};
             for (int j = 0; j < npw; j++) {
                 int ig = ctx_.gvec_coarse().index_by_gvec(gi - kp.gkvec().gvec(gvec_index_t::global(j)));
                 if (ig < 0) {
                     invalid = 1;
                     continue;
                 }
-                double kinetic = 0.5 * dot(qi, kp.gkvec().gkvec_cart(gvec_index_t::global(j)));
+                auto qj         = kp.gkvec().gkvec_cart(gvec_index_t::global(j));
+                double kinetic  = 0.5 * dot(qi, qj);
+                double dkinetic = geometry__ ? 0.5 * (dot(dqi, qj) - dot(qi, dot(transpose(strain), qj))) : 0;
                 for (int s = 0; s < ns; s++) {
                     auto value = kp.weight() * p(row, j, s) / unit_cell_.omega();
-                    fourier[0](ig, s) += value;
-                    fourier[1](ig, s) += kinetic * value;
+                    fourier[0](ig, s) += (geometry__ ? -volume_response : 1.0) * value;
+                    fourier[1](ig, s) += (geometry__ ? dkinetic - volume_response * kinetic : kinetic) * value;
                 }
             }
         }
@@ -778,9 +820,14 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
             mdarray<std::complex<double>, 2> alm({kp.gkvec().count(), naw}), map({mt, n});
             matching.generate<false>(atom, alm);
             mdarray<std::complex<double>, 2> delta_map;
-            if (radial__) {
+            if (radial__ || geometry__) {
                 mdarray<std::complex<double>, 2> dalm({kp.gkvec().count(), naw});
-                matching.generate_potential_response<false>(atom, (*radial__)[atom.symmetry_class().id()], dalm);
+                if (radial__) {
+                    matching.generate_potential_response<false>(atom, (*radial__)[atom.symmetry_class().id()], dalm);
+                } else {
+                    auto const& d = geometry__->atoms[ia];
+                    matching.generate_geometry_response<false>(atom, {d[0], d[1], d[2]}, strain, dalm);
+                }
                 delta_map = mdarray<std::complex<double>, 2>({mt, n});
                 delta_map.zero();
                 for (int i = 0; i < naw; i++) {
@@ -808,16 +855,18 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
                 la::wrap(la::lib_t::blas)
                         .gemm('N', 'N', mt, n, n, &one, map.at(memory_t::host), map.ld(), p.at(memory_t::host, 0, 0, s),
                               p.ld(), &zero, work.at(memory_t::host), work.ld());
-                la::wrap(la::lib_t::blas)
-                        .gemm('N', 'C', mt, mt, n, &one, work.at(memory_t::host), work.ld(), map.at(memory_t::host),
-                              map.ld(), &zero, local.at(memory_t::host), local.ld());
-                for (int j = 0; j < mt; j++) {
-                    for (int i = 0; i < mt; i++) {
-                        // The atom operator stores conj(c_i) c_j, the transpose of ket/bra P.
-                        dm[ia](i, j, s) += kp.weight() * local(j, i);
+                if (!geometry__) {
+                    la::wrap(la::lib_t::blas)
+                            .gemm('N', 'C', mt, mt, n, &one, work.at(memory_t::host), work.ld(), map.at(memory_t::host),
+                                  map.ld(), &zero, local.at(memory_t::host), local.ld());
+                    for (int j = 0; j < mt; j++) {
+                        for (int i = 0; i < mt; i++) {
+                            // The atom operator stores conj(c_i) c_j, the transpose of ket/bra P.
+                            dm[ia](i, j, s) += kp.weight() * local(j, i);
+                        }
                     }
                 }
-                if (radial__) {
+                if (radial__ || geometry__) {
                     la::wrap(la::lib_t::blas)
                             .gemm('N', 'C', mt, mt, n, &one, work.at(memory_t::host), work.ld(),
                                   delta_map.at(memory_t::host), delta_map.ld(), &zero, local.at(memory_t::host),
@@ -860,10 +909,11 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
         target.fft_transform(1);
     }
     for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
-        ctx_.comm().allreduce(dm[ia].at(memory_t::host), dm[ia].size());
+        auto& matrix = geometry__ ? ddm[ia] : dm[ia];
+        ctx_.comm().allreduce(matrix.at(memory_t::host), matrix.size());
         auto const& atom = unit_cell_.atom(ia);
         LAPW_xc_atom op(atom, ctx_.lmax_rho());
-        auto fields = op.fields(dm[ia], radial__ ? &(*radial__)[atom.symmetry_class().id()] : nullptr);
+        auto fields = op.fields(matrix, radial__ ? &(*radial__)[atom.symmetry_class().id()] : nullptr);
         if (radial__) {
             ctx_.comm().allreduce(ddm[ia].at(memory_t::host), ddm[ia].size());
             auto matching = op.fields(ddm[ia]);

@@ -2276,6 +2276,123 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             }
         }
         verify_restored();
+        auto lattice             = ctx->unit_cell().lattice_vectors();
+        auto original_quadrature = ctx->cb().external_xc_points_;
+        std::vector<r3::vector<double>> positions, centres;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            positions.push_back(ctx->unit_cell().atom(ia).position());
+            centres.push_back(ctx->unit_cell().get_cartesian_coordinates(positions.back()));
+        }
+        for (int part = 0; part < 3; part++) {
+            xc_geometry_direction_t direction(ctx->unit_cell().num_atoms());
+            if (part != 1) {
+                direction.atoms[0] = {0.23, -0.37, 0.19};
+            }
+            r3::matrix<double> strain;
+            if (part != 0) {
+                strain(0, 0) = 0.07;
+                strain(1, 1) = -0.03;
+                strain(2, 2) = 0.02;
+                strain(0, 1) = -0.04;
+                strain(2, 0) = 0.05;
+            }
+            auto dlattice = dot(strain, lattice);
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    direction.lattice[x + 3 * y] = dlattice(x, y);
+                }
+            }
+            auto analytic = density.lapw_density_matrix_geometry_response(ks, frozen_matrices, direction);
+            auto evaluate = [&](double step) {
+                auto shifted = lattice;
+                for (int y = 0; y < 3; y++) {
+                    for (int x = 0; x < 3; x++) {
+                        shifted(x, y) += step * dlattice(x, y);
+                    }
+                }
+                ctx->unit_cell().set_lattice_vectors(shifted);
+                for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                    auto const& d = direction.atoms[ia];
+                    r3::vector<double> dr{d[0], d[1], d[2]};
+                    ctx->unit_cell().atom(ia).set_position(dot(inverse(shifted), centres[ia] + dr * step));
+                }
+                for (auto it : ks.spl_num_kpoints()) {
+                    ks.get<double>(it.i)->update();
+                }
+                auto next                     = std::make_shared<xc_point_set_t>(*ctx);
+                next->coordinates             = original_quadrature->coordinates;
+                next->energy_weights          = original_quadrature->energy_weights;
+                next->descriptor_weights      = original_quadrature->descriptor_weights;
+                next->block_sizes             = original_quadrature->block_sizes;
+                next->block_centres           = original_quadrature->block_centres;
+                ctx->cb().external_xc_points_ = next;
+                return density.lapw_density_matrix_fields(ks, frozen_matrices);
+            };
+            for (double step : {1e-4, 5e-5}) {
+                auto plus = evaluate(step), minus = evaluate(-step);
+                for (int field : {0, 1}) {
+                    double error{0}, peak{0};
+                    auto compare = [&](auto a, auto p, auto m) {
+                        double residual = std::abs(a - (p - m) / (2 * step));
+                        error           = std::isfinite(residual) ? std::max(error, residual)
+                                                                  : std::numeric_limits<double>::infinity();
+                        peak            = std::max(peak, std::abs(a));
+                    };
+                    for (int s = 0; s < ctx->num_spins(); s++) {
+                        auto const& a = field == 0 ? analytic->component(s) : analytic->kinetic_density().component(s);
+                        auto const& p = field == 0 ? plus->component(s) : plus->kinetic_density().component(s);
+                        auto const& m = field == 0 ? minus->component(s) : minus->kinetic_density().component(s);
+                        for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+                            compare(a.rg().f_pw_local(ig), p.rg().f_pw_local(ig), m.rg().f_pw_local(ig));
+                        }
+                        for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                            compare(a.rg().value(ir), p.rg().value(ir), m.rg().value(ir));
+                        }
+                        for (auto atom : ctx->unit_cell().spl_num_atoms()) {
+                            for (size_t i = 0; i < a.mt()[atom.i].size(); i++) {
+                                compare(a.mt()[atom.i][i], p.mt()[atom.i][i], m.mt()[atom.i][i]);
+                            }
+                        }
+                    }
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                    check(field == 0 ? "PW/LO geometry rho response" : "PW/LO geometry tau response",
+                          error / std::max(1e-12, peak), 3e-7);
+                    check("nonzero geometry field response", peak > 1e-8 ? 0 : 1, 0);
+                }
+            }
+            ctx->unit_cell().set_lattice_vectors(lattice);
+            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                ctx->unit_cell().atom(ia).set_position(positions[ia]);
+            }
+            for (auto it : ks.spl_num_kpoints()) {
+                ks.get<double>(it.i)->update();
+            }
+            ctx->cb().external_xc_points_ = original_quadrature;
+            if (part == 0) {
+                auto bad = direction;
+                if (ctx->comm().rank() == 0) {
+                    bad.atoms.clear();
+                }
+                reject("geometry fields reject malformed directions collectively",
+                       [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
+                bad = direction;
+                if (ctx->comm().rank() == 0) {
+                    bad.lattice[0] = std::numeric_limits<double>::quiet_NaN();
+                }
+                reject("geometry fields reject nonfinite directions collectively",
+                       [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
+                if (ctx->comm().size() > 1) {
+                    bad = direction;
+                    if (ctx->comm().rank() == 0) {
+                        bad.atoms[0][0] += 0.01;
+                    }
+                    reject("geometry fields reject inconsistent replicas",
+                           [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
+                }
+            }
+            verify_restored();
+        }
         auto set_occupations = [&](double step) {
             size_t ik{0};
             for (auto it : ks.spl_num_kpoints()) {
