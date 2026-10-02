@@ -6,6 +6,7 @@
 #include <sirius.hpp>
 #include <testing.hpp>
 #include "dft/dft_ground_state.hpp"
+#include "hamiltonian/diagonalize.hpp"
 #include "hamiltonian/diagonalize_fp.hpp"
 #include "lapw/step_function.hpp"
 
@@ -39,13 +40,18 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
             int j    = p + in.num_points * s;
             double w = in.points->energy_weights[p], d = in.points->descriptor_weights[p];
             double r = in.rho[j], t = in.tau[j];
-            energy += w * (0.02 * r * r + 0.01 * t * t + 0.005 * r * t);
-            out.vrho[j] = w * (0.04 * r + 0.005 * t) + d * nonlocal;
-            out.vtau[j] = w * (0.02 * t + 0.005 * r) + 0.3 * d * nonlocal;
+            double local = 0.02 * r * r + 0.01 * t * t + 0.005 * r * t;
+            out.vrho[j]  = w * (0.04 * r + 0.005 * t) + d * nonlocal;
+            out.vtau[j]  = w * (0.02 * t + 0.005 * r) + 0.3 * d * nonlocal;
             for (int x = 0; x < 3; x++) {
                 int k = p + in.num_points * (x + 3 * s);
-                energy += 0.002 * w * in.gradient[k] * in.gradient[k];
+                local += 0.002 * in.gradient[k] * in.gradient[k];
                 out.vgradient[k] = 0.004 * w * in.gradient[k];
+            }
+            energy += w * local;
+            if (out.geometry) {
+                out.geometry->energy_weights[p] += local;
+                out.geometry->descriptor_weights[p] += nonlocal * (r + 0.3 * t);
             }
         }
     }
@@ -62,11 +68,19 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
         for (int j = 0; j < 3 * in.num_points * in.num_spins; j++) {
             out.vgradient[j] *= scale;
         }
+        if (out.geometry) {
+            for (auto* weights : {&out.geometry->energy_weights, &out.geometry->descriptor_weights}) {
+                for (auto& w : *weights) {
+                    w *= scale;
+                }
+            }
+        }
     }
 }
 
 auto
-context(int mag, bool distributed_fft, bool second_variation, bool core = false, bool relativistic_core = false)
+context(int mag, bool distributed_fft, bool second_variation, bool core = false, bool relativistic_core = false,
+        double displacement = 0, double pw_cutoff = 5.0)
 {
     auto config                               = R"({"parameters": {
         "electronic_structure_method": "full_potential_lapwlo", "use_symmetry": false,
@@ -82,6 +96,7 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     config["control"]["mpi_grid_dims"]        = {distributed_fft ? mpi::Communicator::world().size() : 1, 1};
     config["parameters"]["core_relativity"]   = relativistic_core ? "dirac" : "none";
     config["parameters"]["num_bands"]         = core ? 8 : 4;
+    config["parameters"]["pw_cutoff"]         = pw_cutoff;
     auto ctx                                  = std::make_unique<Simulation_context>(config);
     ctx->unit_cell().set_lattice_vectors({{6, 0, 0}, {0, 7, 0}, {0, 0, 8}});
     std::string label = core ? "Ne" : "He";
@@ -106,7 +121,9 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     if (core) {
         type.set_configuration(1, 0, 1, 2.0, true);
     }
-    ctx->unit_cell().add_atom(label, {0.23, 0.31, 0.43}, {0, 0, mag ? 0.2 : 0.0});
+    ctx->unit_cell().add_atom(
+            label, {0.23 + 0.23 * displacement / 6, 0.31 - 0.37 * displacement / 7, 0.43 + 0.19 * displacement / 8},
+            {0, 0, mag ? 0.2 : 0.0});
     if (mag && !second_variation && !core) {
         ctx->unit_cell().add_atom(label, {0.71, 0.79, 0.86}, {0, 0, 0.2});
     }
@@ -162,6 +179,31 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     ctx->cb().external_xc_        = functional;
     ctx->initialize();
     return ctx;
+}
+
+double
+occupied_lapw_lagrangian(Simulation_context const& ctx, K_point<double> const& kp, int spin,
+                         la::dmatrix<std::complex<double>> const& h, la::dmatrix<std::complex<double>> const& o)
+{
+    double value{0};
+    for (int b = 0; b < ctx.num_bands(); b++) {
+        auto all = kp.spinor_wave_functions().gather(wf::spin_index(spin), wf::band_index(b));
+        int ng   = kp.gkvec().num_gvec();
+        std::vector<std::complex<double>> c(all.begin(), all.begin() + ng);
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            auto const& type = ctx.unit_cell().atom(ia).type();
+            c.insert(c.end(), all.begin() + ng + type.mt_aw_basis_size(), all.begin() + ng + type.mt_basis_size());
+            ng += type.mt_basis_size();
+        }
+        double weight = kp.weight() * kp.band_occupancy(b, spin) * ctx.blacs_grid().comm().size() / kp.comm().size();
+        for (int j = 0; j < h.num_cols_local(); j++) {
+            for (int i = 0; i < h.num_rows_local(); i++) {
+                value += weight * std::real(std::conj(c[h.irow(i)]) * (h(i, j) - kp.band_energy(b, spin) * o(i, j)) *
+                                            c[h.icol(j)]);
+            }
+        }
+    }
+    return value;
 }
 
 int
@@ -475,25 +517,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                             h(i, j) += 0.5 * dot(qi, qj) * delta;
                         }
                     }
-                    for (int b = 0; b < ctx->num_bands(); b++) {
-                        auto all = kp->spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(b));
-                        int ng   = kp->gkvec().num_gvec();
-                        std::vector<std::complex<double>> c(all.begin(), all.begin() + ng);
-                        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
-                            auto const& type = ctx->unit_cell().atom(ia).type();
-                            c.insert(c.end(), all.begin() + ng + type.mt_aw_basis_size(),
-                                     all.begin() + ng + type.mt_basis_size());
-                            ng += type.mt_basis_size();
-                        }
-                        double weight = kp->weight() * kp->band_occupancy(b, s) * ctx->blacs_grid().comm().size() /
-                                        kp->comm().size();
-                        for (int j = 0; j < h.num_cols_local(); j++) {
-                            for (int i = 0; i < h.num_rows_local(); i++) {
-                                value += weight * std::real(std::conj(c[h.irow(i)]) *
-                                                            (h(i, j) - kp->band_energy(b, s) * o(i, j)) * c[h.icol(j)]);
-                            }
-                        }
-                    }
+                    value += occupied_lapw_lagrangian(*ctx, *kp, s, h, o);
                 }
             }
             ctx->comm().allreduce(&value, 1);
@@ -507,6 +531,145 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         evaluate(0);
         check("nonzero basis/boundary force", std::abs(analytic) > 1e-7 ? 0 : 1, 0);
         verify_restored();
+    }
+    return failures;
+}
+
+int
+test_lapw_force_response(int mag, double pw_cutoff)
+{
+    std::vector<std::vector<double>> frozen_potential;
+    struct state_t
+    {
+        std::unique_ptr<Simulation_context> ctx;
+        std::unique_ptr<K_point_set> ks;
+        std::unique_ptr<DFT_ground_state> gs;
+    };
+    std::unique_ptr<state_t> reference;
+    // The displaced SCF supplies the radial potential response. This decomposition
+    // check does not replace the missing analytic response in the production force.
+    auto radial_lagrangian = [&](std::vector<std::vector<double>> const& potential) {
+        auto& ctx = *reference->ctx;
+        auto& ks  = *reference->ks;
+        for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
+            ctx.unit_cell().atom_symmetry_class(ic).set_spherical_potential(potential[ic]);
+        }
+        ctx.unit_cell().generate_radial_functions(ctx.out());
+        // Vary the basis, not the physical Hamiltonian or the reference orbitals.
+        for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
+            ctx.unit_cell().atom_symmetry_class(ic).set_spherical_potential(frozen_potential[ic]);
+        }
+        ctx.unit_cell().generate_radial_integrals();
+        Hamiltonian0<double> h0(reference->gs->potential(), false);
+        h0.generate_pw_coefs(reference->gs->potential());
+        double value{0};
+        for (auto it : ks.spl_num_kpoints()) {
+            auto kp = ks.get<double>(it.i);
+            auto hk = h0(*kp);
+            int n = kp->gklo_basis_size(), bs = ctx.cyclic_block_size();
+            la::dmatrix<std::complex<double>> h(n, n, ctx.blacs_grid(), bs, bs);
+            la::dmatrix<std::complex<double>> o(n, n, ctx.blacs_grid(), bs, bs);
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                hk.set_fv_h_o(s, h, o);
+                value += occupied_lapw_lagrangian(ctx, *kp, s, h, o);
+            }
+        }
+        ctx.comm().allreduce(&value, 1);
+        return value;
+    };
+    auto calculate = [&](double displacement, bool forces, bool frozen) {
+        auto state                      = std::make_unique<state_t>();
+        state->ctx                      = context(mag, true, false, false, false, displacement, pw_cutoff);
+        auto& ctx                       = state->ctx;
+        ctx->cb().external_xc_geometry_ = functional;
+        // This diagnostic keeps the Cartesian grid, weights and block centres fixed.
+        ctx->cb().external_xc_pullback_ = [](auto const&, auto const&, auto const&, auto&) {};
+        state->ks                       = std::make_unique<K_point_set>(*ctx);
+        auto& ks                        = *state->ks;
+        ks.add_kpoint({0.07, -0.03, 0.02}, 1);
+        ks.initialize();
+        state->gs = std::make_unique<DFT_ground_state>(ks);
+        auto& gs  = *state->gs;
+        gs.initial_state();
+        bool converged{false};
+        if (!frozen) {
+            converged = gs.find(1e-11, 1e-12, 1e-11, 200, false).at("converged").get<bool>();
+            if (forces) {
+                frozen_potential = gs.potential().get_spherical_potential();
+            }
+        } else {
+            for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                ctx->unit_cell().atom_symmetry_class(ic).set_spherical_potential(frozen_potential[ic]);
+            }
+            ctx->unit_cell().generate_radial_functions(ctx->out());
+            gs.density().mixer_init(ctx->cfg().mixer());
+            double previous{0};
+            for (int iter = 0; iter < 200; iter++) {
+                Hamiltonian0<double> h0(gs.potential(), true, false);
+                sirius::diagonalize<double, double>(h0, ks, 1e-11, ctx->cfg().iterative_solver().num_steps());
+                ks.find_band_occupancies<double>();
+                gs.density().generate<double>(ks, false, true, true);
+                double rms = gs.density().mix();
+                gs.potential().generate(gs.density(), false, true);
+                double energy = free_energy(*ctx, ks, gs.density(), gs.potential());
+                if (rms < 1e-11 && std::abs(energy - previous) < 1e-12) {
+                    converged = true;
+                    break;
+                }
+                previous = energy;
+            }
+        }
+        if (!converged) {
+            RTE_THROW("LAPW force SCF did not converge");
+        }
+        double derivative{0};
+        if (forces) {
+            auto const& ibs = gs.forces().calc_forces_ibs();
+            auto const& hf  = gs.forces().calc_forces_hf();
+            auto const& rho = gs.forces().calc_forces_rho();
+            auto xc         = gs.potential().external_xc_geometry(gs.density());
+            r3::vector<double> direction{0.23, -0.37, 0.19};
+            for (int x = 0; x < 3; x++) {
+                derivative += direction[x] * (xc.atoms[0][x] - ibs(x, 0) - hf(x, 0) - rho(x, 0));
+                if (ctx->comm().rank() == 0) {
+                    std::cout << "LAPW force component " << x << " ibs=" << ibs(x, 0) << " hf=" << hf(x, 0)
+                              << " rho=" << rho(x, 0) << " xc=" << -xc.atoms[0][x] << '\n';
+                }
+            }
+        }
+        double direct = gs.density().kinetic_density().scalar().integrate().total +
+                        gs.potential().energy_exc(gs.density()) + 0.5 * gs.potential().energy_vha() +
+                        energy_enuc(*ctx, gs.potential()) + ks.entropy_sum();
+        std::array<double, 4> result{free_energy(*ctx, ks, gs.density(), gs.potential()), derivative, direct, 0};
+        if (forces) {
+            reference = std::move(state);
+        } else if (!frozen) {
+            result[3] = radial_lagrangian(gs.potential().get_spherical_potential());
+        }
+        return result;
+    };
+    int failures{0};
+    for (bool frozen : {false, true}) {
+        auto centre = calculate(0, true, frozen);
+        for (double h : {2e-4, 1e-4}) {
+            auto plus = calculate(h, false, frozen), minus = calculate(-h, false, frozen);
+            double fd       = (plus[0] - minus[0]) / (2 * h);
+            double response = (plus[3] - minus[3]) / (2 * h);
+            double error    = std::abs(fd - centre[1] - response);
+            if (mpi::Communicator::world().rank() == 0) {
+                std::cout << "LAPW force decomposition spin=" << mag << " pw cutoff=" << pw_cutoff
+                          << " frozen radial basis=" << frozen << " h=" << h << " derivative=" << centre[1]
+                          << " FD=" << fd << " direct FD=" << (plus[2] - minus[2]) / (2 * h)
+                          << " energy identity=" << centre[0] - centre[2] << " radial response=" << response
+                          << " error=" << error << '\n';
+            }
+            failures += !std::isfinite(error) || error > 2e-6;
+            failures += !frozen && std::abs(response) < 1e-5;
+            for (auto const& point : {centre, plus, minus}) {
+                failures += !std::isfinite(point[0] - point[2]) || std::abs(point[0] - point[2]) > 2e-7;
+            }
+            failures += std::abs(fd - (plus[2] - minus[2]) / (2 * h)) > 2e-7;
+        }
     }
     return failures;
 }
@@ -575,6 +738,14 @@ main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
+    if (argc > 1 && std::string(argv[1]) == "force-response") {
+        for (int mag : {0, 1}) {
+            result += call_test("external LAPW force response", test_lapw_force_response, mag,
+                                argc > 2 ? std::stod(argv[2]) : 9.0);
+        }
+        sirius::finalize();
+        return std::min(result, 1);
+    }
     if (argc > 1 && std::string(argv[1]) == "core") {
         for (int mag : {0, 1}) {
             for (bool second : {false, true}) {
