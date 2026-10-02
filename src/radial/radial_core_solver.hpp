@@ -462,8 +462,9 @@ class Radial_core_solver
 inline std::vector<radial_core_state_t>
 solve_radial_core_states(Radial_grid<double> const& grid__, int l__, int zn__, std::vector<double> const& potential__,
                          int count__, std::array<std::vector<double>, 2> fields__, int nmtp__,
-                         std::vector<double> const* direction__       = nullptr,
-                         std::vector<radial_core_state_t>* response__ = nullptr)
+                         std::vector<double> const* direction__             = nullptr,
+                         std::vector<radial_core_state_t>* response__       = nullptr,
+                         std::array<std::vector<double>, 2> xc_directions__ = {})
 {
     if (nmtp__ < 2 || nmtp__ >= grid__.num_points()) {
         RTE_THROW("radial core solve requires an extended muffin-tin domain");
@@ -473,6 +474,15 @@ solve_radial_core_states(Radial_grid<double> const& grid__, int l__, int zn__, s
          (direction__->size() != grid__.num_points() ||
           !std::all_of(direction__->begin(), direction__->end(), [](double x) { return std::isfinite(x); })))) {
         RTE_THROW("radial core solve: invalid potential response direction");
+    }
+    for (auto& field : xc_directions__) {
+        if (!field.empty() && (!response__ || field.size() != nmtp__ ||
+                               !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); }))) {
+            RTE_THROW("radial core solve: invalid XC response direction");
+        }
+        if (response__) {
+            field.resize(grid__.num_points(), 0);
+        }
     }
     for (auto& field : fields__) {
         if (field.size() != nmtp__) {
@@ -513,8 +523,8 @@ solve_radial_core_states(Radial_grid<double> const& grid__, int l__, int zn__, s
             if (std::max(energy_error, field_error) <= 1) {
                 if (response__) {
                     // Differentiate in the same discrete basis selected by the primal convergence test.
-                    std::vector<double> zero(grid__.num_points(), 0);
-                    auto response = solver.solve_response(count__, fields__[0], fields__[1], *direction__, zero, zero);
+                    auto response = solver.solve_response(count__, fields__[0], fields__[1], *direction__,
+                                                          xc_directions__[0], xc_directions__[1]);
                     response__->clear();
                     for (int j = 0; j < count__; j++) {
                         states[j] = std::move(response[j].value);

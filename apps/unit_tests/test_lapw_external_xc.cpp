@@ -538,72 +538,108 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     }
     if (!second_variation || !mag) {
         std::vector<std::vector<double>> spherical;
+        std::vector<std::array<std::vector<double>, 2>> spherical_xc;
         for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-            spherical.push_back(ctx->unit_cell().atom_symmetry_class(ic).spherical_potential());
+            auto const& cls = ctx->unit_cell().atom_symmetry_class(ic);
+            spherical.push_back(cls.spherical_potential());
+            spherical_xc.push_back(cls.spherical_xc_derivatives());
         }
-        auto radial_direction = spherical;
-        for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-            auto const& grid = ctx->unit_cell().atom_symmetry_class(ic).atom_type().radial_grid();
-            for (int ir = 0; ir < grid.num_points(); ir++) {
-                radial_direction[ic][ir] = (ic + 1) * (0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]));
+        for (int part : core ? std::vector<int>{0, 1, 2, 3} : std::vector<int>{0}) {
+            auto radial_direction = spherical;
+            std::vector<std::array<std::vector<double>, 2>> xc_direction(spherical.size());
+            for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                auto const& grid = ctx->unit_cell().atom_symmetry_class(ic).atom_type().radial_grid();
+                for (int ir = 0; ir < grid.num_points(); ir++) {
+                    radial_direction[ic][ir] =
+                            (part == 0 || part == 3)
+                                    ? (ic + 1) * (0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]))
+                                    : 0;
+                }
+                for (int j : {0, 1}) {
+                    if (part == j + 1 || part == 3) {
+                        xc_direction[ic][j] = spherical_xc[ic][j];
+                        for (int ir = 0; ir < grid.num_points(); ir++) {
+                            // Resolve both channels while keeping the stronger tau response linear.
+                            xc_direction[ic][j][ir] *= (j == 0 ? 1000 : 10) * std::cos(grid[ir]);
+                        }
+                    }
+                }
             }
-        }
-        double basis_derivative = gs.forces().lapw_radial_basis_derivative(radial_direction);
-        verify_restored();
-        if (!mag && !second_variation) {
-            auto direction = radial_direction;
-            for (auto& atom : direction) {
-                std::fill(atom.begin(), atom.end(), 0);
+            std::cout << "Radial basis Lagrangian response part=" << part << '\n';
+            double basis_derivative = gs.forces().lapw_radial_basis_derivative(radial_direction, xc_direction);
+            verify_restored();
+            if (!mag && !second_variation && part == 0) {
+                auto direction = radial_direction;
+                for (auto& atom : direction) {
+                    std::fill(atom.begin(), atom.end(), 0);
+                }
+                check("zero radial potential direction", std::abs(gs.forces().lapw_radial_basis_derivative(direction)),
+                      0);
+                if (ctx->comm().rank() == 0) {
+                    direction[0].pop_back();
+                }
+                reject("invalid radial direction rejected collectively",
+                       [&] { gs.forces().lapw_radial_basis_derivative(direction); });
+                for (int j : {0, 1}) {
+                    auto invalid_xc = xc_direction;
+                    if (ctx->comm().rank() == 0) {
+                        invalid_xc[0][j] = {std::numeric_limits<double>::quiet_NaN()};
+                    }
+                    reject("invalid radial XC direction rejected collectively",
+                           [&] { gs.forces().lapw_radial_basis_derivative(radial_direction, invalid_xc); });
+                }
+                verify_restored();
             }
-            check("zero radial potential direction", std::abs(gs.forces().lapw_radial_basis_derivative(direction)), 0);
-            if (ctx->comm().rank() == 0) {
-                direction[0].pop_back();
+            auto radial_lagrangian = [&](double step) {
+                for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                    auto v  = spherical[ic];
+                    auto xc = spherical_xc[ic];
+                    for (size_t ir = 0; ir < v.size(); ir++) {
+                        v[ir] += step * radial_direction[ic][ir];
+                        for (int j : {0, 1}) {
+                            if (!xc_direction[ic][j].empty()) {
+                                xc[j][ir] += step * xc_direction[ic][j][ir];
+                            }
+                        }
+                    }
+                    auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
+                    cls.set_spherical_potential(v);
+                    cls.set_spherical_xc_derivatives(xc);
+                    if (cls.generate_radial_functions(relativity_t::none, false)) {
+                        RTE_THROW("radial basis derivative fixture failed");
+                    }
+                    // Only the basis changes, not the physical Hamiltonian.
+                    cls.set_spherical_potential(spherical[ic]);
+                    cls.set_spherical_xc_derivatives(spherical_xc[ic]);
+                }
+                ctx->unit_cell().generate_radial_integrals();
+                Hamiltonian0<double> radial_h0(potential, false);
+                radial_h0.generate_pw_coefs(potential);
+                double value{0};
+                for (auto it : ks.spl_num_kpoints()) {
+                    auto kp = ks.get<double>(it.i);
+                    auto hk = radial_h0(*kp);
+                    int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                    la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                    la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                    for (int s = 0; s < ctx->num_spins(); s++) {
+                        hk.set_fv_h_o(s, h, o);
+                        value += occupied_lapw_lagrangian(*ctx, *kp, s, h, o);
+                    }
+                }
+                ctx->comm().allreduce(&value, 1);
+                return value;
+            };
+            for (double step : {1e-3, 5e-4}) {
+                double fd = (radial_lagrangian(step) - radial_lagrangian(-step)) / (2 * step);
+                check("radial basis Lagrangian derivative", std::abs(fd - basis_derivative), 2e-8);
+                check("relative radial basis Lagrangian derivative",
+                      std::abs((fd - basis_derivative) / basis_derivative), 2e-5);
             }
-            reject("invalid radial direction rejected collectively",
-                   [&] { gs.forces().lapw_radial_basis_derivative(direction); });
+            radial_lagrangian(0);
+            check("nonzero radial basis Lagrangian derivative", std::abs(basis_derivative) > 1e-7 ? 0 : 1, 0);
             verify_restored();
         }
-        auto radial_lagrangian = [&](double step) {
-            for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-                auto v = spherical[ic];
-                for (size_t ir = 0; ir < v.size(); ir++) {
-                    v[ir] += step * radial_direction[ic][ir];
-                }
-                auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
-                cls.set_spherical_potential(v);
-                if (cls.generate_radial_functions(relativity_t::none, false)) {
-                    RTE_THROW("radial basis derivative fixture failed");
-                }
-                // Only the basis changes, not the physical Hamiltonian.
-                cls.set_spherical_potential(spherical[ic]);
-            }
-            ctx->unit_cell().generate_radial_integrals();
-            Hamiltonian0<double> radial_h0(potential, false);
-            radial_h0.generate_pw_coefs(potential);
-            double value{0};
-            for (auto it : ks.spl_num_kpoints()) {
-                auto kp = ks.get<double>(it.i);
-                auto hk = radial_h0(*kp);
-                int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
-                la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
-                la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
-                for (int s = 0; s < ctx->num_spins(); s++) {
-                    hk.set_fv_h_o(s, h, o);
-                    value += occupied_lapw_lagrangian(*ctx, *kp, s, h, o);
-                }
-            }
-            ctx->comm().allreduce(&value, 1);
-            return value;
-        };
-        for (double step : {1e-3, 5e-4}) {
-            double fd = (radial_lagrangian(step) - radial_lagrangian(-step)) / (2 * step);
-            check("radial basis Lagrangian derivative", std::abs(fd - basis_derivative), 2e-8);
-            check("relative radial basis Lagrangian derivative", std::abs((fd - basis_derivative) / basis_derivative),
-                  2e-5);
-        }
-        radial_lagrangian(0);
-        check("nonzero radial basis Lagrangian derivative", std::abs(basis_derivative) > 1e-7 ? 0 : 1, 0);
-        verify_restored();
     }
     return failures;
 }

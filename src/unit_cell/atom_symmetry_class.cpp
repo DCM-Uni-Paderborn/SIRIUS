@@ -748,8 +748,8 @@ Atom_symmetry_class::find_enu(relativity_t rel__)
 }
 
 Atom_symmetry_class::core_states_t
-Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* direction__,
-                                                 core_states_t* response__) const
+Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* direction__, core_states_t* response__,
+                                                 std::array<std::vector<double>, 2> const& xc_directions__) const
 {
     core_states_t result;
     if (!spherical_xc_derivatives_[0].empty() && atom_type_.num_core_electrons() != 0) {
@@ -771,7 +771,7 @@ Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* dire
             std::vector<radial_core_state_t> response;
             auto states = solve_radial_core_states(
                     grid, l, atom_type_.zn(), potential, count, spherical_xc_derivatives_, atom_type_.num_mt_points(),
-                    direction__ ? &direction : nullptr, direction__ ? &response : nullptr);
+                    direction__ ? &direction : nullptr, direction__ ? &response : nullptr, xc_directions__);
             for (int j = 0; j < count; j++) {
                 bool occupied{false};
                 for (int i = 0; i < atom_type_.num_atomic_levels(); i++) {
@@ -859,7 +859,8 @@ Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_e
 }
 
 radial_basis_response_t
-Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& direction__) const
+Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& direction__,
+                                                     std::array<std::vector<double>, 2> const& xc_directions__) const
 {
     if (atom_type_.parameters().valence_relativity() != relativity_t::none) {
         RTE_THROW("radial basis response requires nonrelativistic functions");
@@ -869,12 +870,21 @@ Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& 
         !std::all_of(direction__.begin(), direction__.end(), [](double x) { return std::isfinite(x); })) {
         RTE_THROW("invalid radial basis potential direction");
     }
+    for (auto const& field : xc_directions__) {
+        if (!field.empty() && (field.size() != direction__.size() ||
+                               !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); }))) {
+            RTE_THROW("invalid radial basis XC direction");
+        }
+        if (!field.empty() && atom_type_.num_core_electrons() != 0 && spherical_xc_derivatives_[0].empty()) {
+            RTE_THROW("XC-dependent core response requires initialized core projection");
+        }
+    }
     mdarray<double, 3> rf({atom_type_.num_mt_points(), atom_type_.mt_radial_basis_size(), 2});
     mdarray<double, 2> sd({3, atom_type_.mt_radial_basis_size() - atom_type_.num_lo_descriptors()});
     rf.zero();
     sd.zero();
     core_states_t dcore;
-    auto core = generate_core_radial_states(&direction__, &dcore);
+    auto core = generate_core_radial_states(&direction__, &dcore, xc_directions__);
     radial_basis_response_t result(atom_type_);
     if (generate_aw_radial_functions(relativity_t::none, rf, sd, core, &direction__, &result, &dcore) ||
         generate_lo_radial_functions(relativity_t::none, rf, core, &direction__, &result, &dcore)) {

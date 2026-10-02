@@ -42,7 +42,8 @@ Force::Force(Simulation_context& ctx__, Density& density__, Potential& potential
 }
 
 double
-Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& directions__)
+Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& directions__,
+                                    std::vector<std::array<std::vector<double>, 2>> const& xc_directions__)
 {
     auto& uc    = ctx_.unit_cell();
     int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
@@ -50,12 +51,23 @@ Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& dire
                   ctx_.hubbard_correction() ||
                   (uc.num_core_electrons() != 0 && ctx_.core_relativity() != relativity_t::none) ||
                   (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) ||
-                  directions__.size() != uc.num_atom_symmetry_classes();
+                  directions__.size() != uc.num_atom_symmetry_classes() ||
+                  (!xc_directions__.empty() && xc_directions__.size() != directions__.size());
     if (!invalid) {
         for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
             invalid |= directions__[ic].size() != uc.atom_symmetry_class(ic).atom_type().num_mt_points() ||
                        !std::all_of(directions__[ic].begin(), directions__[ic].end(),
                                     [](double x) { return std::isfinite(x); });
+            if (!xc_directions__.empty()) {
+                auto const& cls = uc.atom_symmetry_class(ic);
+                for (auto const& field : xc_directions__[ic]) {
+                    invalid |=
+                            !field.empty() &&
+                            (field.size() != directions__[ic].size() ||
+                             !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); }) ||
+                             (cls.atom_type().num_core_electrons() != 0 && cls.spherical_xc_derivatives()[0].empty()));
+                }
+            }
         }
     }
     ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
@@ -68,7 +80,9 @@ Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& dire
     Hamiltonian0<double> h0(potential_, false);
     std::vector<radial_basis_response_t> response;
     for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
-        response.push_back(uc.atom_symmetry_class(ic).radial_basis_potential_response(directions__[ic]));
+        response.push_back(uc.atom_symmetry_class(ic).radial_basis_potential_response(
+                directions__[ic],
+                xc_directions__.empty() ? std::array<std::vector<double>, 2>{} : xc_directions__[ic]));
     }
     struct atom_response_t
     {

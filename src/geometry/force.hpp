@@ -202,9 +202,12 @@ class Force
     /// Directional derivative of sum f c*(H-epsilon S)c from the LAPW radial basis.
     /** Directions are spherical-potential variations by atom symmetry class. Geometry,
      *  physical potentials, occupations and linearisation energies remain fixed.
+     *  Optional raw density/tau covector directions include core projection response,
+     *  not the core-energy derivative. Empty directions hold these covectors fixed.
      *  This is a force-building block, not the self-consistent potential response. */
     double
-    lapw_radial_basis_derivative(std::vector<std::vector<double>> const& directions__);
+    lapw_radial_basis_derivative(std::vector<std::vector<double>> const& directions__,
+                                 std::vector<std::array<std::vector<double>, 2>> const& xc_directions__ = {});
 
     inline auto const&
     forces_ibs() const

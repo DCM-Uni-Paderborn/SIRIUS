@@ -604,9 +604,15 @@ test_radial_basis_response()
         std::cout << name << ": " << error << " (limit " << tolerance << ")\n";
         failures += !std::isfinite(error) || error > tolerance;
     };
-    for (auto setup : {std::make_pair(false, false), std::make_pair(false, true), std::make_pair(true, false),
-                       std::make_pair(true, true)}) {
-        auto [core, orthogonalize] = setup;
+    struct setup_t
+    {
+        bool core;
+        bool orthogonalize;
+        int part; // Potential, density covector, tau covector, or all three.
+    };
+    for (auto [core, orthogonalize, part] :
+         {setup_t{false, false, 0}, setup_t{false, true, 0}, setup_t{true, false, 0}, setup_t{true, true, 0},
+          setup_t{true, true, 1}, setup_t{true, true, 2}, setup_t{true, true, 3}}) {
         Simulation_parameters parameters;
         parameters.valence_relativity("none");
         parameters.core_relativity("none");
@@ -657,23 +663,42 @@ test_radial_basis_response()
         std::vector<double> potential(grid.num_points()), direction(grid.num_points());
         for (int ir = 0; ir < grid.num_points(); ir++) {
             potential[ir] = -z / grid[ir] + 0.2 * std::exp(-grid[ir]);
-            direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+            direction[ir] = (part == 0 || part == 3) ? 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]) : 0;
         }
+        std::array<std::vector<double>, 2> fields, xc_direction;
         if (core) {
             auto weights = radial_weights(grid);
-            std::array<std::vector<double>, 2> fields{weights, weights};
+            fields       = {weights, weights};
+            if (part == 1 || part == 3) {
+                xc_direction[0] = weights;
+            }
+            if (part == 2 || part == 3) {
+                xc_direction[1] = weights;
+            }
             for (int ir = 0; ir < grid.num_points(); ir++) {
                 fields[0][ir] *= 0.03 * std::exp(-grid[ir]);
                 fields[1][ir] *= 0.02 * std::exp(-grid[ir]);
+                if (!xc_direction[0].empty()) {
+                    xc_direction[0][ir] *= 4 * std::sin(3 * grid[ir]) * std::exp(-grid[ir]);
+                }
+                if (!xc_direction[1].empty()) {
+                    xc_direction[1][ir] *= 0.03 * std::sin(3 * grid[ir]) * std::exp(-grid[ir]);
+                }
             }
-            cls.set_spherical_xc_derivatives(fields);
         }
         auto sample = [&](double step) {
-            auto v = potential;
+            auto v  = potential;
+            auto xc = fields;
             for (int ir = 0; ir < grid.num_points(); ir++) {
                 v[ir] += step * direction[ir];
+                for (int j : {0, 1}) {
+                    if (!xc_direction[j].empty()) {
+                        xc[j][ir] += step * xc_direction[j][ir];
+                    }
+                }
             }
             cls.set_spherical_potential(v);
+            cls.set_spherical_xc_derivatives(xc);
             // Exercise the production owner-rank generation and replicated response.
             cell.generate_radial_functions(std::cout);
             std::vector<double> values;
@@ -694,7 +719,7 @@ test_radial_basis_response()
             return values;
         };
         auto baseline = sample(0);
-        auto response = cls.radial_basis_potential_response(direction);
+        auto response = cls.radial_basis_potential_response(direction, xc_direction);
         auto zero     = cls.radial_basis_potential_response(std::vector<double>(grid.num_points(), 0));
         std::vector<double> analytic(response.radial_functions.begin(), response.radial_functions.end());
         analytic.insert(analytic.end(), response.surface_derivatives.begin(), response.surface_derivatives.end());
@@ -718,8 +743,11 @@ test_radial_basis_response()
                         std::max(boundary_error, std::abs(response.radial_functions(grid.num_points() - 1, i, 0)));
             }
         }
-        std::cout << "Radial basis response core=" << core << " orthogonalize=" << orthogonalize << '\n';
+        std::cout << "Radial basis response core=" << core << " orthogonalize=" << orthogonalize << " part=" << part
+                  << '\n';
         check("unchanged stored radial basis", unchanged, 0);
+        check("unchanged stored radial fields",
+              cls.spherical_potential() == potential && cls.spherical_xc_derivatives() == fields ? 0 : 1, 0);
         check("zero basis response", null_error, 0);
         check("basis normalization response", norm_error, 2e-9);
         check("LO boundary response", boundary_error, 2e-10);
@@ -732,7 +760,7 @@ test_radial_basis_response()
                 peak  = std::max(peak, std::abs(analytic[i]));
             }
             check("nonzero radial basis response", peak > 1e-5 ? 0 : 1, 0);
-            check("AW/LO potential derivative", error / peak, 2e-6);
+            check("AW/LO radial-field derivative", error / peak, 2e-6);
         }
         sample(0);
         mdarray<std::complex<double>, 2> dalm({gkvec.count(), type.mt_aw_basis_size()});
@@ -756,7 +784,7 @@ test_radial_basis_response()
             cell.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
             cell.comm().allreduce<double, mpi::op_t::max>(&conjugation_error, 1);
             check("nonzero matching response", peak > 1e-5 ? 0 : 1, 0);
-            check("APW/LAPW matching potential derivative", error / peak, 2e-6);
+            check("APW/LAPW matching radial-field derivative", error / peak, 2e-6);
             check("conjugated matching response", conjugation_error, 0);
         }
         for (auto invalid : {std::vector<double>{},
@@ -768,6 +796,30 @@ test_radial_basis_response()
                 rejected = true;
             }
             check("invalid radial basis direction", rejected ? 0 : 1, 0);
+        }
+        for (int j : {0, 1}) {
+            for (auto invalid : {std::vector<double>(1, 0),
+                                 std::vector<double>(grid.num_points(), std::numeric_limits<double>::quiet_NaN())}) {
+                std::array<std::vector<double>, 2> bad;
+                bad[j] = invalid;
+                bool rejected{false};
+                try {
+                    cls.radial_basis_potential_response(direction, bad);
+                } catch (std::exception const&) {
+                    rejected = true;
+                }
+                check("invalid radial basis XC direction", rejected ? 0 : 1, 0);
+            }
+        }
+        if (core && part) {
+            cls.set_spherical_xc_derivatives({});
+            bool rejected{false};
+            try {
+                cls.radial_basis_potential_response(direction, xc_direction);
+            } catch (std::exception const&) {
+                rejected = true;
+            }
+            check("uninitialized core projection response", rejected ? 0 : 1, 0);
         }
         parameters.valence_relativity("zora");
         bool rejected{false};

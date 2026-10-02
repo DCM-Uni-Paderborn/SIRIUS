@@ -95,8 +95,8 @@ class Atom_symmetry_class
     mutable std::vector<local_orbital_descriptor> lo_descriptors_;
 
     core_states_t
-    generate_core_radial_states(std::vector<double> const* direction__ = nullptr,
-                                core_states_t* response__              = nullptr) const;
+    generate_core_radial_states(std::vector<double> const* direction__ = nullptr, core_states_t* response__ = nullptr,
+                                std::array<std::vector<double>, 2> const& xc_directions__ = {}) const;
 
     radial_solver_result_t
     solve_radial(relativity_t rel__, int dme__, int l__, double energy__, core_states_t const& core__,
@@ -139,6 +139,12 @@ class Atom_symmetry_class
     void
     set_spherical_xc_derivatives(std::array<std::vector<double>, 2> const& fields__);
 
+    auto const&
+    spherical_xc_derivatives() const
+    {
+        return spherical_xc_derivatives_;
+    }
+
     /// Save spherical potential for debugging purposes.
     void
     save_spherical_potential() const;
@@ -152,10 +158,12 @@ class Atom_symmetry_class
     generate_radial_functions(relativity_t rel__, bool update_enu__ = true);
 
     /// Differentiate the nonrelativistic AW/LO construction without changing the stored basis or energies.
-    /** The direction is the change in the spherical potential on the MT grid. Core projection includes the
-     *  induced core-orbital response, with the spherical XC covectors and free-atom reference held fixed. */
+    /** Directions are changes in the spherical potential and optional raw density/tau XC covectors on the MT
+     *  grid. Empty XC directions mean zero. Core projection includes the induced core-orbital response without
+     *  adding quadrature weights to the covectors. The free-atom reference remains fixed. */
     radial_basis_response_t
-    radial_basis_potential_response(std::vector<double> const& direction__) const;
+    radial_basis_potential_response(std::vector<double> const& direction__,
+                                    std::array<std::vector<double>, 2> const& xc_directions__ = {}) const;
 
     void
     sync_radial_functions(mpi::Communicator const& comm__, int const rank__);
