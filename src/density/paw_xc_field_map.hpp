@@ -75,6 +75,36 @@ class PAW_xc_field_map
         return result;
     }
 
+    /// Geometry response of the complete smooth/local fields at fixed coefficients.
+    xc_geometry_adjoint_t
+    geometry_adjoint(std::vector<Smooth_periodic_function<double>> const& rho__,
+                     std::vector<Smooth_periodic_function<double>> const& tau__,
+                     xc_point_fields_t const& derivatives__) const
+    {
+        int ns     = ctx_.num_spins();
+        int failed = rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns);
+        ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+        if (failed) {
+            RTE_THROW("PAW XC geometry adjoint: incompatible spin fields on a context rank");
+        }
+        auto result = local_.geometry_adjoint(derivatives__);
+        for (int s = 0; s < ns; s++) {
+            std::vector<std::array<double, 4>> dr(num_points_), dt(num_points_);
+            for (int p = 0; p < num_points_; p++) {
+                dr[p] = {derivatives__.rho(p, s), derivatives__.gradient(p, 0, s), derivatives__.gradient(p, 1, s),
+                         derivatives__.gradient(p, 2, s)};
+                dt[p] = {derivatives__.tau(p, s), 0, 0, 0};
+            }
+            auto r = smooth_.geometry_adjoint(rho__[s], dr);
+            auto t = smooth_.geometry_adjoint(tau__[s], dt);
+            result.lattice += r.lattice + t.lattice;
+            for (int p = 0; p < num_points_; p++) {
+                result.points[p] += r.points[p] + t.points[p];
+            }
+        }
+        return result;
+    }
+
     /// Return the adjoint of the complete reconstruction, not separate XC calls.
     /** Fourier coefficients are normalized as ordinary SIRIUS potentials. The
      *  rho result includes the Cartesian-gradient adjoint. Apply it as a local
@@ -93,8 +123,8 @@ class PAW_xc_field_map
         auto const& g = derivatives__.gradient;
         auto const& t = derivatives__.tau;
         int failed    = r.size(0) != num_points_ || r.size(1) != ns || t.size(0) != num_points_ || t.size(1) != ns ||
-                     g.size(0) != num_points_ || g.size(1) != 3 || g.size(2) != ns;
-        auto finite = [](auto const& a) {
+                        g.size(0) != num_points_ || g.size(1) != 3 || g.size(2) != ns;
+        auto finite   = [](auto const& a) {
             for (size_t i = 0; i < a.size(); i++) {
                 if (!std::isfinite(a[i])) {
                     return false;
