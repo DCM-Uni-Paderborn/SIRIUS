@@ -124,6 +124,12 @@ class Atom_symmetry_class
     void
     set_spherical_potential(std::vector<double> const& vs__);
 
+    auto const&
+    spherical_potential() const
+    {
+        return spherical_potential_;
+    }
+
     void
     set_spherical_xc_derivatives(std::array<std::vector<double>, 2> const& fields__);
 

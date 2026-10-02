@@ -199,6 +199,13 @@ class Force
     mdarray<double, 2> const&
     calc_forces_ibs();
 
+    /// Directional derivative of sum f c*(H-epsilon S)c from the LAPW radial basis.
+    /** Directions are spherical-potential variations by atom symmetry class. Geometry,
+     *  physical potentials, occupations and linearisation energies remain fixed.
+     *  This is a force-building block, not the self-consistent potential response. */
+    double
+    lapw_radial_basis_derivative(std::vector<std::vector<double>> const& directions__);
+
     inline auto const&
     forces_ibs() const
     {

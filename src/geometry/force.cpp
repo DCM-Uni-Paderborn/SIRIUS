@@ -16,6 +16,7 @@
 #include "k_point/k_point_set.hpp"
 #include "density/density.hpp"
 #include "density/augmentation_operator.hpp"
+#include "density/lapw_xc_atom.hpp"
 #include "potential/potential.hpp"
 #include "beta_projectors/beta_projectors.hpp"
 #include "beta_projectors/beta_projectors_gradient.hpp"
@@ -38,6 +39,208 @@ Force::Force(Simulation_context& ctx__, Density& density__, Potential& potential
     , potential_(potential__)
     , kset_(kset__)
 {
+}
+
+double
+Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& directions__)
+{
+    auto& uc    = ctx_.unit_cell();
+    int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
+                  ctx_.valence_relativity() != relativity_t::none || ctx_.so_correction() || ctx_.num_mag_dims() == 3 ||
+                  ctx_.hubbard_correction() || uc.num_core_electrons() != 0 ||
+                  (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) ||
+                  directions__.size() != uc.num_atom_symmetry_classes();
+    if (!invalid) {
+        for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
+            invalid |= directions__[ic].size() != uc.atom_symmetry_class(ic).atom_type().num_mt_points() ||
+                       !std::all_of(directions__[ic].begin(), directions__[ic].end(),
+                                    [](double x) { return std::isfinite(x); });
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW radial basis derivative requires nonrelativistic scalar/collinear valence states and valid "
+                  "directions");
+    }
+
+    // Differentiate the stored basis without updating its potential or energies.
+    Hamiltonian0<double> h0(potential_, false);
+    std::vector<radial_basis_response_t> response;
+    for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
+        response.push_back(uc.atom_symmetry_class(ic).radial_basis_potential_response(directions__[ic]));
+    }
+    struct atom_response_t
+    {
+        mdarray<std::complex<double>, 3> h;
+        mdarray<double, 2> o, overlap;
+    };
+    std::vector<atom_response_t> matrices;
+    bool simple = ctx_.cfg().settings().simple_lapw_ri();
+    int ns = ctx_.num_spins(), lmmax = sf::lmmax(ctx_.lmax_pot());
+    for (int ia = 0; ia < uc.num_atoms(); ia++) {
+        auto const& atom      = uc.atom(ia);
+        auto const& type      = atom.type();
+        auto const& cls       = atom.symmetry_class();
+        auto const& grid      = type.radial_grid();
+        auto const& spherical = cls.spherical_potential();
+        auto const& drf       = response[cls.id()].radial_functions;
+        int n = type.mt_basis_size(), nrf = type.indexr().size();
+        atom_response_t matrix{mdarray<std::complex<double>, 3>({n, n, ns}), mdarray<double, 2>({n, n}),
+                               mdarray<double, 2>({n, n})};
+        matrix.h.zero();
+        matrix.o.zero();
+        matrix.overlap.zero();
+        std::vector<Spline<double>> radial, tangent;
+        for (int i = 0; i < nrf; i++) {
+            radial.emplace_back(grid);
+            tangent.emplace_back(grid);
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                radial.back()(ir)  = cls.radial_function(ir, i);
+                tangent.back()(ir) = drf(ir, i, 0);
+            }
+            radial.back().interpolate();
+            tangent.back().interpolate();
+        }
+        mdarray<double, 4> dh({lmmax, nrf, nrf, ns});
+        mdarray<double, 2> ds({nrf, nrf});
+        dh.zero();
+        ds.zero();
+        Spline<double> product(grid), integral(grid), field(grid);
+        auto integrate_field = [&](int i, int j) {
+            if (simple) {
+                for (int ir = 0; ir < grid.num_points(); ir++) {
+                    integral(ir) = product(ir) * field(ir) * grid[ir] * grid[ir];
+                }
+                return integral.interpolate().integrate(0);
+            }
+            field.interpolate();
+            return inner(tangent[j], radial[i] * field, 2) + inner(radial[j], tangent[i] * field, 2);
+        };
+        for (int j = 0; j < nrf; j++) {
+            for (int i = 0; i <= j; i++) {
+                int l1 = type.indexr(i).am.l(), l2 = type.indexr(j).am.l();
+                for (int ir = 0; ir < grid.num_points(); ir++) {
+                    product(ir) = tangent[i](ir) * radial[j](ir) + radial[i](ir) * tangent[j](ir);
+                }
+                if (l1 == l2 && i != j) {
+                    for (int ir = 0; ir < grid.num_points(); ir++) {
+                        integral(ir) = product(ir) * (simple ? grid[ir] * grid[ir] : 1);
+                    }
+                    ds(i, j) = ds(j, i) = integral.interpolate().integrate(simple ? 0 : 2);
+                }
+                for (int lm = 0; lm < lmmax; lm++) {
+                    double value{0};
+                    if (lm == 0 && l1 == l2) {
+                        for (int ir = 0; ir < grid.num_points(); ir++) {
+                            integral(ir) = 0.5 * (drf(ir, i, 1) * cls.radial_function_derivative(ir, j) +
+                                                  cls.radial_function_derivative(ir, i) * drf(ir, j, 1)) +
+                                           product(ir) * (0.5 * l1 * (l1 + 1) + spherical[ir] * grid[ir] * grid[ir]);
+                        }
+                        value = integral.interpolate().integrate(0) / y00;
+                    } else if (lm != 0) {
+                        for (int ir = 0; ir < grid.num_points(); ir++) {
+                            field(ir) = potential_.effective_potential().mt()[ia](lm, ir);
+                        }
+                        value = integrate_field(i, j);
+                    }
+                    double magnetic{0};
+                    if (ns == 2) {
+                        for (int ir = 0; ir < grid.num_points(); ir++) {
+                            field(ir) = potential_.effective_magnetic_field(0).mt()[ia](lm, ir);
+                        }
+                        magnetic = integrate_field(i, j);
+                    }
+                    for (int s = 0; s < ns; s++) {
+                        dh(lm, i, j, s) = dh(lm, j, i, s) = value + (1 - 2 * s) * magnetic;
+                    }
+                }
+            }
+        }
+        for (int j = 0; j < n; j++) {
+            auto const& b = type.indexb(j);
+            for (int i = 0; i < n; i++) {
+                auto const& a = type.indexb(i);
+                if (a.lm == b.lm) {
+                    bool aw              = i < type.mt_aw_basis_size() && j < type.mt_aw_basis_size();
+                    matrix.overlap(i, j) = aw ? (i == j ? 1 : 0) : cls.o_radial_integral(a.am.l(), a.order, b.order);
+                    matrix.o(i, j)       = aw ? 0 : ds(a.idxrf, b.idxrf);
+                }
+                for (auto const& g : type.gaunt_coefs().gaunt_vector(a.lm, b.lm)) {
+                    if (g.lm3 < lmmax) {
+                        for (int s = 0; s < ns; s++) {
+                            matrix.h(i, j, s) += g.coef * dh(g.lm3, a.idxrf, b.idxrf, s);
+                        }
+                    }
+                }
+            }
+        }
+        if (auto const* xc = potential_.lapw_xc_derivatives()) {
+            LAPW_xc_atom op(atom, ctx_.lmax_rho());
+            for (int s = 0; s < ns; s++) {
+                auto d = op.matrix_elements(xc->local[ia][0][s], xc->local[ia][1][s], &response[cls.id()]);
+                for (int j = 0; j < n; j++) {
+                    for (int i = 0; i < n; i++) {
+                        matrix.h(i, j, s) += d(i, j);
+                    }
+                }
+            }
+        }
+        matrices.push_back(std::move(matrix));
+    }
+
+    double result{0};
+    for (auto it : kset_.spl_num_kpoints()) {
+        auto& kp = *kset_.get<double>(it.i);
+        Matching_coefficients matching(uc, kp.gkvec());
+        std::vector<mdarray<std::complex<double>, 2>> alm, dalm;
+        for (int ia = 0; ia < uc.num_atoms(); ia++) {
+            auto const& atom = uc.atom(ia);
+            std::array<index_range, 2> shape{kp.gkvec().count(), atom.type().mt_aw_basis_size()};
+            alm.emplace_back(shape);
+            dalm.emplace_back(shape);
+            matching.generate<false>(atom, alm.back());
+            matching.generate_potential_response<false>(atom, response[atom.symmetry_class().id()], dalm.back());
+        }
+        for (int s = 0; s < ns; s++) {
+            for (int band = 0; band < ctx_.num_bands(); band++) {
+                double weight = kp.weight() * kp.band_occupancy(band, s) / kp.comm().size();
+                if (weight == 0) {
+                    continue;
+                }
+                auto all   = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(band));
+                int offset = kp.gkvec().num_gvec();
+                for (int ia = 0; ia < uc.num_atoms(); ia++) {
+                    auto const& type = uc.atom(ia).type();
+                    int n = type.mt_basis_size(), naw = type.mt_aw_basis_size();
+                    std::vector<std::complex<double>> c(n), dc(n);
+                    for (int i = 0; i < naw; i++) {
+                        for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                            c[i] += alm[ia](ig, i) * all[kp.gkvec().offset() + ig];
+                            dc[i] += dalm[ia](ig, i) * all[kp.gkvec().offset() + ig];
+                        }
+                    }
+                    kp.comm().allreduce(c.data(), naw);
+                    kp.comm().allreduce(dc.data(), naw);
+                    for (int i = naw; i < n; i++) {
+                        c[i] = all[offset + i];
+                    }
+                    auto const& d = matrices[ia];
+                    double energy = kp.band_energy(band, s);
+                    for (int j = 0; j < n; j++) {
+                        for (int i = 0; i < n; i++) {
+                            result +=
+                                    weight * std::real(2.0 * std::conj(dc[i]) *
+                                                               (h0.hmt(ia)(i, j, s) - energy * d.overlap(i, j)) * c[j] +
+                                                       std::conj(c[i]) * (d.h(i, j, s) - energy * d.o(i, j)) * c[j]);
+                        }
+                    }
+                    offset += n;
+                }
+            }
+        }
+    }
+    ctx_.comm().allreduce(&result, 1);
+    return result;
 }
 
 void

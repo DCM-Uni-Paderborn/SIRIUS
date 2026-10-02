@@ -80,7 +80,7 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
 
 auto
 context(int mag, bool distributed_fft, bool second_variation, bool core = false, bool relativistic_core = false,
-        double displacement = 0, double pw_cutoff = 5.0)
+        double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false)
 {
     auto config                               = R"({"parameters": {
         "electronic_structure_method": "full_potential_lapwlo", "use_symmetry": false,
@@ -97,6 +97,7 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     config["parameters"]["core_relativity"]   = relativistic_core ? "dirac" : "none";
     config["parameters"]["num_bands"]         = core ? 8 : 4;
     config["parameters"]["pw_cutoff"]         = pw_cutoff;
+    config["settings"]["simple_lapw_ri"]      = simple_radial_integrals;
     auto ctx                                  = std::make_unique<Simulation_context>(config);
     ctx->unit_cell().set_lattice_vectors({{6, 0, 0}, {0, 7, 0}, {0, 0, 8}});
     std::string label = core ? "Ne" : "He";
@@ -209,14 +210,16 @@ occupied_lapw_lagrangian(Simulation_context const& ctx, K_point<double> const& k
 int
 test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool core = false)
 {
-    auto ctx = context(mag, distributed_fft, second_variation, core);
+    bool simple = !mag && second_variation && !core;
+    auto ctx    = context(mag, distributed_fft, second_variation, core, false, 0, 5.0, simple);
     int failures{0};
     auto check = [&](char const* name, double error, double tolerance) {
         ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
         if (ctx->comm().rank() == 0) {
             std::cout << "external LAPW core=" << core << " spins=" << ctx->num_spins()
                       << " atoms=" << ctx->unit_cell().num_atoms() << " distributed FFT=" << distributed_fft
-                      << " second variation=" << second_variation << " " << name << ": " << error << '\n';
+                      << " second variation=" << second_variation << " simple radial integrals=" << simple << " "
+                      << name << ": " << error << '\n';
         }
         failures += !std::isfinite(error) || error > tolerance;
     };
@@ -531,6 +534,74 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         evaluate(0);
         check("nonzero basis/boundary force", std::abs(analytic) > 1e-7 ? 0 : 1, 0);
         verify_restored();
+
+        std::vector<std::vector<double>> spherical;
+        for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+            spherical.push_back(ctx->unit_cell().atom_symmetry_class(ic).spherical_potential());
+        }
+        auto radial_direction = spherical;
+        for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto const& grid = ctx->unit_cell().atom_symmetry_class(ic).atom_type().radial_grid();
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                radial_direction[ic][ir] = (ic + 1) * (0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]));
+            }
+        }
+        double basis_derivative = gs.forces().lapw_radial_basis_derivative(radial_direction);
+        verify_restored();
+        if (!mag && !second_variation) {
+            auto direction = radial_direction;
+            for (auto& atom : direction) {
+                std::fill(atom.begin(), atom.end(), 0);
+            }
+            check("zero radial potential direction", std::abs(gs.forces().lapw_radial_basis_derivative(direction)), 0);
+            if (ctx->comm().rank() == 0) {
+                direction[0].pop_back();
+            }
+            reject("invalid radial direction rejected collectively",
+                   [&] { gs.forces().lapw_radial_basis_derivative(direction); });
+            verify_restored();
+        }
+        auto radial_lagrangian = [&](double step) {
+            for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                auto v = spherical[ic];
+                for (size_t ir = 0; ir < v.size(); ir++) {
+                    v[ir] += step * radial_direction[ic][ir];
+                }
+                auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
+                cls.set_spherical_potential(v);
+                if (cls.generate_radial_functions(relativity_t::none, false)) {
+                    RTE_THROW("radial basis derivative fixture failed");
+                }
+                // Only the basis changes, not the physical Hamiltonian.
+                cls.set_spherical_potential(spherical[ic]);
+            }
+            ctx->unit_cell().generate_radial_integrals();
+            Hamiltonian0<double> radial_h0(potential, false);
+            radial_h0.generate_pw_coefs(potential);
+            double value{0};
+            for (auto it : ks.spl_num_kpoints()) {
+                auto kp = ks.get<double>(it.i);
+                auto hk = radial_h0(*kp);
+                int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                for (int s = 0; s < ctx->num_spins(); s++) {
+                    hk.set_fv_h_o(s, h, o);
+                    value += occupied_lapw_lagrangian(*ctx, *kp, s, h, o);
+                }
+            }
+            ctx->comm().allreduce(&value, 1);
+            return value;
+        };
+        for (double step : {1e-3, 5e-4}) {
+            double fd = (radial_lagrangian(step) - radial_lagrangian(-step)) / (2 * step);
+            check("radial basis Lagrangian derivative", std::abs(fd - basis_derivative), 2e-8);
+            check("relative radial basis Lagrangian derivative", std::abs((fd - basis_derivative) / basis_derivative),
+                  2e-5);
+        }
+        radial_lagrangian(0);
+        check("nonzero radial basis Lagrangian derivative", std::abs(basis_derivative) > 1e-7 ? 0 : 1, 0);
+        verify_restored();
     }
     return failures;
 }
@@ -539,6 +610,7 @@ int
 test_lapw_force_response(int mag, double pw_cutoff)
 {
     std::vector<std::vector<double>> frozen_potential;
+    std::vector<std::vector<double>> displaced_potential;
     struct state_t
     {
         std::unique_ptr<Simulation_context> ctx;
@@ -644,7 +716,8 @@ test_lapw_force_response(int mag, double pw_cutoff)
         if (forces) {
             reference = std::move(state);
         } else if (!frozen) {
-            result[3] = radial_lagrangian(gs.potential().get_spherical_potential());
+            displaced_potential = gs.potential().get_spherical_potential();
+            result[3]           = radial_lagrangian(displaced_potential);
         }
         return result;
     };
@@ -652,18 +725,34 @@ test_lapw_force_response(int mag, double pw_cutoff)
     for (bool frozen : {false, true}) {
         auto centre = calculate(0, true, frozen);
         for (double h : {2e-4, 1e-4}) {
-            auto plus = calculate(h, false, frozen), minus = calculate(-h, false, frozen);
+            auto plus       = calculate(h, false, frozen);
+            auto direction  = displaced_potential;
+            auto minus      = calculate(-h, false, frozen);
             double fd       = (plus[0] - minus[0]) / (2 * h);
             double response = (plus[3] - minus[3]) / (2 * h);
-            double error    = std::abs(fd - centre[1] - response);
+            double analytic_response{0};
+            if (!frozen) {
+                for (size_t ic = 0; ic < direction.size(); ic++) {
+                    for (size_t ir = 0; ir < direction[ic].size(); ir++) {
+                        direction[ic][ir] = (direction[ic][ir] - displaced_potential[ic][ir]) / (2 * h);
+                    }
+                }
+                radial_lagrangian(frozen_potential);
+                analytic_response = reference->gs->forces().lapw_radial_basis_derivative(direction);
+            }
+            double error          = std::abs(fd - centre[1] - response);
+            double analytic_error = std::abs(fd - centre[1] - analytic_response);
             if (mpi::Communicator::world().rank() == 0) {
                 std::cout << "LAPW force decomposition spin=" << mag << " pw cutoff=" << pw_cutoff
                           << " frozen radial basis=" << frozen << " h=" << h << " derivative=" << centre[1]
                           << " FD=" << fd << " direct FD=" << (plus[2] - minus[2]) / (2 * h)
                           << " energy identity=" << centre[0] - centre[2] << " radial response=" << response
-                          << " error=" << error << '\n';
+                          << " analytic radial response=" << analytic_response << " error=" << error
+                          << " analytic error=" << analytic_error << '\n';
             }
             failures += !std::isfinite(error) || error > 2e-6;
+            failures += !std::isfinite(analytic_error) || analytic_error > 2e-6;
+            failures += std::abs(response - analytic_response) > 2e-7;
             failures += !frozen && std::abs(response) < 1e-5;
             for (auto const& point : {centre, plus, minus}) {
                 failures += !std::isfinite(point[0] - point[2]) || std::abs(point[0] - point[2]) > 2e-7;
