@@ -31,6 +31,12 @@ struct radial_core_state_t
     std::vector<double> tau;
 };
 
+struct radial_core_response_t
+{
+    radial_core_state_t value;
+    radial_core_state_t derivative;
+};
+
 /// Nonrelativistic radial generalized-Kohn-Sham solver with discrete density/tau derivatives.
 /** The regular radial orbital is expanded as R_l(r) = r^l sum_i c_i B_i(r).
  *  Dropping the last B-spline imposes a vanishing orbital at the outer boundary.
@@ -115,25 +121,28 @@ class Radial_core_solver
         }
     }
 
-    la::dmatrix<double>
-    hamiltonian(std::vector<double> const& drho__, std::vector<double> const& dtau__) const
+    void
+    add_xc(la::dmatrix<double>& h__, std::vector<double> const& drho__, std::vector<double> const& dtau__) const
     {
         check_covectors(drho__, dtau__);
-        la::dmatrix<double> h(size(), size());
-        for (int j = 0; j < size(); j++) {
-            for (int i = 0; i < size(); i++) {
-                h(i, j) = h0_(i, j);
-            }
-        }
         for (size_t ir = 0; ir < samples_.size(); ir++) {
             for (auto const& a : samples_[ir]) {
                 for (auto const& b : samples_[ir]) {
-                    h(a.index, b.index) += (drho__[ir] * a.value * b.value +
-                                            0.5 * dtau__[ir] * (a.derivative * b.derivative + a.angular * b.angular)) /
-                                           fourpi;
+                    h__(a.index, b.index) +=
+                            (drho__[ir] * a.value * b.value +
+                             0.5 * dtau__[ir] * (a.derivative * b.derivative + a.angular * b.angular)) /
+                            fourpi;
                 }
             }
         }
+    }
+
+    la::dmatrix<double>
+    hamiltonian(std::vector<double> const& drho__, std::vector<double> const& dtau__) const
+    {
+        la::dmatrix<double> h(size(), size());
+        copy(h0_, h);
+        add_xc(h, drho__, dtau__);
         return h;
     }
 
@@ -371,6 +380,82 @@ class Radial_core_solver
         }
         return result;
     }
+
+    /// Differentiate core eigenstates at fixed radial grid, basis, nuclear charge and boundary.
+    /** The potential direction is an ordinary local potential. The two XC directions are
+     *  variations of the already-weighted sample covectors, without further quadrature.
+     *  The tangent orbitals satisfy c^T S dc = 0. Energies are eigenvalue derivatives. */
+    std::vector<radial_core_response_t>
+    solve_response(int num_states__, std::vector<double> const& drho__, std::vector<double> const& dtau__,
+                   std::vector<double> const& potential_direction__, std::vector<double> const& rho_direction__,
+                   std::vector<double> const& tau_direction__) const
+    {
+        if (potential_direction__.size() != samples_.size() ||
+            !std::all_of(potential_direction__.begin(), potential_direction__.end(),
+                         [](double x) { return std::isfinite(x); })) {
+            RTE_THROW("radial core response: invalid potential direction");
+        }
+        int n = size();
+        la::dmatrix<double> dh(n, n);
+        dh.zero();
+        Spline<double> direction(grid_, potential_direction__);
+        for (auto const& p : basis_.basis_pairs()) {
+            for (size_t q = 0; q < p.r.size(); q++) {
+                double r = p.r[q];
+                dh(p.i, p.j) += p.w[q] * std::pow(r, 2 * l_ + 2) * p.Bi[q] * p.Bj[q] *
+                                direction.at_point(std::max(r, grid_.first()));
+            }
+        }
+        add_xc(dh, rho_direction__, tau_direction__);
+        auto h      = hamiltonian(drho__, dtau__);
+        auto states = solve(num_states__, drho__, dtau__);
+        std::vector<double> scale(n);
+        for (int i = 0; i < n; i++) {
+            scale[i] = 1 / std::sqrt(overlap_(i, i));
+        }
+        std::vector<radial_core_response_t> result;
+        for (auto& value : states) {
+            auto const& c = value.coefficients;
+            la::dmatrix<double> a(n + 1, n + 1);
+            a.zero();
+            std::vector<double> rhs(n + 1, 0);
+            // Border the singular Sternheimer operator by the normalization constraint.
+            for (int i = 0; i < n; i++) {
+                double sc{0};
+                for (int j = 0; j < n; j++) {
+                    sc += overlap_(i, j) * c[j];
+                    rhs[i] -= scale[i] * dh(i, j) * c[j];
+                    a(i, j) = scale[i] * (h(i, j) - value.energy * overlap_(i, j)) * scale[j];
+                }
+                a(i, n) = a(n, i) = scale[i] * sc;
+            }
+            int info = la::wrap(la::lib_t::lapack).gesv(n + 1, 1, a.at(memory_t::host), n + 1, rhs.data(), n + 1);
+            if (info || !std::all_of(rhs.begin(), rhs.end(), [](double x) { return std::isfinite(x); })) {
+                RTE_THROW("radial core response: singular or nonfinite eigenstate response");
+            }
+            std::vector<double> dc(n);
+            for (int i = 0; i < n; i++) {
+                dc[i] = scale[i] * rhs[i];
+            }
+            auto tangent           = state(dc);
+            tangent.energy         = -rhs[n];
+            tangent.kinetic_energy = 0;
+            for (int j = 0; j < n; j++) {
+                for (int i = 0; i < n; i++) {
+                    tangent.kinetic_energy += 2 * c[i] * kinetic_(i, j) * dc[j];
+                }
+            }
+            for (int ir = 0; ir < grid_.num_points(); ir++) {
+                double product  = value.value[ir] * tangent.value[ir];
+                tangent.rho[ir] = 2 * product / fourpi;
+                tangent.tau[ir] = (value.derivative[ir] * tangent.derivative[ir] +
+                                   l_ * (l_ + 1.0) * product / (grid_[ir] * grid_[ir])) /
+                                  fourpi;
+            }
+            result.push_back({std::move(value), std::move(tangent)});
+        }
+        return result;
+    }
 };
 
 /// Converge the occupied core eigenstates used by both density and LAPW basis construction.
@@ -436,13 +521,19 @@ solve_radial_core_states(Radial_grid<double> const& grid__, int l__, int zn__, s
  */
 inline void
 orthogonalize_radial_to_core(Radial_grid<double> const& grid__, std::vector<radial_core_state_t> const& core__,
-                             radial_solver_result_t& radial__)
+                             radial_solver_result_t& radial__,
+                             std::vector<radial_core_state_t> const* core_response__ = nullptr,
+                             radial_solver_result_t* response__                      = nullptr)
 {
+    if (core_response__ && (!response__ || core_response__->size() != core__.size())) {
+        RTE_THROW("core projection: inconsistent core response");
+    }
     if (core__.empty()) {
         return;
     }
     int n = static_cast<int>(core__.size()), nr = grid__.num_points();
-    if (radial__.p.size() != nr || radial__.rdudr.size() != nr) {
+    if (radial__.p.size() != nr || radial__.rdudr.size() != nr ||
+        (response__ && (response__->p.size() != nr || response__->rdudr.size() != nr))) {
         RTE_THROW("core projection: inconsistent radial field size");
     }
     for (auto const& state : core__) {
@@ -450,8 +541,17 @@ orthogonalize_radial_to_core(Radial_grid<double> const& grid__, std::vector<radi
             RTE_THROW("core projection: missing signed core orbital or derivative");
         }
     }
+    if (core_response__) {
+        for (auto const& state : *core_response__) {
+            if (state.value.size() < nr || state.derivative.size() < nr) {
+                RTE_THROW("core projection: missing core orbital response");
+            }
+        }
+    }
     la::dmatrix<double> overlap(n, n);
+    la::dmatrix<double> response_overlap(n, n);
     std::vector<double> rhs(n), weight(nr), derivative(nr);
+    std::vector<double> drhs(n, 0);
     double radius = grid__.last();
     for (int ir = 0; ir < nr; ir++) {
         double x = grid__[ir] / radius, t = 1 - x * x;
@@ -464,6 +564,13 @@ orthogonalize_radial_to_core(Radial_grid<double> const& grid__, std::vector<radi
             product(ir) = core__[i].value[ir] * radial__.p[ir];
         }
         rhs[i] = product.interpolate().integrate(1);
+        if (response__) {
+            for (int ir = 0; ir < nr; ir++) {
+                product(ir) = core__[i].value[ir] * response__->p[ir] +
+                              (core_response__ ? (*core_response__)[i].value[ir] * radial__.p[ir] : 0);
+            }
+            drhs[i] = product.interpolate().integrate(1);
+        }
         for (int j = 0; j <= i; j++) {
             for (int ir = 0; ir < nr; ir++) {
                 product(ir) = core__[i].value[ir] * core__[j].value[ir] * weight[ir];
@@ -471,18 +578,48 @@ orthogonalize_radial_to_core(Radial_grid<double> const& grid__, std::vector<radi
             overlap(i, j) = overlap(j, i) = product.interpolate().integrate(2);
         }
     }
+    if (response__) {
+        copy(overlap, response_overlap);
+    }
     int info = la::wrap(la::lib_t::lapack).gesv(n, 1, overlap.at(memory_t::host), n, rhs.data(), n);
     if (info || !std::all_of(rhs.begin(), rhs.end(), [](double x) { return std::isfinite(x); })) {
         RTE_THROW("core projection: singular or nonfinite core overlap");
     }
+    if (response__) {
+        if (core_response__) {
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < n; j++) {
+                    for (int ir = 0; ir < nr; ir++) {
+                        product(ir) = weight[ir] * ((*core_response__)[i].value[ir] * core__[j].value[ir] +
+                                                    core__[i].value[ir] * (*core_response__)[j].value[ir]);
+                    }
+                    drhs[i] -= product.interpolate().integrate(2) * rhs[j];
+                }
+            }
+        }
+        info = la::wrap(la::lib_t::lapack).gesv(n, 1, response_overlap.at(memory_t::host), n, drhs.data(), n);
+        if (info || !std::all_of(drhs.begin(), drhs.end(), [](double x) { return std::isfinite(x); })) {
+            RTE_THROW("core projection: singular or nonfinite projection response");
+        }
+    }
     radial__.num_nodes = 0;
     for (int ir = 0; ir < nr; ir++) {
         for (int j = 0; j < n; j++) {
+            if (response__) {
+                double dr = core_response__ ? (*core_response__)[j].value[ir] : 0;
+                double dd = core_response__ ? (*core_response__)[j].derivative[ir] : 0;
+                response__->p[ir] -= grid__[ir] * weight[ir] * (drhs[j] * core__[j].value[ir] + rhs[j] * dr);
+                response__->rdudr[ir] -=
+                        grid__[ir] *
+                        (drhs[j] * (derivative[ir] * core__[j].value[ir] + weight[ir] * core__[j].derivative[ir]) +
+                         rhs[j] * (derivative[ir] * dr + weight[ir] * dd));
+            }
             radial__.p[ir] -= rhs[j] * grid__[ir] * weight[ir] * core__[j].value[ir];
             radial__.rdudr[ir] -= rhs[j] * grid__[ir] *
                                   (derivative[ir] * core__[j].value[ir] + weight[ir] * core__[j].derivative[ir]);
         }
-        if (!std::isfinite(radial__.p[ir]) || !std::isfinite(radial__.rdudr[ir])) {
+        if (!std::isfinite(radial__.p[ir]) || !std::isfinite(radial__.rdudr[ir]) ||
+            (response__ && (!std::isfinite(response__->p[ir]) || !std::isfinite(response__->rdudr[ir])))) {
             RTE_THROW("core projection: nonfinite projected radial function");
         }
         if (ir && radial__.p[ir] * radial__.p[ir - 1] < 0) {
