@@ -92,6 +92,12 @@ Potential::get_core_xc_derivatives() const
     if (!lapw_xc_derivatives_) {
         return {};
     }
+    return project_core_xc_derivatives(*lapw_xc_derivatives_);
+}
+
+std::vector<std::array<std::vector<double>, 2>>
+Potential::project_core_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const
+{
     std::vector<std::array<std::vector<double>, 2>> result(unit_cell_.num_atom_symmetry_classes());
     for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
         auto const& cls = unit_cell_.atom_symmetry_class(ic);
@@ -99,7 +105,7 @@ Potential::get_core_xc_derivatives() const
         for (int part = 0; part < 2; part++) {
             result[ic][part].resize(nr, 0);
             for (int i = 0; i < cls.num_atoms(); i++) {
-                auto const& d = lapw_xc_derivatives_->core[cls.atom_id(i)][part];
+                auto const& d = derivatives__.core[cls.atom_id(i)][part];
                 for (int ir = 0; ir < nr; ir++) {
                     result[ic][part][ir] += d[ir] / cls.num_atoms();
                 }
@@ -107,6 +113,30 @@ Potential::get_core_xc_derivatives() const
         }
     }
     return result;
+}
+
+void
+Potential::lapw_radial_potential_response(Density const& density__, Density const& density_response__,
+                                          std::vector<std::vector<double>>& scalar__,
+                                          std::vector<std::array<std::vector<double>, 2>>& xc__) const
+{
+    auto derivatives = lapw_external_xc_response(density__, density_response__);
+    auto hartree     = hartree_response(density_response__.rho());
+    std::vector<std::vector<double>> spherical(unit_cell_.num_atom_symmetry_classes());
+    for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
+        auto const& cls = unit_cell_.atom_symmetry_class(ic);
+        int ia = cls.atom_id(0), nr = cls.atom_type().num_mt_points();
+        int owner = unit_cell_.spl_num_atoms().location(atom_index_t::global(ia)).ib;
+        spherical[ic].resize(nr);
+        if (ctx_.comm().rank() == owner) {
+            for (int ir = 0; ir < nr; ir++) {
+                spherical[ic][ir] = y00 * hartree->mt()[ia](0, ir);
+            }
+        }
+        ctx_.comm().bcast(spherical[ic].data(), nr, owner);
+    }
+    xc__     = project_core_xc_derivatives(derivatives);
+    scalar__ = std::move(spherical);
 }
 
 lapw_xc_contractions_t

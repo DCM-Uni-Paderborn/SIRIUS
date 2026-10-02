@@ -8,6 +8,110 @@
 
 namespace sirius {
 
+std::array<double, 2>
+DFT_ground_state::check_lapw_xc_response(double step__) const
+{
+    int invalid = !ctx_.full_potential() || !ctx_.cb().external_xc_response_ || !std::isfinite(step__) || step__ <= 0;
+    double hmin = step__, hmax = step__;
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    ctx_.comm().allreduce<double, mpi::op_t::min>(&hmin, 1);
+    ctx_.comm().allreduce<double, mpi::op_t::max>(&hmax, 1);
+    if (invalid || hmin != hmax) {
+        RTE_THROW("LAPW XC response check requires a point-response callback and a common positive step");
+    }
+    Density direction(ctx_), plus(ctx_), minus(ctx_);
+    direction.zero();
+    direction.kinetic_density().zero();
+    for (int j = 0; j <= ctx_.num_mag_dims(); j++) {
+        axpy(0.3 + 0.1 * j, density_.component(j), direction.component(j));
+        axpy(-0.2 + 0.05 * j, density_.kinetic_density().component(j), direction.kinetic_density().component(j));
+    }
+    auto response = potential_.lapw_external_xc_response(density_, direction);
+    std::vector<std::vector<double>> radial_scalar;
+    std::vector<std::array<std::vector<double>, 2>> radial_xc;
+    potential_.lapw_radial_potential_response(density_, direction, radial_scalar, radial_xc);
+    Potential plus_potential(ctx_), minus_potential(ctx_);
+    std::array<double, 2> result{};
+    for (int k = 0; k < 2; k++) {
+        double h = step__ / (k + 1);
+        copy(density_, plus);
+        copy(density_, minus);
+        for (int j = 0; j <= ctx_.num_mag_dims(); j++) {
+            for (auto* field : {&plus, &minus}) {
+                double sign = field == &plus ? 1 : -1;
+                axpy(sign * h, direction.component(j), field->component(j));
+                axpy(sign * h, direction.kinetic_density().component(j), field->kinetic_density().component(j));
+            }
+        }
+        plus_potential.xc(plus);
+        minus_potential.xc(minus);
+        auto plus_hartree  = potential_.hartree_response(plus.rho());
+        auto minus_hartree = potential_.hartree_response(minus.rho());
+        auto plus_core     = plus_potential.get_core_xc_derivatives();
+        auto minus_core    = minus_potential.get_core_xc_derivatives();
+        auto const& p      = *plus_potential.lapw_xc_derivatives();
+        auto const& m      = *minus_potential.lapw_xc_derivatives();
+        double error{0}, peak{0};
+        auto compare = [&](auto r, auto u, auto v) {
+            double e = std::abs(r - (u - v) / (2 * h)), a = std::abs(r);
+            if (!std::isfinite(e) || !std::isfinite(a)) {
+                error = std::numeric_limits<double>::infinity();
+            } else {
+                error = std::max(error, e);
+                peak  = std::max(peak, a);
+            }
+        };
+        auto finish_group = [&] {
+            ctx_.comm().allreduce<double, mpi::op_t::max>(&error, 1);
+            ctx_.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+            result[k] = std::max(result[k], error / std::max(1e-12, peak));
+            error = peak = 0;
+        };
+        for (int s = 0; s < ctx_.num_spins(); s++) {
+            for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
+                compare(response.rho[s].f_pw_local(ig), p.rho[s].f_pw_local(ig), m.rho[s].f_pw_local(ig));
+                compare(response.tau[s].f_pw_local(ig), p.tau[s].f_pw_local(ig), m.tau[s].f_pw_local(ig));
+            }
+        }
+        for (size_t ia = 0; ia < response.local.size(); ia++) {
+            for (int part = 0; part < 2; part++) {
+                for (int s = 0; s < ctx_.num_spins(); s++) {
+                    for (size_t i = 0; i < response.local[ia][part][s].size(); i++) {
+                        compare(response.local[ia][part][s][i], p.local[ia][part][s][i], m.local[ia][part][s][i]);
+                    }
+                }
+                for (size_t i = 0; i < response.core[ia][part].size(); i++) {
+                    compare(response.core[ia][part][i], p.core[ia][part][i], m.core[ia][part][i]);
+                }
+            }
+        }
+        finish_group();
+        for (int ic = 0; ic < ctx_.unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto const& cls = ctx_.unit_cell().atom_symmetry_class(ic);
+            int nr          = cls.atom_type().num_mt_points();
+            for (int ir = 0; ir < nr; ir++) {
+                for (int part : {0, 1}) {
+                    compare(radial_xc[ic][part][ir], plus_core[ic][part][ir], minus_core[ic][part][ir]);
+                }
+            }
+        }
+        finish_group();
+        for (int ic = 0; ic < ctx_.unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto const& cls = ctx_.unit_cell().atom_symmetry_class(ic);
+            int ia = cls.atom_id(0), nr = cls.atom_type().num_mt_points();
+            int owner = ctx_.unit_cell().spl_num_atoms().location(atom_index_t::global(ia)).ib;
+            if (ctx_.comm().rank() == owner) {
+                for (int ir = 0; ir < nr; ir++) {
+                    compare(radial_scalar[ic][ir], y00 * plus_hartree->mt()[ia](0, ir),
+                            y00 * minus_hartree->mt()[ia](0, ir));
+                }
+            }
+        }
+        finish_group();
+    }
+    return result;
+}
+
 std::array<std::array<double, 3>, 2>
 DFT_ground_state::check_lapw_xc_derivative(double step__)
 {

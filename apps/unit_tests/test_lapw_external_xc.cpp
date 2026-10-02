@@ -78,6 +78,33 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
     }
 }
 
+void
+functional_response(Simulation_context const& ctx, xc_callback_input_t const& in,
+                    xc_callback_direction_t const& direction, xc_callback_response_t& out)
+{
+    double moment{0};
+    for (int s = 0; s < in.num_spins; s++) {
+        for (int p = 0; p < in.num_points; p++) {
+            int j = p + in.num_points * s;
+            moment += in.points->descriptor_weights[p] * (direction.rho[j] + 0.3 * direction.tau[j]);
+        }
+    }
+    ctx.comm().allreduce(&moment, 1);
+    double nonlocal = 0.01 * moment / ctx.unit_cell().omega(), scale = functional_scale(ctx);
+    for (int s = 0; s < in.num_spins; s++) {
+        for (int p = 0; p < in.num_points; p++) {
+            int j    = p + in.num_points * s;
+            double w = in.points->energy_weights[p], d = in.points->descriptor_weights[p];
+            out.vrho[j] = scale * (w * (0.04 * direction.rho[j] + 0.005 * direction.tau[j]) + d * nonlocal);
+            out.vtau[j] = scale * (w * (0.02 * direction.tau[j] + 0.005 * direction.rho[j]) + 0.3 * d * nonlocal);
+            for (int x = 0; x < 3; x++) {
+                int k            = p + in.num_points * (x + 3 * s);
+                out.vgradient[k] = scale * 0.004 * w * direction.gradient[k];
+            }
+        }
+    }
+}
+
 auto
 context(int mag, bool distributed_fft, bool second_variation, bool core = false, bool relativistic_core = false,
         double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false, int auto_enu = 0)
@@ -130,8 +157,8 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     }
     auto points     = std::make_shared<xc_point_set_t>(*ctx);
     constexpr int n = 10;
-    // All points on one rank exercise empty model ranks and replicated FFTs.
-    if (ctx->comm().rank() == 0) {
+    // Replicated FFTs exercise empty model ranks; distributed FFTs also partition model rows.
+    if (ctx->comm().rank() == 0 || distributed_fft) {
         for (int z = 0; z < n; z++) {
             for (int y = 0; y < n; y++) {
                 for (int x = 0; x < n; x++) {
@@ -173,11 +200,27 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
                 }
             }
         }
-        points->block_sizes   = {static_cast<int>(points->coordinates.size())};
-        points->block_centres = {{1.38, 2.17, 3.44}};
+        if (distributed_fft) {
+            size_t local{0};
+            for (size_t p = 0; p < points->coordinates.size(); p++) {
+                if (p % ctx->comm().size() == static_cast<size_t>(ctx->comm().rank())) {
+                    points->coordinates[local]          = points->coordinates[p];
+                    points->energy_weights[local]       = points->energy_weights[p];
+                    points->descriptor_weights[local++] = points->descriptor_weights[p];
+                }
+            }
+            points->coordinates.resize(local);
+            points->energy_weights.resize(local);
+            points->descriptor_weights.resize(local);
+        }
+        if (!points->coordinates.empty()) {
+            points->block_sizes   = {static_cast<int>(points->coordinates.size())};
+            points->block_centres = {{1.38, 2.17, 3.44}};
+        }
     }
-    ctx->cb().external_xc_points_ = std::move(points);
-    ctx->cb().external_xc_        = functional;
+    ctx->cb().external_xc_points_   = std::move(points);
+    ctx->cb().external_xc_          = functional;
+    ctx->cb().external_xc_response_ = functional_response;
     ctx->initialize();
     return ctx;
 }
@@ -247,6 +290,58 @@ potential_response_error(std::vector<double> const& response, std::vector<double
 }
 
 std::vector<double>
+xc_samples(lapw_xc_field_adjoint_t const& fields)
+{
+    std::vector<double> result;
+    for (auto const* part : {&fields.rho, &fields.tau}) {
+        for (auto const& spin : *part) {
+            for (auto value : spin.f_pw_local()) {
+                result.push_back(value.real());
+                result.push_back(value.imag());
+            }
+        }
+    }
+    for (auto const& atom : fields.local) {
+        for (auto const& part : atom) {
+            for (auto const& spin : part) {
+                for (size_t i = 0; i < spin.size(); i++) {
+                    result.push_back(spin[i]);
+                }
+            }
+        }
+    }
+    for (auto const& atom : fields.core) {
+        for (auto const& part : atom) {
+            result.insert(result.end(), part.begin(), part.end());
+        }
+    }
+    return result;
+}
+
+std::vector<double>
+radial_xc_response(Simulation_context& ctx, Potential const& potential, Density const& density,
+                   std::vector<std::array<std::vector<Flm>, 2>> const& fields)
+{
+    Density direction(ctx);
+    direction.zero();
+    direction.kinetic_density().zero();
+    for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+        for (int part : {0, 1}) {
+            auto& target = part == 0 ? static_cast<Field4D&>(direction) : direction.kinetic_density();
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                target.scalar().mt()[ia] += fields[ia][part][s];
+                if (ctx.num_spins() == 2) {
+                    for (size_t i = 0; i < fields[ia][part][s].size(); i++) {
+                        target.vector(0).mt()[ia][i] += (1 - 2 * s) * fields[ia][part][s][i];
+                    }
+                }
+            }
+        }
+    }
+    return xc_samples(potential.lapw_external_xc_response(density, direction));
+}
+
+std::vector<double>
 radial_hartree_response(Simulation_context const& ctx, Potential const& potential,
                         std::vector<std::array<std::vector<Flm>, 2>> const& fields)
 {
@@ -265,7 +360,7 @@ radial_hartree_response(Simulation_context const& ctx, Potential const& potentia
 std::vector<double>
 sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::vector<double>> const& vs,
                      std::vector<std::array<std::vector<double>, 2>> const& core_xc,
-                     std::vector<double>* hartree = nullptr)
+                     std::vector<double>* hartree = nullptr, std::vector<double>* xc = nullptr)
 {
     std::vector<int> nlo;
     for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
@@ -319,6 +414,11 @@ sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::
             Potential potential(ctx);
             // Omit the fixed nuclear potential before subtraction to avoid near-origin cancellation.
             *hartree = potential_samples(*potential.hartree_response(density.rho()));
+        }
+        if (xc) {
+            Potential potential(ctx);
+            potential.xc(density);
+            *xc = xc_samples(*potential.lapw_xc_derivatives());
         }
         for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
             for (auto* fields : {static_cast<Field4D*>(&density), &density.kinetic_density()}) {
@@ -470,6 +570,126 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         no_spheres.zero();
         reject("missing MT Hartree direction rejected collectively", [&] { potential.hartree_response(no_spheres); });
     }
+    if (!core) {
+        Density direction(*ctx), shifted(*ctx);
+        direction.zero();
+        direction.kinetic_density().zero();
+        auto saved          = xc_samples(*potential.lapw_xc_derivatives());
+        double saved_energy = potential.energy_exc(density);
+        double peak{0};
+        for (double x : xc_samples(potential.lapw_external_xc_response(density, direction))) {
+            peak = std::max(peak, std::abs(x));
+        }
+        check("zero XC kernel direction", peak, 0);
+        for (int component = 0; component <= ctx->num_mag_dims(); component++) {
+            for (int part : {0, 1}) {
+                auto& field =
+                        part == 0 ? direction.component(component) : direction.kinetic_density().component(component);
+                for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+                    auto g = ctx->gvec().gvec(gvec_index_t::local(ig));
+                    if (std::abs(g[0]) + std::abs(g[1]) + std::abs(g[2]) == 1) {
+                        field.rg().f_pw_local(ig) = std::complex<double>(0.003, 0.002 * (g[0] + g[1] + g[2])) *
+                                                    double(1 + component + part);
+                    }
+                }
+                field.rg().fft_transform(1);
+                auto angular_l = sf::l_by_lm(ctx->lmax_rho());
+                for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                    auto const& grid = ctx->unit_cell().atom(ia).radial_grid();
+                    for (int lm = 0; lm < ctx->lmmax_rho(); lm++) {
+                        for (int ir = 0; ir < grid.num_points(); ir++) {
+                            field.mt()[ia](lm, ir) = 0.02 * (1 + ia + component + part) *
+                                                     std::pow(grid[ir], angular_l[lm]) * std::exp(-grid[ir]) / (lm + 1);
+                        }
+                    }
+                }
+            }
+        }
+        // Add base-dependent curvature to catch a kernel evaluated at the wrong fields.
+        ctx->cb().external_xc_ = [](auto const& c, auto const& in, auto& out) {
+            functional(c, in, out);
+            double energy{0};
+            for (int s = 0; s < in.num_spins; s++) {
+                for (int p = 0; p < in.num_points; p++) {
+                    int j    = p + in.num_points * s;
+                    double w = 0.001 * in.points->energy_weights[p], r = in.rho[j], t = in.tau[j];
+                    energy += w * r * r * r * t;
+                    out.vrho[j] += 3 * w * r * r * t;
+                    out.vtau[j] += w * r * r * r;
+                    for (int x = 0; x < 3; x++) {
+                        int k    = p + in.num_points * (x + 3 * s);
+                        double g = in.gradient[k];
+                        energy += 0.5 * w * std::pow(g, 4);
+                        out.vgradient[k] += 2 * w * g * g * g;
+                    }
+                }
+            }
+            c.comm().allreduce(&energy, 1);
+            out.energy += energy;
+        };
+        ctx->cb().external_xc_response_ = [](auto const& c, auto const& in, auto const& d, auto& out) {
+            functional_response(c, in, d, out);
+            for (int s = 0; s < in.num_spins; s++) {
+                for (int p = 0; p < in.num_points; p++) {
+                    int j    = p + in.num_points * s;
+                    double w = 0.001 * in.points->energy_weights[p], r = in.rho[j], t = in.tau[j];
+                    out.vrho[j] += w * (6 * r * t * d.rho[j] + 3 * r * r * d.tau[j]);
+                    out.vtau[j] += 3 * w * r * r * d.rho[j];
+                    for (int x = 0; x < 3; x++) {
+                        int k = p + in.num_points * (x + 3 * s);
+                        out.vgradient[k] += 6 * w * in.gradient[k] * in.gradient[k] * d.gradient[k];
+                    }
+                }
+            }
+        };
+        auto response = xc_samples(potential.lapw_external_xc_response(density, direction));
+        Potential displaced(*ctx);
+        auto sample = [&](double step) {
+            copy(density, shifted);
+            for (int component = 0; component <= ctx->num_mag_dims(); component++) {
+                axpy(step, direction.component(component), shifted.component(component));
+                axpy(step, direction.kinetic_density().component(component),
+                     shifted.kinetic_density().component(component));
+            }
+            displaced.xc(shifted);
+            return xc_samples(*displaced.lapw_xc_derivatives());
+        };
+        for (double step : {1e-3, 5e-4}) {
+            auto plus = sample(step);
+            check("nonlinear nonlocal XC kernel matches production covectors",
+                  potential_response_error(response, plus, sample(-step), step), 2e-7);
+        }
+        check("XC kernel preserves potential and energy",
+              xc_samples(*potential.lapw_xc_derivatives()) != saved || potential.energy_exc(density) != saved_energy
+                      ? 1
+                      : 0,
+              0);
+        ctx->cb().external_xc_          = functional;
+        ctx->cb().external_xc_response_ = nullptr;
+        reject("missing XC response callback rejected collectively",
+               [&] { potential.lapw_external_xc_response(density, direction); });
+        ctx->cb().external_xc_response_ = [](auto const& c, auto const& in, auto const& d, auto& out) {
+            functional_response(c, in, d, out);
+            if (c.comm().rank() == 0) {
+                out.vrho[0] = std::numeric_limits<double>::quiet_NaN();
+            }
+        };
+        reject("nonfinite XC response rejected collectively",
+               [&] { potential.lapw_external_xc_response(density, direction); });
+        ctx->cb().external_xc_response_ = [](auto const& c, auto const&, auto const&, auto&) {
+            if (c.comm().rank() == 0) {
+                RTE_THROW("XC response fixture failure");
+            }
+        };
+        reject("XC response callback failure propagated collectively",
+               [&] { potential.lapw_external_xc_response(density, direction); });
+        ctx->cb().external_xc_response_ = functional_response;
+        if (ctx->comm().rank() == 0) {
+            direction.rho().mt()[0](0, 0) = std::numeric_limits<double>::quiet_NaN();
+        }
+        reject("nonfinite XC MT direction rejected collectively",
+               [&] { potential.lapw_external_xc_response(density, direction); });
+    }
     Density regenerated(*ctx);
     copy(density, regenerated);
     regenerated.generate<double>(ks, false, true, true);
@@ -595,6 +815,10 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
               std::abs(values[0] - values[1]), 2e-8);
         check("orbital derivative at halved step", std::abs(values[0] - values[2]), 6e-9);
         check("nonzero orbital derivative", std::abs(values[0]) / functional_scale(*ctx) > 1e-7 ? 0 : 1, 0);
+    }
+    verify_restored();
+    for (double error : gs.check_lapw_xc_response(1e-3)) {
+        check("field-response diagnostic", error, 1e-8);
     }
     verify_restored();
     int evaluations{0};
@@ -806,6 +1030,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             }
             auto field_response   = density.lapw_radial_fields_response(ks, radial_response);
             auto hartree_response = radial_hartree_response(*ctx, potential, field_response);
+            auto xc_response      = radial_xc_response(*ctx, potential, density, field_response);
             verify_restored();
             if (!mag && !second_variation && part == 0) {
                 std::vector<radial_basis_response_t> zero;
@@ -855,7 +1080,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 }
                 verify_restored();
             }
-            std::vector<double> sampled_fields, sampled_hartree;
+            std::vector<double> sampled_fields, sampled_hartree, sampled_xc;
             auto radial_lagrangian = [&](double step) {
                 auto shifted_vs = spherical;
                 auto shifted_xc = spherical_xc;
@@ -898,18 +1123,21 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     }
                 }
                 ctx->comm().allreduce(&value, 1);
-                sampled_fields = sample_radial_fields(*ctx, ks, shifted_vs, shifted_xc, &sampled_hartree);
+                sampled_fields = sample_radial_fields(*ctx, ks, shifted_vs, shifted_xc, &sampled_hartree, &sampled_xc);
                 return value;
             };
             for (double step : {1e-3, 5e-4}) {
                 double plus       = radial_lagrangian(step);
                 auto plus_fields  = sampled_fields;
                 auto plus_hartree = sampled_hartree;
+                auto plus_xc      = sampled_xc;
                 double fd         = (plus - radial_lagrangian(-step)) / (2 * step);
                 check("radial density/tau response",
                       radial_fields_error(field_response, plus_fields, sampled_fields, step), 3e-5);
                 check("radial Hartree response",
                       potential_response_error(hartree_response, plus_hartree, sampled_hartree, step), 3e-5);
+                check("radial XC covector response", potential_response_error(xc_response, plus_xc, sampled_xc, step),
+                      3e-5);
                 check("radial basis Lagrangian derivative", std::abs(fd - basis_derivative), 2e-8);
                 check("relative radial basis Lagrangian derivative",
                       std::abs((fd - basis_derivative) / basis_derivative), 2e-5);
@@ -1111,7 +1339,8 @@ test_lapw_linearization_response()
         radial_response.push_back(cls.radial_basis_potential_response(direction, {}, update_enu));
         auto field_response   = gs.density().lapw_radial_fields_response(ks, radial_response);
         auto hartree_response = radial_hartree_response(*ctx, gs.potential(), field_response);
-        std::vector<double> sampled_fields, sampled_hartree;
+        auto xc_response      = radial_xc_response(*ctx, gs.potential(), gs.density(), field_response);
+        std::vector<double> sampled_fields, sampled_hartree, sampled_xc;
         auto sample = [&](double step) {
             auto v = base;
             for (size_t ir = 0; ir < v.size(); ir++) {
@@ -1136,8 +1365,8 @@ test_lapw_linearization_response()
                 value += occupied_lapw_lagrangian(*ctx, *kp, 0, h, o);
             }
             ctx->comm().allreduce(&value, 1);
-            sampled_fields =
-                    sample_radial_fields(*ctx, ks, {v}, gs.potential().get_core_xc_derivatives(), &sampled_hartree);
+            sampled_fields = sample_radial_fields(*ctx, ks, {v}, gs.potential().get_core_xc_derivatives(),
+                                                  &sampled_hartree, &sampled_xc);
             return value;
         };
         std::cout << "LAPW Lagrangian update_enu=" << update_enu << '\n';
@@ -1145,11 +1374,14 @@ test_lapw_linearization_response()
             double plus       = sample(step);
             auto plus_fields  = sampled_fields;
             auto plus_hartree = sampled_hartree;
+            auto plus_xc      = sampled_xc;
             double fd         = (plus - sample(-step)) / (2 * step);
             check("automatic-energy density/tau response",
                   radial_fields_error(field_response, plus_fields, sampled_fields, step), 3e-5);
             check("automatic-energy Hartree response",
                   potential_response_error(hartree_response, plus_hartree, sampled_hartree, step), 3e-5);
+            check("automatic-energy XC covector response",
+                  potential_response_error(xc_response, plus_xc, sampled_xc, step), 3e-5);
             check("automatic-energy Lagrangian derivative", std::abs(fd - analytic), 2e-7);
             check("relative automatic-energy Lagrangian derivative", std::abs((fd - analytic) / analytic), 2e-5);
         }

@@ -77,6 +77,9 @@ class Potential : public Field4D
     void
     xc_lapw_meta(Density const& density__);
 
+    std::vector<std::array<std::vector<double>, 2>>
+    project_core_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const;
+
     /// Local part of pseudopotential.
     std::unique_ptr<Smooth_periodic_function<double>> local_potential_;
 
@@ -322,6 +325,25 @@ class Potential : public Field4D
     xc_rg_magnetic(Density const& density__, bool use_lapl, const bool calculate_vdw_stress__);
 
   public:
+    /// Fixed-geometry LAPW XC covector response to physical rho/tau field variations.
+    /** Applies the external XC Hessian and the discrete field-map adjoint.
+     *  The direction uses total/magnetization fields like Density, including
+     *  any core response. Neither density nor potential state is modified.
+     */
+    lapw_xc_field_adjoint_t
+    lapw_external_xc_response(Density const& density__, Density const& density_response__) const;
+
+    /// Radial-solver potential directions induced by physical rho/tau variations.
+    /** Returns the spherical Hartree response and raw core XC covector response
+     *  in atom-class order, using the same projection as update_atomic_potential().
+     *  Geometry and nuclear potentials are fixed. This applies the response kernel,
+     *  but does not solve the self-consistent orbital/radial response equations.
+     */
+    void
+    lapw_radial_potential_response(Density const& density__, Density const& density_response__,
+                                   std::vector<std::vector<double>>& scalar__,
+                                   std::vector<std::array<std::vector<double>, 2>>& xc__) const;
+
     /// Explicit XC geometry response at fixed electronic coefficients and radial fields.
     /** Includes model coordinates and host quadrature. Basis/projector, MT-boundary
      *  and orbital-normalization responses must still be supplied by force/stress assembly.

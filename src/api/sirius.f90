@@ -2011,6 +2011,49 @@ call sirius_check_external_xc_derivative_aux(gs_handler_ptr,step_ptr,derivatives
 end subroutine sirius_check_external_xc_derivative
 
 !
+!> @brief Check the fixed-geometry external LAPW XC response without changing the ground state.
+!> @param [in] gs_handler Ground-state handler with a point XC response callback.
+!> @param [in] step Positive field-variation step, identical on all context ranks.
+!> @param [out] errors Relative maximum XC and spherical-potential response errors at step and step/2.
+!> @param [out] error_code Error code.
+subroutine sirius_check_external_xc_response(gs_handler,step,errors,error_code)
+implicit none
+!
+type(sirius_ground_state_handler), target, intent(in) :: gs_handler
+real(8), target, intent(in) :: step
+real(8), target, intent(out) :: errors(2)
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: gs_handler_ptr
+type(C_PTR) :: step_ptr
+type(C_PTR) :: errors_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_check_external_xc_response_aux(gs_handler,step,errors,error_code)&
+&bind(C, name="sirius_check_external_xc_response")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: gs_handler
+type(C_PTR), value :: step
+type(C_PTR), value :: errors
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+gs_handler_ptr = C_NULL_PTR
+gs_handler_ptr = C_LOC(gs_handler%handler_ptr_)
+step_ptr = C_NULL_PTR
+step_ptr = C_LOC(step)
+errors_ptr = C_NULL_PTR
+errors_ptr = C_LOC(errors)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_check_external_xc_response_aux(gs_handler_ptr,step_ptr,errors_ptr,error_code_ptr)
+end subroutine sirius_check_external_xc_response
+
+!
 !> @brief Update a ground state object after change of atomic coordinates or lattice vectors.
 !> @param [in] gs_handler Ground-state handler.
 !> @param [out] error_code Error code
@@ -5774,6 +5817,43 @@ endif
 call sirius_set_xc_point_geometry_callbacks_aux(handler_ptr,field_fptr,pullback_fptr,&
 &user_data,error_code_ptr)
 end subroutine sirius_set_xc_point_geometry_callbacks
+
+!
+!> @brief Register a fixed-geometry XC Hessian-vector evaluator after the point XC callback and before context initialization. Its C signature is void response(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, const double* delta_rho, const double* delta_gradient, const double* delta_tau, double* delta_vrho, double* delta_vgradient, double* delta_vtau, int* status). Fields and directions have the point callback's Fortran array shapes. Return raw directional derivatives of the entire discrete XC energy's field covectors, including nonlocal coupling. The call is collective, including empty ranks. Outputs start at zero. Set status nonzero on failure without unwinding across the C ABI. A null pointer disables the response.
+!> @param [in] handler Simulation context handler.
+!> @param [in] fptr C-interoperable XC response evaluator.
+!> @param [in] user_data Caller-owned state retained until context destruction.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_point_response_callback(handler,fptr,user_data,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+type(C_FUNPTR), value, intent(in) :: fptr
+type(C_PTR), value, intent(in) :: user_data
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_point_response_callback_aux(handler,fptr,user_data,error_code)&
+&bind(C, name="sirius_set_xc_point_response_callback")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_FUNPTR), value :: fptr
+type(C_PTR), value :: user_data
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_point_response_callback_aux(handler_ptr,fptr,user_data,error_code_ptr)
+end subroutine sirius_set_xc_point_response_callback
 
 !
 !> @brief Evaluate explicit XC atom and cell energy derivatives for the current fields. Requires point geometry callbacks. Electronic coefficients, physical radial fields and point-domain membership are fixed. Complete forces and stress also require orbital, basis, projector and MT-boundary responses as appropriate. Outputs are globally summed on every rank. No force sign or volume factor is applied. Cell columns vary at fixed Cartesian atoms.

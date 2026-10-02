@@ -949,6 +949,30 @@ sirius_check_external_xc_derivative(void* const* gs_handler__, double const* ste
                                     int* error_code__);
 
 /*
+sirius_check_external_xc_response:
+  doc: Check the fixed-geometry external LAPW XC response without changing the ground state.
+  arguments:
+    gs_handler:
+      type: gs_handler
+      attr: in, required
+      doc: Ground-state handler with a point XC response callback.
+    step:
+      type: double
+      attr: in, required
+      doc: Positive field-variation step, identical on all context ranks.
+    errors:
+      type: double
+      attr: out, required, dimension(2)
+      doc: Relative maximum XC and spherical-potential response errors at step and step/2.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+*/
+void
+sirius_check_external_xc_response(void* const* gs_handler__, double const* step__, double* errors__, int* error_code__);
+
+/*
 sirius_update_ground_state:
   doc: Update a ground state object after change of atomic coordinates or lattice vectors.
   arguments:
@@ -3059,6 +3083,44 @@ sirius_set_xc_point_geometry_callbacks:
 void
 sirius_set_xc_point_geometry_callbacks(void* const* handler__, void (*field_fptr__)(), void (*pullback_fptr__)(),
                                        void* user_data__, int* error_code__);
+
+/*
+sirius_set_xc_point_response_callback:
+  doc: >-
+    Register a fixed-geometry XC Hessian-vector evaluator after the point XC
+    callback and before context initialization. Its C signature is
+    void response(void* user_data, int nr, int ns, int nb, int fcomm,
+    const double* coordinates, const double* energy_weights,
+    const double* descriptor_weights, const int* block_sizes,
+    const double* block_centres, const double* rho, const double* gradient,
+    const double* tau, const double* delta_rho, const double* delta_gradient,
+    const double* delta_tau, double* delta_vrho, double* delta_vgradient,
+    double* delta_vtau, int* status).
+    Fields and directions have the point callback's Fortran array shapes.
+    Return raw directional derivatives of the entire discrete XC energy's
+    field covectors, including nonlocal coupling. The call is collective,
+    including empty ranks. Outputs start at zero. Set status nonzero on failure
+    without unwinding across the C ABI. A null pointer disables the response.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable XC response evaluator.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+*/
+void
+sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__);
 
 /*
 sirius_get_xc_geometry_derivatives:

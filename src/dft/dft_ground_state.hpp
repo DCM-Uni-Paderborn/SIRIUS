@@ -183,6 +183,13 @@ class DFT_ground_state
      */
     std::array<std::array<double, 3>, 2>
     check_lapw_xc_derivative(double step__);
+
+    /// Relative maximum XC and spherical-potential response errors at step and step/2.
+    /** Uses scratch LAPW rho/tau fields at fixed geometry and radial basis.
+     *  The ground-state density, potential and orbitals are not modified.
+     */
+    std::array<double, 2>
+    check_lapw_xc_response(double step__) const;
 };
 
 } // namespace sirius

@@ -306,8 +306,8 @@ Potential::xc_external_points(Density const& density__)
     for (auto const& r : quadrature.coordinates) {
         points.push_back({r[0], r[1], r[2]});
     }
-    int nr = static_cast<int>(points.size());
-    int ns = ctx_.num_spins();
+    int nr      = static_cast<int>(points.size());
+    int ns      = ctx_.num_spins();
     auto smooth = external_smooth_fields(ctx_, density__);
     auto& rho   = smooth[0];
     auto& tau   = smooth[1];
@@ -359,6 +359,65 @@ Potential::xc_external_points(Density const& density__)
     if (ns == 2) {
         effective_magnetic_field(0).rg().fft_transform(1);
     }
+}
+
+lapw_xc_field_adjoint_t
+Potential::lapw_external_xc_response(Density const& density__, Density const& density_response__) const
+{
+    int failed = !ctx_.full_potential() || !ctx_.cb().external_xc_ || !ctx_.cb().external_xc_points_ ||
+                 !ctx_.cb().external_xc_response_ || &density__.ctx() != &ctx_ || &density_response__.ctx() != &ctx_ ||
+                 !density__.has_kinetic_density() || !density_response__.has_kinetic_density() ||
+                 add_delta_rho_xc_ != 0 || add_delta_mag_xc_ != 0;
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external LAPW XC response requires matching physical fields and a point-response callback");
+    }
+    validate_external_xc_context(ctx_);
+    auto const& quadrature = *ctx_.cb().external_xc_points_;
+    std::vector<r3::vector<double>> points;
+    for (auto const& r : quadrature.coordinates) {
+        points.emplace_back(r[0], r[1], r[2]);
+    }
+    LAPW_xc_field_map map(density__, points), direction_map(density_response__, points);
+    auto smooth           = external_smooth_fields(ctx_, density__);
+    auto smooth_direction = external_smooth_fields(ctx_, density_response__);
+    auto fields           = map.sample(smooth[0], smooth[1]);
+    auto direction        = direction_map.sample(smooth_direction[0], smooth_direction[1]);
+    xc_point_fields_t response(points.size(), ctx_.num_spins());
+    response.rho.zero();
+    response.gradient.zero();
+    response.tau.zero();
+    xc_callback_input_t input{static_cast<int>(points.size()),
+                              ctx_.num_spins(),
+                              0,
+                              fields.rho.at(memory_t::host),
+                              fields.gradient.at(memory_t::host),
+                              fields.tau.at(memory_t::host),
+                              &quadrature};
+    xc_callback_direction_t delta{direction.rho.at(memory_t::host), direction.gradient.at(memory_t::host),
+                                  direction.tau.at(memory_t::host)};
+    xc_callback_response_t output{response.rho.at(memory_t::host), response.gradient.at(memory_t::host),
+                                  response.tau.at(memory_t::host)};
+    std::string message;
+    try {
+        ctx_.cb().external_xc_response_(ctx_, input, delta, output);
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    for (auto const* field : {&response.rho, &response.tau}) {
+        for (size_t i = 0; i < field->size(); i++) {
+            failed |= !std::isfinite((*field)[i]);
+        }
+    }
+    for (size_t i = 0; i < response.gradient.size(); i++) {
+        failed |= !std::isfinite(response.gradient[i]);
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external LAPW XC response failed or returned nonfinite output on a context rank: " + message);
+    }
+    return map.adjoint(response);
 }
 
 xc_geometry_derivatives_t
