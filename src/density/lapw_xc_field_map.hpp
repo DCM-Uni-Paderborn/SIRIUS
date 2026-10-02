@@ -35,6 +35,7 @@ class LAPW_xc_field_map
     {
         std::vector<Spheric_function_interpolator> rho, tau;
         std::vector<r3::vector<double>> displacements;
+        std::vector<r3::vector<double>> images;
         std::vector<int> targets;
 
         source_t(Density const& density__, int ia__)
@@ -74,6 +75,24 @@ class LAPW_xc_field_map
         if (failed) {
             RTE_THROW(message__);
         }
+    }
+
+    void
+    check_covectors(xc_point_fields_t const& d__) const
+    {
+        int ns       = ctx_.num_spins();
+        bool invalid = d__.rho.size(0) != num_points_ || d__.rho.size(1) != ns || d__.tau.size(0) != num_points_ ||
+                       d__.tau.size(1) != ns || d__.gradient.size(0) != num_points_ || d__.gradient.size(1) != 3 ||
+                       d__.gradient.size(2) != ns;
+        for (auto const* field : {&d__.rho, &d__.tau}) {
+            for (size_t i = 0; i < field->size(); i++) {
+                invalid |= !std::isfinite((*field)[i]);
+            }
+        }
+        for (size_t i = 0; i < d__.gradient.size(); i++) {
+            invalid |= !std::isfinite(d__.gradient[i]);
+        }
+        check(invalid, "LAPW XC field map: invalid point covectors");
     }
 
   public:
@@ -123,6 +142,7 @@ class LAPW_xc_field_map
                                 }
                                 owner[p] = ia;
                                 source.displacements.push_back(d);
+                                source.images.push_back(shift + r3::vector<double>(x, y, z));
                                 source.targets.push_back(p);
                             }
                         }
@@ -195,6 +215,69 @@ class LAPW_xc_field_map
         return result;
     }
 
+    /// Geometry response at fixed Fourier coefficients and physical MT fields.
+    /** Point-domain membership and MT radii remain fixed. This differentiates
+     *  sampling within each domain, not crossings of the MT boundary or the
+     *  electronic basis, core solve and quadrature responses needed for forces.
+     *  Cartesian source atoms and target points are fixed for the cell partial.
+     */
+    xc_geometry_adjoint_t
+    geometry_adjoint(std::vector<Smooth_periodic_function<double>> const& rho__,
+                     std::vector<Smooth_periodic_function<double>> const& tau__,
+                     xc_point_fields_t const& derivatives__) const
+    {
+        int ns = ctx_.num_spins();
+        check(rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns),
+              "LAPW XC geometry adjoint: incompatible spin fields");
+        check_covectors(derivatives__);
+        xc_geometry_adjoint_t result(num_points_, ctx_.unit_cell().num_atoms());
+        bool failed{false};
+        try {
+            for (size_t ia = 0; ia < sources_.size(); ia++) {
+                auto const& source = sources_[ia];
+                for (int s = 0; s < ns; s++) {
+                    for (size_t j = 0; j < source.targets.size(); j++) {
+                        int p = source.targets[j];
+                        std::array<double, 4> dr{derivatives__.rho(p, s), derivatives__.gradient(p, 0, s),
+                                                 derivatives__.gradient(p, 1, s), derivatives__.gradient(p, 2, s)};
+                        std::array<double, 4> dt{derivatives__.tau(p, s), 0, 0, 0};
+                        auto const& d = source.displacements[j];
+                        auto v        = source.rho[s].position_adjoint(d, dr) + source.tau[s].position_adjoint(d, dt);
+                        result.points[p] += v;
+                        for (int x = 0; x < 3; x++) {
+                            failed |= !std::isfinite(v[x]);
+                            result.atoms(x, static_cast<int>(ia)) -= v[x];
+                            for (int y = 0; y < 3; y++) {
+                                result.lattice(x, y) -= v[x] * source.images[j][y];
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (std::exception const&) {
+            failed = true;
+        }
+        check(failed, "LAPW XC geometry adjoint: MT evaluation failed on a context rank");
+        ctx_.comm().allreduce(result.atoms.at(memory_t::host), result.atoms.size());
+        ctx_.comm().allreduce(&result.lattice(0, 0), 9);
+        for (int s = 0; s < ns; s++) {
+            std::vector<std::array<double, 4>> dr(interstitial_targets_.size()), dt(interstitial_targets_.size());
+            for (size_t j = 0; j < interstitial_targets_.size(); j++) {
+                int p = interstitial_targets_[j];
+                dr[j] = {derivatives__.rho(p, s), derivatives__.gradient(p, 0, s), derivatives__.gradient(p, 1, s),
+                         derivatives__.gradient(p, 2, s)};
+                dt[j] = {derivatives__.tau(p, s), 0, 0, 0};
+            }
+            auto r = interstitial_->geometry_adjoint(rho__[s], dr);
+            auto t = interstitial_->geometry_adjoint(tau__[s], dt);
+            result.lattice += r.lattice + t.lattice;
+            for (size_t j = 0; j < interstitial_targets_.size(); j++) {
+                result.points[interstitial_targets_[j]] += r.points[j] + t.points[j];
+            }
+        }
+        return result;
+    }
+
     /// Adjoint of the discrete, fixed-geometry field selection and sampling.
     /** MT gradients return through the spherical interpolation transpose, not
      *  through a separately discretized divergence. Interstitial potentials
@@ -206,19 +289,8 @@ class LAPW_xc_field_map
     lapw_xc_field_adjoint_t
     adjoint(xc_point_fields_t const& d__) const
     {
-        int ns       = ctx_.num_spins();
-        bool invalid = d__.rho.size(0) != num_points_ || d__.rho.size(1) != ns || d__.tau.size(0) != num_points_ ||
-                       d__.tau.size(1) != ns || d__.gradient.size(0) != num_points_ || d__.gradient.size(1) != 3 ||
-                       d__.gradient.size(2) != ns;
-        for (auto const* field : {&d__.rho, &d__.tau}) {
-            for (size_t i = 0; i < field->size(); i++) {
-                invalid |= !std::isfinite((*field)[i]);
-            }
-        }
-        for (size_t i = 0; i < d__.gradient.size(); i++) {
-            invalid |= !std::isfinite(d__.gradient[i]);
-        }
-        check(invalid, "LAPW XC field map: invalid point covectors");
+        int ns = ctx_.num_spins();
+        check_covectors(d__);
         lapw_xc_field_adjoint_t result;
         bool failed{false};
         try {
@@ -289,7 +361,7 @@ class LAPW_xc_field_map
             interstitial_->adjoint(dr, result.rho.back());
             interstitial_->adjoint(dt, result.tau.back());
         }
-        invalid = false;
+        bool invalid{false};
         for (auto const* fields : {&result.rho, &result.tau}) {
             for (auto const& f : *fields) {
                 for (auto value : f.f_pw_local()) {

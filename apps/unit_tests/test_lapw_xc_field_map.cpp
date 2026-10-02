@@ -753,6 +753,90 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
     }
     solve_core(1);
 
+    // Geometry partials keep the physical fields fixed and do not cross MT surfaces.
+    // The Hamiltonian's first/second-variation choice does not change this map.
+    if (!second_variation) {
+        auto geometry_points = points;
+        for (size_t p = 0; p < ids.size(); p++) {
+            if (ids[p] >= 3 && ids[p] <= 5) {
+                geometry_points[p] = centre(0) + r3::vector<double>(0, 0, ids[p] == 4 ? 2.5 : 1.5);
+            } else if (ids[p] == 7) {
+                geometry_points[p] = centre(1) + r3::vector<double>(0.15, -0.2, 0.25);
+            }
+        }
+        LAPW_xc_field_map geometry_map(density, geometry_points);
+        xc_point_fields_t covectors(geometry_points.size(), ctx.num_spins());
+        energy(geometry_map, &covectors);
+        auto geometry = geometry_map.geometry_adjoint(rho, tau, covectors);
+        auto cell = lattice, reciprocal = ctx.gvec().lattice_vectors(), inverse = r3::inverse(cell);
+        std::vector<r3::vector<double>> fractional_atoms, atoms;
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            fractional_atoms.push_back(ctx.unit_cell().atom(ia).position());
+            atoms.push_back(centre(ia));
+        }
+        auto set_cell = [&](r3::matrix<double> const& trial) {
+            ctx.unit_cell().set_lattice_vectors(trial);
+            ctx.gvec_sptr()->lattice_vectors(twopi * r3::transpose(r3::inverse(trial)));
+            for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                ctx.unit_cell().atom(ia).set_position(r3::dot(r3::inverse(trial), atoms[ia]));
+            }
+        };
+        auto fd_error = [](double fd, double ad) {
+            return std::isfinite(fd) && std::isfinite(ad) ? std::abs(fd - ad) / std::max(1.0, std::abs(ad))
+                                                          : std::numeric_limits<double>::infinity();
+        };
+        double point_error{0}, atom_error{0}, cell_error{0};
+        for (int x = 0; x < 3; x++) {
+            double dp{0};
+            for (size_t p = 0; p < ids.size(); p++) {
+                dp += geometry.points[p][x] * (0.13 + 0.02 * ids[p]);
+            }
+            comm.allreduce(&dp, 1);
+            for (double h : {1e-5, 5e-6}) {
+                auto displaced = [&](double step) {
+                    auto trial = geometry_points;
+                    for (size_t p = 0; p < ids.size(); p++) {
+                        trial[p][x] += step * (0.13 + 0.02 * ids[p]);
+                    }
+                    return energy(LAPW_xc_field_map(density, trial), nullptr);
+                };
+                double plus = displaced(h), minus = displaced(-h);
+                point_error = std::max(point_error, fd_error((plus - minus) / (2 * h), dp));
+                for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                    auto shifted_atom = [&](double step) {
+                        auto trial = atoms[ia];
+                        trial[x] += step;
+                        ctx.unit_cell().atom(ia).set_position(r3::dot(inverse, trial));
+                        return energy(LAPW_xc_field_map(density, geometry_points), nullptr);
+                    };
+                    plus       = shifted_atom(h);
+                    minus      = shifted_atom(-h);
+                    atom_error = std::max(atom_error, fd_error((plus - minus) / (2 * h), geometry.atoms(x, ia)));
+                    ctx.unit_cell().atom(ia).set_position(fractional_atoms[ia]);
+                }
+                for (int y = 0; y < 3; y++) {
+                    auto strained = [&](double step) {
+                        auto trial = cell;
+                        trial(x, y) += step;
+                        set_cell(trial);
+                        return energy(LAPW_xc_field_map(density, geometry_points), nullptr);
+                    };
+                    plus       = strained(h);
+                    minus      = strained(-h);
+                    cell_error = std::max(cell_error, fd_error((plus - minus) / (2 * h), geometry.lattice(x, y)));
+                    set_cell(cell);
+                }
+            }
+        }
+        ctx.gvec_sptr()->lattice_vectors(reciprocal);
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            ctx.unit_cell().atom(ia).set_position(fractional_atoms[ia]);
+        }
+        check("MT/interstitial geometry point FD", point_error, 2e-7);
+        check("geometry atom FD including physical core fields", atom_error, 2e-7);
+        check("geometry all nine fixed-Cartesian cell components FD", cell_error, 2e-7);
+    }
+
     failures += test_lapw_hamiltonian(ctx, map.adjoint(derivatives), map.adjoint(derivatives));
 
     // The physical fields, not the current density matrix, define the energy
@@ -902,8 +986,20 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
         zero.rho.zero();
         zero.gradient.zero();
         zero.tau.zero();
-        auto r = small.adjoint(zero);
+        auto r        = small.adjoint(zero);
+        auto geometry = small.geometry_adjoint(rho, tau, zero);
         double maximum{0};
+        for (auto const& p : geometry.points) {
+            maximum = std::max(maximum, p.length());
+        }
+        for (size_t i = 0; i < geometry.atoms.size(); i++) {
+            maximum = std::max(maximum, std::abs(geometry.atoms[i]));
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                maximum = std::max(maximum, std::abs(geometry.lattice(x, y)));
+            }
+        }
         for (auto const& atom : r.local) {
             for (auto const& part : atom) {
                 for (auto const& field : part) {
@@ -1181,15 +1277,19 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
     set_pw(0);
     std::vector<Smooth_periodic_function<double>> empty;
     reject("collective wrong-spin rejection", [&] { map.sample(comm.rank() == 0 ? empty : rho, tau); });
+    reject("geometry collective wrong-spin rejection",
+           [&] { map.geometry_adjoint(comm.rank() == 0 ? empty : rho, tau, derivatives); });
     xc_point_fields_t bad(points.size() + (comm.rank() == 0 ? 1 : 0), ctx.num_spins());
     bad.rho.zero();
     bad.tau.zero();
     bad.gradient.zero();
     reject("collective wrong-buffer rejection", [&] { map.adjoint(bad); });
+    reject("geometry collective wrong-buffer rejection", [&] { map.geometry_adjoint(rho, tau, bad); });
     if (comm.rank() == 0) {
         derivatives.gradient(0, 0, 0) = std::numeric_limits<double>::quiet_NaN();
     }
     reject("collective nonfinite-covector rejection", [&] { map.adjoint(derivatives); });
+    reject("geometry collective nonfinite-covector rejection", [&] { map.geometry_adjoint(rho, tau, derivatives); });
     return failures;
 }
 
