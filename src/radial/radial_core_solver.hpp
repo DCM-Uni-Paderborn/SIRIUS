@@ -461,10 +461,18 @@ class Radial_core_solver
 /// Converge the occupied core eigenstates used by both density and LAPW basis construction.
 inline std::vector<radial_core_state_t>
 solve_radial_core_states(Radial_grid<double> const& grid__, int l__, int zn__, std::vector<double> const& potential__,
-                         int count__, std::array<std::vector<double>, 2> fields__, int nmtp__)
+                         int count__, std::array<std::vector<double>, 2> fields__, int nmtp__,
+                         std::vector<double> const* direction__       = nullptr,
+                         std::vector<radial_core_state_t>* response__ = nullptr)
 {
     if (nmtp__ < 2 || nmtp__ >= grid__.num_points()) {
         RTE_THROW("radial core solve requires an extended muffin-tin domain");
+    }
+    if (bool(direction__) != bool(response__) ||
+        (direction__ &&
+         (direction__->size() != grid__.num_points() ||
+          !std::all_of(direction__->begin(), direction__->end(), [](double x) { return std::isfinite(x); })))) {
+        RTE_THROW("radial core solve: invalid potential response direction");
     }
     for (auto& field : fields__) {
         if (field.size() != nmtp__) {
@@ -503,6 +511,16 @@ solve_radial_core_states(Radial_grid<double> const& grid__, int l__, int zn__, s
             convergence << " basis=" << nb << " energy=" << energy_error << " fields=" << field_error
                         << " state=" << worst_state << " part=" << worst_part << " r=" << grid__[worst_ir];
             if (std::max(energy_error, field_error) <= 1) {
+                if (response__) {
+                    // Differentiate in the same discrete basis selected by the primal convergence test.
+                    std::vector<double> zero(grid__.num_points(), 0);
+                    auto response = solver.solve_response(count__, fields__[0], fields__[1], *direction__, zero, zero);
+                    response__->clear();
+                    for (int j = 0; j < count__; j++) {
+                        states[j] = std::move(response[j].value);
+                        response__->push_back(std::move(response[j].derivative));
+                    }
+                }
                 return states;
             }
         }

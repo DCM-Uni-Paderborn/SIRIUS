@@ -604,9 +604,12 @@ test_radial_basis_response()
         std::cout << name << ": " << error << " (limit " << tolerance << ")\n";
         failures += !std::isfinite(error) || error > tolerance;
     };
-    for (bool orthogonalize : {false, true}) {
+    for (auto setup : {std::make_pair(false, false), std::make_pair(false, true), std::make_pair(true, false),
+                       std::make_pair(true, true)}) {
+        auto [core, orthogonalize] = setup;
         Simulation_parameters parameters;
         parameters.valence_relativity("none");
+        parameters.core_relativity("none");
         parameters.lmax_apw(3);
         parameters.lmax_rho(6);
         parameters.lmax_pot(6);
@@ -615,9 +618,22 @@ test_radial_basis_response()
         parameters.cfg().control().ortho_rf(orthogonalize);
         Unit_cell cell(parameters, mpi::Communicator::world());
         cell.set_lattice_vectors({{6, 0, 0}, {0, 7, 0}, {0, 0, 8}});
-        auto& type = cell.add_atom_type("He");
-        type.zn(2);
-        type.set_radial_grid(radial_grid_t::power, 801, 1e-6, 1.8, 2.0);
+        std::string label = core ? "Ne" : "He";
+        int z             = core ? 10 : 2;
+        auto& type        = cell.add_atom_type(label);
+        type.zn(z);
+        type.set_radial_grid(radial_grid_t::power, core ? 3201 : 801, 1e-6, 1.8, 2.0);
+        if (core) {
+            auto free_grid = Radial_grid_factory<double>(radial_grid_t::power, 3000, 1e-7, 20.0, 3.0);
+            std::vector<double> density(free_grid.num_points());
+            for (int ir = 0; ir < free_grid.num_points(); ir++) {
+                density[ir] = 2 * std::pow(9.0, 3) / pi * std::exp(-18 * free_grid[ir]) +
+                              8 * std::pow(1.6, 3) / pi * std::exp(-3.2 * free_grid[ir]);
+            }
+            type.free_atom_density(density);
+            type.set_free_atom_radial_grid(std::move(free_grid));
+            type.set_configuration(1, 0, 1, 2.0, true);
+        }
         for (int l = 0; l <= 3; l++) {
             for (int order = 0; order < (l < 2 ? 3 : (l == 2 ? 2 : 1)); order++) {
                 type.add_aw_descriptor(l + 1, l, -0.3, order, 0);
@@ -631,7 +647,7 @@ test_radial_basis_response()
                 }
             }
         }
-        cell.add_atom("He", {0.23, 0.31, 0.43});
+        cell.add_atom(label, {0.23, 0.31, 0.43});
         cell.initialize();
         auto& atom = cell.atom(0);
         auto& cls  = atom.symmetry_class();
@@ -640,8 +656,17 @@ test_radial_basis_response()
         auto const& grid = type.radial_grid();
         std::vector<double> potential(grid.num_points()), direction(grid.num_points());
         for (int ir = 0; ir < grid.num_points(); ir++) {
-            potential[ir] = -2 / grid[ir] + 0.2 * std::exp(-grid[ir]);
+            potential[ir] = -z / grid[ir] + 0.2 * std::exp(-grid[ir]);
             direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+        }
+        if (core) {
+            auto weights = radial_weights(grid);
+            std::array<std::vector<double>, 2> fields{weights, weights};
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                fields[0][ir] *= 0.03 * std::exp(-grid[ir]);
+                fields[1][ir] *= 0.02 * std::exp(-grid[ir]);
+            }
+            cls.set_spherical_xc_derivatives(fields);
         }
         auto sample = [&](double step) {
             auto v = potential;
@@ -649,9 +674,8 @@ test_radial_basis_response()
                 v[ir] += step * direction[ir];
             }
             cls.set_spherical_potential(v);
-            if (cls.generate_radial_functions(relativity_t::none, false)) {
-                RTE_THROW("radial basis response fixture construction failed");
-            }
+            // Exercise the production owner-rank generation and replicated response.
+            cell.generate_radial_functions(std::cout);
             std::vector<double> values;
             for (int j : {0, 1}) {
                 for (int i = 0; i < type.mt_radial_basis_size(); i++) {
@@ -694,12 +718,13 @@ test_radial_basis_response()
                         std::max(boundary_error, std::abs(response.radial_functions(grid.num_points() - 1, i, 0)));
             }
         }
-        std::cout << "Radial basis response orthogonalize=" << orthogonalize << '\n';
+        std::cout << "Radial basis response core=" << core << " orthogonalize=" << orthogonalize << '\n';
         check("unchanged stored radial basis", unchanged, 0);
         check("zero basis response", null_error, 0);
         check("basis normalization response", norm_error, 2e-9);
         check("LO boundary response", boundary_error, 2e-10);
-        for (double h : {1e-4, 5e-5}) {
+        double step = core ? 1e-3 : 1e-4;
+        for (double h : {step, step / 2}) {
             auto plus = sample(h), minus = sample(-h);
             double error{0}, peak{0};
             for (size_t i = 0; i < analytic.size(); i++) {
@@ -716,7 +741,7 @@ test_radial_basis_response()
         mdarray<std::complex<double>, 2> minus({gkvec.count(), type.mt_aw_basis_size()});
         matching.generate_potential_response<false>(atom, response, dalm);
         matching.generate_potential_response<true>(atom, response, conjugate);
-        for (double h : {1e-4, 5e-5}) {
+        for (double h : {step, step / 2}) {
             sample(h);
             matching.generate<false>(atom, plus);
             sample(-h);

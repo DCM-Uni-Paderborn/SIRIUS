@@ -77,8 +77,10 @@ Atom_symmetry_class::Atom_symmetry_class(int id__, Atom_type const& atom_type__)
 
 int
 Atom_symmetry_class::generate_aw_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__,
-                                                  mdarray<double, 2>& sd__, std::vector<double> const* direction__,
-                                                  radial_basis_response_t* response__) const
+                                                  mdarray<double, 2>& sd__, core_states_t const& core__,
+                                                  std::vector<double> const* direction__,
+                                                  radial_basis_response_t* response__,
+                                                  core_states_t const* core_response__) const
 {
     int nmtp = atom_type_.num_mt_points();
 
@@ -105,7 +107,8 @@ Atom_symmetry_class::generate_aw_radial_functions(relativity_t rel__, mdarray<do
             try {
                 /* integrate radial equation forward and find radial solution */
                 radial_solver_result_t derivative;
-                auto result = solve_radial(rel__, rsd.dme, rsd.l, rsd.enu + enu_shift, direction__, &derivative);
+                auto result = solve_radial(rel__, rsd.dme, rsd.l, rsd.enu + enu_shift, core__, direction__, &derivative,
+                                           core_response__);
                 for (int ir = 0; ir < nmtp; ir++) {
                     rf__(ir, idxrf, 0) = result.p[ir];
                     rf__(ir, idxrf, 1) = result.rdudr[ir];
@@ -284,8 +287,9 @@ Atom_symmetry_class::generate_aw_radial_functions(relativity_t rel__, mdarray<do
 
 int
 Atom_symmetry_class::generate_lo_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__,
-                                                  std::vector<double> const* direction__,
-                                                  radial_basis_response_t* response__) const
+                                                  core_states_t const& core__, std::vector<double> const* direction__,
+                                                  radial_basis_response_t* response__,
+                                                  core_states_t const* core_response__) const
 {
     int nmtp = atom_type_.num_mt_points();
 
@@ -313,7 +317,8 @@ Atom_symmetry_class::generate_lo_radial_functions(relativity_t rel__, mdarray<do
             radial_solver_result_t result;
             radial_solver_result_t derivative;
             try {
-                result = solve_radial(rel__, rsd.dme, rsd.l, rsd.enu, direction__, &derivative);
+                result =
+                        solve_radial(rel__, rsd.dme, rsd.l, rsd.enu, core__, direction__, &derivative, core_response__);
             } catch (std::exception const& e) {
                 errors[idxlo] = e.what();
                 break;
@@ -646,24 +651,32 @@ Atom_symmetry_class::set_spherical_xc_derivatives(std::array<std::vector<double>
 }
 
 radial_solver_result_t
-Atom_symmetry_class::solve_radial(relativity_t rel__, int dme__, int l__, double energy__,
-                                  std::vector<double> const* direction__, radial_solver_result_t* response__) const
+Atom_symmetry_class::solve_radial(relativity_t rel__, int dme__, int l__, double energy__, core_states_t const& core__,
+                                  std::vector<double> const* direction__, radial_solver_result_t* response__,
+                                  core_states_t const* core_response__) const
 {
     Radial_solver solver(atom_type_.zn(), spherical_potential_, atom_type_.radial_grid());
+    radial_solver_result_t result;
     if (direction__) {
-        if (rel__ != relativity_t::none || !core_radial_states_.empty() || !response__) {
-            RTE_THROW("radial basis response requires nonrelativistic functions without core projection");
+        if (rel__ != relativity_t::none || !response__) {
+            RTE_THROW("radial basis response requires nonrelativistic functions");
         }
-        auto result = solver.solve_potential_response(dme__, l__, energy__, *direction__);
-        *response__ = radial_solver_result_t{0, std::move(result.p), std::move(result.rdudr), result.uderiv};
-        return std::move(result.value);
+        auto radial = solver.solve_potential_response(dme__, l__, energy__, *direction__);
+        *response__ = radial_solver_result_t{0, std::move(radial.p), std::move(radial.rdudr), radial.uderiv};
+        result      = std::move(radial.value);
+    } else {
+        result = solver.solve(rel__, dme__, l__, energy__);
     }
-    auto result = solver.solve(rel__, dme__, l__, energy__);
-    auto core   = core_radial_states_.find(l__);
-    if (core != core_radial_states_.end()) {
+    auto core = core__.find(l__);
+    if (core != core__.end()) {
+        if (direction__ && (!core_response__ || !core_response__->count(l__))) {
+            RTE_THROW("radial basis response requires the occupied core response");
+        }
         // The auxiliary local equation need not reproduce the discrete XC
         // operator. Its full matrix is assembled separately in the Hamiltonian.
-        orthogonalize_radial_to_core(atom_type_.radial_grid(), core->second, result);
+        orthogonalize_radial_to_core(atom_type_.radial_grid(), core->second, result,
+                                     direction__ ? &core_response__->at(l__) : nullptr,
+                                     direction__ ? response__ : nullptr);
     }
     return result;
 }
@@ -734,22 +747,19 @@ Atom_symmetry_class::find_enu(relativity_t rel__)
     return ierr;
 }
 
-int
-Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_enu__)
+Atom_symmetry_class::core_states_t
+Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* direction__,
+                                                 core_states_t* response__) const
 {
-    PROFILE("sirius::Atom_symmetry_class::generate_radial_functions");
-
-    mdarray<double, 2> sd({3, atom_type_.mt_radial_basis_size() - atom_type_.num_lo_descriptors()});
-    mdarray<double, 3> rf({atom_type_.num_mt_points(), atom_type_.mt_radial_basis_size(), 2});
-    sd.zero();
-    rf.zero();
-
-    core_radial_states_.clear();
+    core_states_t result;
     if (!spherical_xc_derivatives_[0].empty() && atom_type_.num_core_electrons() != 0) {
-        if (rel__ != relativity_t::none) {
-            RTE_THROW("XC-dependent LAPW radial functions require nonrelativistic states");
-        }
         auto [grid, potential] = atom_type_.core_radial_problem(spherical_potential_);
+        std::vector<double> direction;
+        if (direction__) {
+            direction = *direction__;
+            // The free-atom tail is shifted by the potential at the MT boundary.
+            direction.resize(grid.num_points(), direction.back());
+        }
         std::map<int, int> states_per_l;
         for (int i = 0; i < atom_type_.num_atomic_levels(); i++) {
             auto const& level = atom_type_.atomic_level(i);
@@ -758,8 +768,10 @@ Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_e
             }
         }
         for (auto const& [l, count] : states_per_l) {
-            auto states = solve_radial_core_states(grid, l, atom_type_.zn(), potential, count,
-                                                   spherical_xc_derivatives_, atom_type_.num_mt_points());
+            std::vector<radial_core_state_t> response;
+            auto states = solve_radial_core_states(
+                    grid, l, atom_type_.zn(), potential, count, spherical_xc_derivatives_, atom_type_.num_mt_points(),
+                    direction__ ? &direction : nullptr, direction__ ? &response : nullptr);
             for (int j = 0; j < count; j++) {
                 bool occupied{false};
                 for (int i = 0; i < atom_type_.num_atomic_levels(); i++) {
@@ -770,11 +782,31 @@ Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_e
                     if (states[j].energy >= potential.back()) {
                         RTE_THROW("tau-dependent core state is not bound within the extended radial domain");
                     }
-                    core_radial_states_[l].push_back(std::move(states[j]));
+                    result[l].push_back(std::move(states[j]));
+                    if (response__) {
+                        (*response__)[l].push_back(std::move(response[j]));
+                    }
                 }
             }
         }
     }
+    return result;
+}
+
+int
+Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_enu__)
+{
+    PROFILE("sirius::Atom_symmetry_class::generate_radial_functions");
+
+    mdarray<double, 2> sd({3, atom_type_.mt_radial_basis_size() - atom_type_.num_lo_descriptors()});
+    mdarray<double, 3> rf({atom_type_.num_mt_points(), atom_type_.mt_radial_basis_size(), 2});
+    sd.zero();
+    rf.zero();
+
+    if (!spherical_xc_derivatives_[0].empty() && atom_type_.num_core_electrons() != 0 && rel__ != relativity_t::none) {
+        RTE_THROW("XC-dependent LAPW radial functions require nonrelativistic states");
+    }
+    auto core = generate_core_radial_states();
 
     if (update_enu__) {
         auto ierr_enu = this->find_enu(rel__);
@@ -784,7 +816,7 @@ Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_e
         }
     }
 
-    auto ierr_aw = generate_aw_radial_functions(rel__, rf, sd);
+    auto ierr_aw = generate_aw_radial_functions(rel__, rf, sd, core);
     if (ierr_aw && !spherical_xc_derivatives_[0].empty()) {
         RTE_THROW("XC-dependent LAPW radial basis construction failed");
     }
@@ -794,7 +826,7 @@ Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_e
         RTE_WARNING(s);
     }
 
-    auto ierr_lo = generate_lo_radial_functions(rel__, rf);
+    auto ierr_lo = generate_lo_radial_functions(rel__, rf, core);
     if (ierr_lo) {
         std::stringstream s;
         s << "generate_lo_radial_functions() failed for atom class " << id_;
@@ -829,8 +861,8 @@ Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_e
 radial_basis_response_t
 Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& direction__) const
 {
-    if (atom_type_.parameters().valence_relativity() != relativity_t::none || !core_radial_states_.empty()) {
-        RTE_THROW("radial basis response requires nonrelativistic functions without core projection");
+    if (atom_type_.parameters().valence_relativity() != relativity_t::none) {
+        RTE_THROW("radial basis response requires nonrelativistic functions");
     }
     if (direction__.size() != static_cast<size_t>(atom_type_.num_mt_points()) ||
         spherical_potential_.size() != direction__.size() ||
@@ -841,9 +873,11 @@ Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& 
     mdarray<double, 2> sd({3, atom_type_.mt_radial_basis_size() - atom_type_.num_lo_descriptors()});
     rf.zero();
     sd.zero();
+    core_states_t dcore;
+    auto core = generate_core_radial_states(&direction__, &dcore);
     radial_basis_response_t result(atom_type_);
-    if (generate_aw_radial_functions(relativity_t::none, rf, sd, &direction__, &result) ||
-        generate_lo_radial_functions(relativity_t::none, rf, &direction__, &result)) {
+    if (generate_aw_radial_functions(relativity_t::none, rf, sd, core, &direction__, &result, &dcore) ||
+        generate_lo_radial_functions(relativity_t::none, rf, core, &direction__, &result, &dcore)) {
         RTE_THROW("radial basis potential response construction failed");
     }
     if (atom_type_.parameters().cfg().control().ortho_rf()) {

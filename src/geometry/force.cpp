@@ -47,7 +47,8 @@ Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& dire
     auto& uc    = ctx_.unit_cell();
     int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
                   ctx_.valence_relativity() != relativity_t::none || ctx_.so_correction() || ctx_.num_mag_dims() == 3 ||
-                  ctx_.hubbard_correction() || uc.num_core_electrons() != 0 ||
+                  ctx_.hubbard_correction() ||
+                  (uc.num_core_electrons() != 0 && ctx_.core_relativity() != relativity_t::none) ||
                   (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) ||
                   directions__.size() != uc.num_atom_symmetry_classes();
     if (!invalid) {

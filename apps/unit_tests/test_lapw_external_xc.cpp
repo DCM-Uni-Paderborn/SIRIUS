@@ -474,6 +474,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         }
         check("nonzero tau-dependent core response", response > 1e-5 ? 0 : 1, 0);
         density.generate_core_charge_density(vs, d);
+        saved_energy = gs.total_energy();
     }
     if (!core && (!second_variation || !mag)) {
         auto const& forces = gs.forces().calc_forces_ibs();
@@ -534,7 +535,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         evaluate(0);
         check("nonzero basis/boundary force", std::abs(analytic) > 1e-7 ? 0 : 1, 0);
         verify_restored();
-
+    }
+    if (!second_variation || !mag) {
         std::vector<std::vector<double>> spherical;
         for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
             spherical.push_back(ctx->unit_cell().atom_symmetry_class(ic).spherical_potential());
