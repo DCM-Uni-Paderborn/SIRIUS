@@ -111,15 +111,17 @@ struct xc_callback_output_t
 /** Register before constructing Density/Potential and keep it fixed during SCF. */
 using xc_callback_t = std::function<void(Simulation_context const&, xc_callback_input_t const&, xc_callback_output_t&)>;
 
-/// Primitive-field direction, with the shapes and spin convention of the base input.
+/// Independent input direction, with the shapes and spin convention of the base input.
 struct xc_callback_direction_t
 {
     double const* rho;
     double const* gradient;
     double const* tau;
+    /// Optional quadrature direction; absent means fixed points, weights and block centres.
+    xc_point_derivatives_t const* geometry{nullptr};
 };
 
-/// Directional derivatives of the primitive-field XC covectors at fixed quadrature.
+/// Directional derivatives of the XC covectors.
 /** Return the Hessian of the entire discrete energy applied to the direction.
  *  Point callbacks return raw covectors, including nonlocal coupling between
  *  all points, spins and ranks. No gradient adjoint or tau operator is applied
@@ -130,6 +132,8 @@ struct xc_callback_response_t
     double* vrho;
     double* vgradient;
     double* vtau;
+    /// Optional raw quadrature-covector response, with no sampling or geometry pullback.
+    xc_point_derivatives_t* geometry{nullptr};
 };
 
 using xc_response_callback_t = std::function<void(Simulation_context const&, xc_callback_input_t const&,

@@ -950,7 +950,11 @@ sirius_check_external_xc_derivative(void* const* gs_handler__, double const* ste
 
 /*
 sirius_check_external_xc_response:
-  doc: Check the fixed-geometry external LAPW XC response without changing the ground state.
+  doc: >-
+    Check the external LAPW XC response without changing the ground state.
+    With joint Hessian and point-geometry callbacks, also check the seven independent point-input
+    covectors under simultaneous field and quadrature variations. This does not
+    check the complete host force or stress response.
   arguments:
     gs_handler:
       type: gs_handler
@@ -963,7 +967,7 @@ sirius_check_external_xc_response:
     errors:
       type: double
       attr: out, required, dimension(2)
-      doc: Relative maximum XC and spherical-potential response errors at step and step/2.
+      doc: Relative maximum XC, spherical-potential and enabled point-input response errors at step and step/2.
     error_code:
       type: int
       attr: out, optional
@@ -3121,6 +3125,51 @@ sirius_set_xc_point_response_callback:
 */
 void
 sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__);
+
+/*
+sirius_set_xc_point_hessian_callback:
+  doc: >-
+    Register a joint field and quadrature XC Hessian-vector evaluator after the
+    point XC callback and before context initialization. Replaces the fixed-geometry
+    response callback without changing its ABI. Its C signature is
+    void response(void* user_data, int nr, int ns, int nb, int fcomm,
+    const double* coordinates, const double* energy_weights,
+    const double* descriptor_weights, const int* block_sizes,
+    const double* block_centres, const double* rho, const double* gradient,
+    const double* tau, const double* delta_rho, const double* delta_gradient,
+    const double* delta_tau, const double* delta_coordinates,
+    const double* delta_energy_weights, const double* delta_descriptor_weights,
+    const double* delta_block_centres, double* delta_vrho,
+    double* delta_vgradient, double* delta_vtau, double* delta_dcoordinates,
+    double* delta_denergy_weights, double* delta_ddescriptor_weights,
+    double* delta_dblock_centres, int* status).
+    Arrays have the point callback's Fortran shapes. Return the Hessian of the
+    entire discrete energy applied to these independent directions, including
+    mixed field/geometry and nonlocal terms. All output covectors are raw,
+    without field sampling, gradient adjoints, forces or stress factors.
+    The call is collective, including empty ranks. Outputs start at zero.
+    Set status nonzero on failure without unwinding across the C ABI.
+    A null pointer disables the response.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable joint XC Hessian-vector evaluator.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+*/
+void
+sirius_set_xc_point_hessian_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__);
 
 /*
 sirius_get_xc_geometry_derivatives:

@@ -109,6 +109,12 @@ DFT_ground_state::check_lapw_xc_response(double step__) const
         }
         finish_group();
     }
+    if (ctx_.cb().external_xc_geometry_response_ && ctx_.cb().external_xc_geometry_) {
+        auto point_errors = potential_.check_external_xc_point_hessian(density_, step__);
+        for (int k = 0; k < 2; k++) {
+            result[k] = std::max(result[k], point_errors[k]);
+        }
+    }
     return result;
 }
 

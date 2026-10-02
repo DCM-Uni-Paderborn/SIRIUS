@@ -361,6 +361,72 @@ Potential::xc_external_points(Density const& density__)
     }
 }
 
+void
+Potential::external_xc_point_response(xc_callback_input_t const& input__, xc_callback_direction_t const& direction__,
+                                      xc_callback_response_t& output__) const
+{
+    int failed = !ctx_.cb().external_xc_response_ || !input__.points || input__.num_points < 0 ||
+                 input__.num_spins != ctx_.num_spins() ||
+                 ((direction__.geometry || output__.geometry) && !ctx_.cb().external_xc_geometry_response_);
+    if (input__.points) {
+        failed |= size_t(input__.num_points) != input__.points->coordinates.size();
+    }
+    auto geometry_matches = [&](auto const* g) {
+        return !g || (input__.points && g->coordinates.size() == input__.points->coordinates.size() &&
+                      g->block_centres.size() == input__.points->block_centres.size() &&
+                      g->energy_weights.size() == input__.points->energy_weights.size() &&
+                      g->descriptor_weights.size() == input__.points->descriptor_weights.size());
+    };
+    failed |= !geometry_matches(direction__.geometry) || !geometry_matches(output__.geometry);
+    auto finite = [&](double const* p, size_t n) {
+        if (!p && n) {
+            return false;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (!std::isfinite(p[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+    size_t n = size_t(std::max(0, input__.num_points)) * ctx_.num_spins();
+    failed |= !finite(input__.rho, n) || !finite(input__.gradient, 3 * n) || !finite(input__.tau, n) ||
+              !finite(direction__.rho, n) || !finite(direction__.gradient, 3 * n) || !finite(direction__.tau, n) ||
+              (!output__.vrho && n) || (!output__.vgradient && n) || (!output__.vtau && n);
+    auto finite_geometry = [&](auto const* g) {
+        if (!g) {
+            return true;
+        }
+        for (auto const* a : {&g->coordinates, &g->block_centres}) {
+            for (auto const& r : *a) {
+                if (!finite(r.data(), 3)) {
+                    return false;
+                }
+            }
+        }
+        return finite(g->energy_weights.data(), g->energy_weights.size()) &&
+               finite(g->descriptor_weights.data(), g->descriptor_weights.size());
+    };
+    failed |= !finite_geometry(direction__.geometry);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("invalid external XC point response inputs or unsupported quadrature direction");
+    }
+    std::string message;
+    try {
+        ctx_.cb().external_xc_response_(ctx_, input__, direction__, output__);
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    failed |= !finite(output__.vrho, n) || !finite(output__.vgradient, 3 * n) || !finite(output__.vtau, n) ||
+              !finite_geometry(output__.geometry);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external XC point response failed or returned nonfinite output on a context rank: " + message);
+    }
+}
+
 lapw_xc_field_adjoint_t
 Potential::lapw_external_xc_response(Density const& density__, Density const& density_response__) const
 {
@@ -398,26 +464,142 @@ Potential::lapw_external_xc_response(Density const& density__, Density const& de
                                   direction.tau.at(memory_t::host)};
     xc_callback_response_t output{response.rho.at(memory_t::host), response.gradient.at(memory_t::host),
                                   response.tau.at(memory_t::host)};
-    std::string message;
-    try {
-        ctx_.cb().external_xc_response_(ctx_, input, delta, output);
-    } catch (std::exception const& e) {
-        failed  = 1;
-        message = e.what();
+    external_xc_point_response(input, delta, output);
+    return map.adjoint(response);
+}
+
+std::array<double, 2>
+Potential::check_external_xc_point_hessian(Density const& density__, double step__) const
+{
+    int invalid = !ctx_.full_potential() || !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_geometry_ ||
+                  !ctx_.cb().external_xc_geometry_response_ || &density__.ctx() != &ctx_ ||
+                  !density__.has_kinetic_density() || !std::isfinite(step__) || step__ <= 0;
+    double hmin = step__, hmax = step__;
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    ctx_.comm().allreduce<double, mpi::op_t::min>(&hmin, 1);
+    ctx_.comm().allreduce<double, mpi::op_t::max>(&hmax, 1);
+    if (invalid || hmin != hmax) {
+        RTE_THROW("point Hessian check requires matching LAPW fields, joint callbacks and a common positive step");
     }
-    for (auto const* field : {&response.rho, &response.tau}) {
-        for (size_t i = 0; i < field->size(); i++) {
-            failed |= !std::isfinite((*field)[i]);
+    validate_external_xc_context(ctx_);
+    auto const& q = *ctx_.cb().external_xc_points_;
+    int nr = static_cast<int>(q.coordinates.size()), ns = ctx_.num_spins();
+    std::vector<r3::vector<double>> points;
+    for (auto const& r : q.coordinates) {
+        points.emplace_back(r[0], r[1], r[2]);
+    }
+    LAPW_xc_field_map map(density__, points);
+    auto smooth = external_smooth_fields(ctx_, density__);
+    auto fields = map.sample(smooth[0], smooth[1]);
+    xc_point_fields_t direction(nr, ns), response(nr, ns), plus(nr, ns), minus(nr, ns), shifted(nr, ns);
+    xc_point_derivatives_t geometry(q), hgeometry(q), pgeometry(q), mgeometry(q);
+    for (size_t i = 0; i < fields.rho.size(); i++) {
+        direction.rho[i] = 0.07 * fields.rho[i];
+        direction.tau[i] = -0.11 * fields.tau[i];
+    }
+    for (size_t i = 0; i < fields.gradient.size(); i++) {
+        direction.gradient[i] = 0.03 * fields.gradient[i];
+    }
+    for (int i = 0; i < nr; i++) {
+        geometry.energy_weights[i]     = 0.02 * q.energy_weights[i];
+        geometry.descriptor_weights[i] = 0.03 * q.descriptor_weights[i] * std::cos(0.31 * i);
+        for (int x = 0; x < 3; x++) {
+            geometry.coordinates[i][x] = 0.04 * std::sin(0.23 * (i + x + 1));
         }
     }
-    for (size_t i = 0; i < response.gradient.size(); i++) {
-        failed |= !std::isfinite(response.gradient[i]);
+    for (size_t i = 0; i < q.block_centres.size(); i++) {
+        for (int x = 0; x < 3; x++) {
+            geometry.block_centres[i][x] = 0.03 * std::cos(0.17 * (i + x + 1));
+        }
     }
-    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
-    if (failed) {
-        RTE_THROW("external LAPW XC response failed or returned nonfinite output on a context rank: " + message);
+    response.rho.zero();
+    response.gradient.zero();
+    response.tau.zero();
+    xc_callback_input_t input{
+            nr, ns, 0, fields.rho.at(memory_t::host), fields.gradient.at(memory_t::host), fields.tau.at(memory_t::host),
+            &q};
+    xc_callback_direction_t d{direction.rho.at(memory_t::host), direction.gradient.at(memory_t::host),
+                              direction.tau.at(memory_t::host), &geometry};
+    xc_callback_response_t out{response.rho.at(memory_t::host), response.gradient.at(memory_t::host),
+                               response.tau.at(memory_t::host), &hgeometry};
+    external_xc_point_response(input, d, out);
+    std::array<double, 2> result{};
+    for (int k = 0; k < 2; k++) {
+        double h      = step__ / (k + 1);
+        auto evaluate = [&](double sign, xc_point_fields_t& f, xc_point_derivatives_t& g) {
+            auto displaced = q;
+            for (int i = 0; i < nr; i++) {
+                displaced.energy_weights[i] += sign * h * geometry.energy_weights[i];
+                displaced.descriptor_weights[i] += sign * h * geometry.descriptor_weights[i];
+                for (int x = 0; x < 3; x++) {
+                    displaced.coordinates[i][x] += sign * h * geometry.coordinates[i][x];
+                }
+            }
+            for (size_t i = 0; i < q.block_centres.size(); i++) {
+                for (int x = 0; x < 3; x++) {
+                    displaced.block_centres[i][x] += sign * h * geometry.block_centres[i][x];
+                }
+            }
+            for (size_t i = 0; i < fields.rho.size(); i++) {
+                shifted.rho[i] = fields.rho[i] + sign * h * direction.rho[i];
+                shifted.tau[i] = fields.tau[i] + sign * h * direction.tau[i];
+            }
+            for (size_t i = 0; i < fields.gradient.size(); i++) {
+                shifted.gradient[i] = fields.gradient[i] + sign * h * direction.gradient[i];
+            }
+            f.rho.zero();
+            f.gradient.zero();
+            f.tau.zero();
+            g = xc_point_derivatives_t(q);
+            xc_callback_input_t base{nr,
+                                     ns,
+                                     0,
+                                     shifted.rho.at(memory_t::host),
+                                     shifted.gradient.at(memory_t::host),
+                                     shifted.tau.at(memory_t::host),
+                                     &displaced};
+            xc_callback_output_t v{0, f.rho.at(memory_t::host), f.gradient.at(memory_t::host), f.tau.at(memory_t::host),
+                                   &g};
+            int failed{0};
+            try {
+                ctx_.cb().external_xc_geometry_(ctx_, base, v);
+            } catch (std::exception const&) {
+                failed = 1;
+            }
+            ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+            if (failed) {
+                RTE_THROW("XC geometry callback failed during point Hessian check");
+            }
+        };
+        evaluate(1, plus, pgeometry);
+        evaluate(-1, minus, mgeometry);
+        auto compare = [&](auto const& r, auto const& p, auto const& m) {
+            double error{0}, peak{0};
+            for (size_t i = 0; i < r.size(); i++) {
+                auto e = std::abs(r[i] - (p[i] - m[i]) / (2 * h));
+                error  = std::isfinite(e) ? std::max(error, e) : std::numeric_limits<double>::infinity();
+                peak   = std::max(peak, std::abs(r[i]));
+            }
+            ctx_.comm().allreduce<double, mpi::op_t::max>(&error, 1);
+            ctx_.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+            result[k] = std::max(result[k], error / std::max(1e-12, peak));
+        };
+        compare(response.rho, plus.rho, minus.rho);
+        compare(response.gradient, plus.gradient, minus.gradient);
+        compare(response.tau, plus.tau, minus.tau);
+        compare(hgeometry.energy_weights, pgeometry.energy_weights, mgeometry.energy_weights);
+        compare(hgeometry.descriptor_weights, pgeometry.descriptor_weights, mgeometry.descriptor_weights);
+        auto flatten = [](auto const& v) {
+            std::vector<double> result;
+            for (auto const& r : v) {
+                result.insert(result.end(), r.begin(), r.end());
+            }
+            return result;
+        };
+        compare(flatten(hgeometry.coordinates), flatten(pgeometry.coordinates), flatten(mgeometry.coordinates));
+        compare(flatten(hgeometry.block_centres), flatten(pgeometry.block_centres), flatten(mgeometry.block_centres));
     }
-    return map.adjoint(response);
+    return result;
 }
 
 xc_geometry_derivatives_t

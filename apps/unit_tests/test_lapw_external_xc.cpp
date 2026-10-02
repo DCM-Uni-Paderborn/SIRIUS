@@ -10,6 +10,7 @@
 #include "hamiltonian/diagonalize.hpp"
 #include "hamiltonian/diagonalize_fp.hpp"
 #include "dft/smearing.hpp"
+#include "function3d/xc_point_fields.hpp"
 #include "lapw/step_function.hpp"
 
 using namespace sirius;
@@ -84,24 +85,42 @@ void
 functional_response(Simulation_context const& ctx, xc_callback_input_t const& in,
                     xc_callback_direction_t const& direction, xc_callback_response_t& out)
 {
-    double moment{0};
+    double moment{0}, base_moment{0};
     for (int s = 0; s < in.num_spins; s++) {
         for (int p = 0; p < in.num_points; p++) {
             int j = p + in.num_points * s;
             moment += in.points->descriptor_weights[p] * (direction.rho[j] + 0.3 * direction.tau[j]);
+            base_moment += in.points->descriptor_weights[p] * (in.rho[j] + 0.3 * in.tau[j]);
+            if (direction.geometry) {
+                moment += direction.geometry->descriptor_weights[p] * (in.rho[j] + 0.3 * in.tau[j]);
+            }
         }
     }
     ctx.comm().allreduce(&moment, 1);
+    ctx.comm().allreduce(&base_moment, 1);
     double nonlocal = 0.01 * moment / ctx.unit_cell().omega(), scale = functional_scale(ctx);
+    double base_nonlocal = 0.01 * base_moment / ctx.unit_cell().omega();
     for (int s = 0; s < in.num_spins; s++) {
         for (int p = 0; p < in.num_points; p++) {
             int j    = p + in.num_points * s;
             double w = in.points->energy_weights[p], d = in.points->descriptor_weights[p];
-            out.vrho[j] = scale * (w * (0.04 * direction.rho[j] + 0.005 * direction.tau[j]) + d * nonlocal);
-            out.vtau[j] = scale * (w * (0.02 * direction.tau[j] + 0.005 * direction.rho[j]) + 0.3 * d * nonlocal);
+            double dw = direction.geometry ? direction.geometry->energy_weights[p] : 0;
+            double dd = direction.geometry ? direction.geometry->descriptor_weights[p] : 0;
+            double r = in.rho[j], t = in.tau[j], dr = direction.rho[j], dt = direction.tau[j];
+            out.vrho[j]  = scale * (w * (0.04 * dr + 0.005 * dt) + dw * (0.04 * r + 0.005 * t) + d * nonlocal +
+                                    dd * base_nonlocal);
+            out.vtau[j]  = scale * (w * (0.02 * dt + 0.005 * dr) + dw * (0.02 * t + 0.005 * r) +
+                                    0.3 * (d * nonlocal + dd * base_nonlocal));
+            double local = (0.04 * r + 0.005 * t) * dr + (0.02 * t + 0.005 * r) * dt;
             for (int x = 0; x < 3; x++) {
                 int k            = p + in.num_points * (x + 3 * s);
-                out.vgradient[k] = scale * 0.004 * w * direction.gradient[k];
+                out.vgradient[k] = scale * 0.004 * (w * direction.gradient[k] + dw * in.gradient[k]);
+                local += 0.004 * in.gradient[k] * direction.gradient[k];
+            }
+            if (out.geometry) {
+                out.geometry->energy_weights[p] += scale * local;
+                out.geometry->descriptor_weights[p] +=
+                        scale * (nonlocal * (r + 0.3 * t) + base_nonlocal * (dr + 0.3 * dt));
             }
         }
     }
@@ -1351,7 +1370,53 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         };
         reject("XC response callback failure propagated collectively",
                [&] { potential.lapw_external_xc_response(density, direction); });
-        ctx->cb().external_xc_response_ = functional_response;
+        ctx->cb().external_xc_response_          = functional_response;
+        ctx->cb().external_xc_geometry_          = functional;
+        ctx->cb().external_xc_geometry_response_ = true;
+        auto point_errors                        = potential.check_external_xc_point_hessian(density, 1e-3);
+        check("joint field/quadrature Hessian matches raw covector finite differences",
+              std::max(point_errors[0], point_errors[1]), 2e-8);
+        auto const& quadrature = *ctx->cb().external_xc_points_;
+        int nr = static_cast<int>(quadrature.coordinates.size()), ns = ctx->num_spins();
+        xc_point_fields_t fields(nr, ns), raw_response(nr, ns);
+        fields.rho.zero();
+        fields.gradient.zero();
+        fields.tau.zero();
+        raw_response.rho.zero();
+        raw_response.gradient.zero();
+        raw_response.tau.zero();
+        xc_point_derivatives_t geometry(quadrature), geometry_output(quadrature);
+        xc_callback_input_t input{nr,
+                                  ns,
+                                  0,
+                                  fields.rho.at(memory_t::host),
+                                  fields.gradient.at(memory_t::host),
+                                  fields.tau.at(memory_t::host),
+                                  &quadrature};
+        xc_callback_direction_t d{input.rho, input.gradient, input.tau, &geometry};
+        xc_callback_response_t output{raw_response.rho.at(memory_t::host), raw_response.gradient.at(memory_t::host),
+                                      raw_response.tau.at(memory_t::host), &geometry_output};
+        auto apply_point = [&] { potential.external_xc_point_response(input, d, output); };
+        if (ctx->comm().rank() == 0) {
+            geometry.coordinates.push_back({0, 0, 0});
+        }
+        reject("wrong quadrature direction shape rejected collectively", apply_point);
+        geometry = xc_point_derivatives_t(quadrature);
+        if (ctx->comm().rank() == 0) {
+            geometry.energy_weights[0] = std::numeric_limits<double>::quiet_NaN();
+        }
+        reject("nonfinite quadrature direction rejected collectively", apply_point);
+        geometry                        = xc_point_derivatives_t(quadrature);
+        ctx->cb().external_xc_response_ = [](auto const& c, auto const& in, auto const& d, auto& out) {
+            functional_response(c, in, d, out);
+            if (c.comm().rank() == 0) {
+                out.geometry->coordinates[0][0] = std::numeric_limits<double>::quiet_NaN();
+            }
+        };
+        reject("nonfinite quadrature response rejected collectively", apply_point);
+        ctx->cb().external_xc_response_          = functional_response;
+        ctx->cb().external_xc_geometry_response_ = false;
+        reject("field-only callback rejects quadrature differentiation", apply_point);
         if (ctx->comm().rank() == 0) {
             direction.rho().mt()[0](0, 0) = std::numeric_limits<double>::quiet_NaN();
         }

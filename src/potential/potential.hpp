@@ -325,6 +325,16 @@ class Potential : public Field4D
     xc_rg_magnetic(Density const& density__, bool use_lapl, const bool calculate_vdw_stress__);
 
   public:
+    /// Apply the external Hessian to independent point fields and optional quadrature directions.
+    /** Returns raw covectors, not the derivative of the field-sampling adjoint. */
+    void
+    external_xc_point_response(xc_callback_input_t const& input__, xc_callback_direction_t const& direction__,
+                               xc_callback_response_t& output__) const;
+
+    /// Finite-difference check of all seven independent point-input Hessian blocks.
+    std::array<double, 2>
+    check_external_xc_point_hessian(Density const& density__, double step__) const;
+
     /// Fixed-geometry LAPW XC covector response to physical rho/tau field variations.
     /** Applies the external XC Hessian and the discrete field-map adjoint.
      *  The direction uses total/magnetization fields like Density, including

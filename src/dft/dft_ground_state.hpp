@@ -184,8 +184,9 @@ class DFT_ground_state
     std::array<std::array<double, 3>, 2>
     check_lapw_xc_derivative(double step__);
 
-    /// Relative maximum XC and spherical-potential response errors at step and step/2.
+    /// Relative maximum XC, spherical-potential and enabled point-input response errors.
     /** Uses scratch LAPW rho/tau fields at fixed geometry and radial basis.
+     *  A joint Hessian callback also tests independent quadrature input variations.
      *  The ground-state density, potential and orbitals are not modified.
      */
     std::array<double, 2>

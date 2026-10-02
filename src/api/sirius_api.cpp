@@ -1941,7 +1941,11 @@ sirius_check_external_xc_derivative(void* const* gs_handler__, double const* ste
 /*
 @api begin
 sirius_check_external_xc_response:
-  doc: Check the fixed-geometry external LAPW XC response without changing the ground state.
+  doc: >-
+    Check the external LAPW XC response without changing the ground state.
+    With joint Hessian and point-geometry callbacks, also check the seven independent point-input
+    covectors under simultaneous field and quadrature variations. This does not
+    check the complete host force or stress response.
   arguments:
     gs_handler:
       type: gs_handler
@@ -1954,7 +1958,7 @@ sirius_check_external_xc_response:
     errors:
       type: double
       attr: out, required, dimension(2)
-      doc: Relative maximum XC and spherical-potential response errors at step and step/2.
+      doc: Relative maximum XC, spherical-potential and enabled point-input response errors at step and step/2.
     error_code:
       type: int
       attr: out, optional
@@ -5635,9 +5639,10 @@ sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data
                 if (ctx.initialized()) {
                     RTE_THROW("register external XC before initializing the context");
                 }
-                ctx.cb().external_xc_geometry_ = nullptr;
-                ctx.cb().external_xc_pullback_ = nullptr;
-                ctx.cb().external_xc_response_ = nullptr;
+                ctx.cb().external_xc_geometry_          = nullptr;
+                ctx.cb().external_xc_pullback_          = nullptr;
+                ctx.cb().external_xc_response_          = nullptr;
+                ctx.cb().external_xc_geometry_response_ = false;
                 if (!fptr__) {
                     ctx.cb().external_xc_ = nullptr;
                     ctx.cb().external_xc_points_.reset();
@@ -5762,18 +5767,20 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                     RTE_THROW("register external point XC before initializing the context");
                 }
                 if (!fptr__) {
-                    ctx.cb().external_xc_geometry_ = nullptr;
-                    ctx.cb().external_xc_pullback_ = nullptr;
-                    ctx.cb().external_xc_response_ = nullptr;
-                    ctx.cb().external_xc_          = nullptr;
+                    ctx.cb().external_xc_geometry_          = nullptr;
+                    ctx.cb().external_xc_pullback_          = nullptr;
+                    ctx.cb().external_xc_response_          = nullptr;
+                    ctx.cb().external_xc_geometry_response_ = false;
+                    ctx.cb().external_xc_                   = nullptr;
                     ctx.cb().external_xc_points_.reset();
                     return;
                 }
                 auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
                                                 descriptor_weights__, block_sizes__, block_centres__);
-                ctx.cb().external_xc_geometry_ = nullptr;
-                ctx.cb().external_xc_pullback_ = nullptr;
-                ctx.cb().external_xc_response_ = nullptr;
+                ctx.cb().external_xc_geometry_          = nullptr;
+                ctx.cb().external_xc_pullback_          = nullptr;
+                ctx.cb().external_xc_response_          = nullptr;
+                ctx.cb().external_xc_geometry_response_ = false;
                 using callback_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
                                             int const*, double const*, double const*, double const*, double const*,
                                             double*, double*, double*, double*, int*);
@@ -6037,6 +6044,7 @@ sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), 
                 if (invalid || enabled_min != enabled_max) {
                     RTE_THROW("register the XC response collectively after point XC and before initialization");
                 }
+                ctx.cb().external_xc_geometry_response_ = false;
                 if (!fptr__) {
                     ctx.cb().external_xc_response_ = nullptr;
                     return;
@@ -6048,6 +6056,11 @@ sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), 
                 auto response                  = reinterpret_cast<response_t>(fptr__);
                 ctx.cb().external_xc_response_ = [response, user_data__](auto const& c, auto const& in, auto const& d,
                                                                          auto& out) {
+                    int invalid = d.geometry || out.geometry;
+                    c.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+                    if (invalid) {
+                        RTE_THROW("the fixed-geometry XC response callback cannot differentiate quadrature inputs");
+                    }
                     auto const& p = *in.points;
                     int status{0};
                     response(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
@@ -6058,6 +6071,132 @@ sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), 
                              in.tau, d.rho, d.gradient, d.tau, out.vrho, out.vgradient, out.vtau, &status);
                     if (status) {
                         RTE_THROW("external XC response callback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_point_hessian_callback:
+  doc: >-
+    Register a joint field and quadrature XC Hessian-vector evaluator after the
+    point XC callback and before context initialization. Replaces the fixed-geometry
+    response callback without changing its ABI. Its C signature is
+    void response(void* user_data, int nr, int ns, int nb, int fcomm,
+    const double* coordinates, const double* energy_weights,
+    const double* descriptor_weights, const int* block_sizes,
+    const double* block_centres, const double* rho, const double* gradient,
+    const double* tau, const double* delta_rho, const double* delta_gradient,
+    const double* delta_tau, const double* delta_coordinates,
+    const double* delta_energy_weights, const double* delta_descriptor_weights,
+    const double* delta_block_centres, double* delta_vrho,
+    double* delta_vgradient, double* delta_vtau, double* delta_dcoordinates,
+    double* delta_denergy_weights, double* delta_ddescriptor_weights,
+    double* delta_dblock_centres, int* status).
+    Arrays have the point callback's Fortran shapes. Return the Hessian of the
+    entire discrete energy applied to these independent directions, including
+    mixed field/geometry and nonlocal terms. All output covectors are raw,
+    without field sampling, gradient adjoints, forces or stress factors.
+    The call is collective, including empty ranks. Outputs start at zero.
+    Set status nonzero on failure without unwinding across the C ABI.
+    A null pointer disables the response.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable joint XC Hessian-vector evaluator.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_point_hessian_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx = get_sim_ctx(handler__);
+                int invalid =
+                        ctx.initialized() || (fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int enabled_min = bool(fptr__), enabled_max = enabled_min;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || enabled_min != enabled_max) {
+                    RTE_THROW("register the joint XC Hessian collectively after point XC and before initialization");
+                }
+                ctx.cb().external_xc_geometry_response_ = bool(fptr__);
+                if (!fptr__) {
+                    ctx.cb().external_xc_response_ = nullptr;
+                    return;
+                }
+                using response_t =
+                        void (*)(void*, int, int, int, int, double const*, double const*, double const*, int const*,
+                                 double const*, double const*, double const*, double const*, double const*,
+                                 double const*, double const*, double const*, double const*, double const*,
+                                 double const*, double*, double*, double*, double*, double*, double*, double*, int*);
+                auto response                  = reinterpret_cast<response_t>(fptr__);
+                ctx.cb().external_xc_response_ = [response, user_data__](auto const& c, auto const& in, auto const& d,
+                                                                         auto& out) {
+                    auto const& p = *in.points;
+                    std::unique_ptr<xc_point_derivatives_t> zero, unused;
+                    if (!d.geometry) {
+                        zero = std::make_unique<xc_point_derivatives_t>(p);
+                    }
+                    if (!out.geometry) {
+                        unused = std::make_unique<xc_point_derivatives_t>(p);
+                    }
+                    auto const& g      = d.geometry ? *d.geometry : *zero;
+                    auto& v            = out.geometry ? *out.geometry : *unused;
+                    auto shape_matches = [&](auto const& a) {
+                        return a.coordinates.size() == p.coordinates.size() &&
+                               a.block_centres.size() == p.block_centres.size() &&
+                               a.energy_weights.size() == p.energy_weights.size() &&
+                               a.descriptor_weights.size() == p.descriptor_weights.size();
+                    };
+                    int invalid = !shape_matches(g) || !shape_matches(v);
+                    for (auto const* a : {&g.coordinates, &g.block_centres}) {
+                        for (auto const& r : *a) {
+                            for (auto x : r) {
+                                invalid |= !std::isfinite(x);
+                            }
+                        }
+                    }
+                    for (auto const* a : {&g.energy_weights, &g.descriptor_weights}) {
+                        for (auto x : *a) {
+                            invalid |= !std::isfinite(x);
+                        }
+                    }
+                    c.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+                    if (invalid) {
+                        RTE_THROW("invalid or nonfinite XC quadrature response direction on a context rank");
+                    }
+                    int status{0};
+                    response(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
+                             MPI_Comm_c2f(c.comm().native()),
+                             p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
+                             p.descriptor_weights.data(), p.block_sizes.data(),
+                             p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
+                             in.tau, d.rho, d.gradient, d.tau,
+                             g.coordinates.empty() ? nullptr : g.coordinates.front().data(), g.energy_weights.data(),
+                             g.descriptor_weights.data(),
+                             g.block_centres.empty() ? nullptr : g.block_centres.front().data(), out.vrho,
+                             out.vgradient, out.vtau, v.coordinates.empty() ? nullptr : v.coordinates.front().data(),
+                             v.energy_weights.data(), v.descriptor_weights.data(),
+                             v.block_centres.empty() ? nullptr : v.block_centres.front().data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC Hessian callback returned status " + std::to_string(status));
                     }
                 };
             },
