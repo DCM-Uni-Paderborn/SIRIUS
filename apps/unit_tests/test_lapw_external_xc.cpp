@@ -7,6 +7,7 @@
 #include <testing.hpp>
 #include "dft/dft_ground_state.hpp"
 #include "hamiltonian/diagonalize_fp.hpp"
+#include "lapw/step_function.hpp"
 
 using namespace sirius;
 
@@ -106,6 +107,9 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
         type.set_configuration(1, 0, 1, 2.0, true);
     }
     ctx->unit_cell().add_atom(label, {0.23, 0.31, 0.43}, {0, 0, mag ? 0.2 : 0.0});
+    if (mag && !second_variation && !core) {
+        ctx->unit_cell().add_atom(label, {0.71, 0.79, 0.86}, {0, 0, 0.2});
+    }
     auto points     = std::make_shared<xc_point_set_t>(*ctx);
     constexpr int n = 10;
     // All points on one rank exercise empty model ranks and replicated FFTs.
@@ -169,8 +173,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
         if (ctx->comm().rank() == 0) {
             std::cout << "external LAPW core=" << core << " spins=" << ctx->num_spins()
-                      << " distributed FFT=" << distributed_fft << " second variation=" << second_variation << " "
-                      << name << ": " << error << '\n';
+                      << " atoms=" << ctx->unit_cell().num_atoms() << " distributed FFT=" << distributed_fft
+                      << " second variation=" << second_variation << " " << name << ": " << error << '\n';
         }
         failures += !std::isfinite(error) || error > tolerance;
     };
@@ -425,6 +429,84 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         }
         check("nonzero tau-dependent core response", response > 1e-5 ? 0 : 1, 0);
         density.generate_core_charge_density(vs, d);
+    }
+    if (!core && (!second_variation || !mag)) {
+        auto const& forces = gs.forces().calc_forces_ibs();
+        r3::vector<double> direction{0.23, -0.37, 0.19};
+        auto position = ctx->unit_cell().atom(0).position();
+        double analytic{0};
+        for (int x = 0; x < 3; x++) {
+            analytic -= direction[x] * forces(x, 0);
+        }
+        // Hold radial functions, local Hamiltonians, Fourier potentials and orbitals
+        // fixed. Only matching coefficients and the interstitial boundary move.
+        Hamiltonian0<double> h0(potential, false);
+        h0.generate_pw_coefs(potential);
+        auto evaluate = [&](double step) {
+            auto shifted = position;
+            for (int x = 0; x < 3; x++) {
+                shifted[x] += step * direction[x] / ctx->unit_cell().lattice_vector(x)[x];
+            }
+            ctx->unit_cell().atom(0).set_position(shifted);
+            double value{0};
+            for (auto it : ks.spl_num_kpoints()) {
+                auto kp = ks.get<double>(it.i);
+                kp->update();
+                auto hk = h0(*kp);
+                int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                for (int s = 0; s < ctx->num_spins(); s++) {
+                    hk.set_fv_h_o(s, h, o);
+                    // Translate the sphere's Fourier coefficients without rebuilding
+                    // the context, which would discard the frozen radial basis.
+                    for (int j = 0; j < kp->num_gkvec_col(); j++) {
+                        auto qj = kp->gkvec_col().gkvec_cart(gvec_index_t::local(j));
+                        for (int i = 0; i < kp->num_gkvec_row(); i++) {
+                            auto qi    = kp->gkvec_row().gkvec_cart(gvec_index_t::local(i));
+                            auto g     = qi - qj;
+                            auto r     = ctx->unit_cell().get_cartesian_coordinates(position);
+                            auto phase = std::exp(std::complex<double>(0, -dot(g, r)));
+                            auto delta =
+                                    -fourpi / ctx->unit_cell().omega() *
+                                    unit_step_function_form_factors(ctx->unit_cell().atom(0).mt_radius(), g.length()) *
+                                    phase * (std::exp(std::complex<double>(0, -step * dot(g, direction))) - 1.0);
+                            o(i, j) += delta;
+                            h(i, j) += 0.5 * dot(qi, qj) * delta;
+                        }
+                    }
+                    for (int b = 0; b < ctx->num_bands(); b++) {
+                        auto all = kp->spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(b));
+                        int ng   = kp->gkvec().num_gvec();
+                        std::vector<std::complex<double>> c(all.begin(), all.begin() + ng);
+                        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                            auto const& type = ctx->unit_cell().atom(ia).type();
+                            c.insert(c.end(), all.begin() + ng + type.mt_aw_basis_size(),
+                                     all.begin() + ng + type.mt_basis_size());
+                            ng += type.mt_basis_size();
+                        }
+                        double weight = kp->weight() * kp->band_occupancy(b, s) * ctx->blacs_grid().comm().size() /
+                                        kp->comm().size();
+                        for (int j = 0; j < h.num_cols_local(); j++) {
+                            for (int i = 0; i < h.num_rows_local(); i++) {
+                                value += weight * std::real(std::conj(c[h.irow(i)]) *
+                                                            (h(i, j) - kp->band_energy(b, s) * o(i, j)) * c[h.icol(j)]);
+                            }
+                        }
+                    }
+                }
+            }
+            ctx->comm().allreduce(&value, 1);
+            return value;
+        };
+        for (double step : {1e-3, 5e-4}) {
+            double fd = (evaluate(step) - evaluate(-step)) / (2 * step);
+            check("LAPW basis/boundary force", std::abs(fd - analytic), 2e-8);
+            check("relative basis/boundary force error", std::abs((fd - analytic) / analytic), 2e-5);
+        }
+        evaluate(0);
+        check("nonzero basis/boundary force", std::abs(analytic) > 1e-7 ? 0 : 1, 0);
+        verify_restored();
     }
     return failures;
 }
