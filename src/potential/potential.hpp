@@ -856,6 +856,10 @@ class Potential : public Field4D
         return bool(kinetic_potential_);
     }
 
+    /// Collectively validate the discrete LAPW XC field layout without staging it.
+    void
+    validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const;
+
     /// Stage discrete LAPW XC derivatives for a fixed-potential Hamiltonian build.
     /** Supplying the corresponding functional energy also enables energy contractions.
      *  This does not solve the radial core response. generate() clears this data.

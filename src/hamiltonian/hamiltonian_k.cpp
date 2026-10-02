@@ -344,6 +344,33 @@ Hamiltonian_k<T>::get_h_o_diag_lapw() const
 
 template <typename T>
 void
+Hamiltonian_k<T>::lapw_basis_coefficients(int ia__, mdarray<std::complex<T>, 2>& row__,
+                                          mdarray<std::complex<T>, 2>& col__) const
+{
+    auto const& atom = H0_.ctx().unit_cell().atom(ia__);
+    auto const& type = atom.type();
+    row__.zero();
+    col__.zero();
+    if (kp_.num_gkvec_row()) {
+        kp_.alm_coeffs_row().template generate<true>(atom, row__);
+    }
+    if (kp_.num_gkvec_col()) {
+        kp_.alm_coeffs_col().template generate<false>(atom, col__);
+    }
+    for (int i = 0; i < kp_.num_atom_lo_rows(ia__); i++) {
+        int j                                                                          = kp_.lo_row(ia__, i);
+        auto const& b                                                                  = kp_.lo_basis_descriptor_row(j);
+        row__(kp_.num_gkvec_row() + j, type.indexb().index_by_lm_order(b.lm, b.order)) = 1;
+    }
+    for (int i = 0; i < kp_.num_atom_lo_cols(ia__); i++) {
+        int j                                                                          = kp_.lo_col(ia__, i);
+        auto const& b                                                                  = kp_.lo_basis_descriptor_col(j);
+        col__(kp_.num_gkvec_col() + j, type.indexb().index_by_lm_order(b.lm, b.order)) = 1;
+    }
+}
+
+template <typename T>
+void
 Hamiltonian_k<T>::set_fv_h_o_radial_response(int ispn__, std::vector<radial_basis_response_t> const& response__,
                                              std::vector<lapw_atom_basis_response_t> const& atoms__,
                                              la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const
@@ -405,27 +432,15 @@ Hamiltonian_k<T>::set_fv_h_o_radial_response(int ispn__, std::vector<radial_basi
         auto const& type = atom.type();
         int nb           = type.mt_basis_size();
         mdarray<std::complex<T>, 2> row({nr, nb}), col({nc, nb}), drow({nr, nb}), dcol({nc, nb});
-        for (auto* m : {&row, &col, &drow, &dcol}) {
-            m->zero();
-        }
+        lapw_basis_coefficients(ia, row, col);
+        drow.zero();
+        dcol.zero();
         auto const& r = response__[atom.symmetry_class().id()];
         if (kp_.num_gkvec_row()) {
-            kp_.alm_coeffs_row().template generate<true>(atom, row);
             kp_.alm_coeffs_row().template generate_potential_response<true>(atom, r, drow);
         }
         if (kp_.num_gkvec_col()) {
-            kp_.alm_coeffs_col().template generate<false>(atom, col);
             kp_.alm_coeffs_col().template generate_potential_response<false>(atom, r, dcol);
-        }
-        for (int i = 0; i < kp_.num_atom_lo_rows(ia); i++) {
-            int j         = kp_.lo_row(ia, i);
-            auto const& b = kp_.lo_basis_descriptor_row(j);
-            row(kp_.num_gkvec_row() + j, type.indexb().index_by_lm_order(b.lm, b.order)) = 1;
-        }
-        for (int i = 0; i < kp_.num_atom_lo_cols(ia); i++) {
-            int j         = kp_.lo_col(ia, i);
-            auto const& b = kp_.lo_basis_descriptor_col(j);
-            col(kp_.num_gkvec_col() + j, type.indexb().index_by_lm_order(b.lm, b.order)) = 1;
         }
         mdarray<std::complex<T>, 2> mt({nb, nb}), delta({nb, nb}), work({nr, nb});
         for (int part : {0, 1}) {
@@ -454,6 +469,84 @@ Hamiltonian_k<T>::set_fv_h_o_radial_response(int ispn__, std::vector<radial_basi
             la::wrap(la::lib_t::blas)
                     .gemm('N', 'T', nr, nc, nb, &one, work.at(memory_t::host), work.ld(), col.at(memory_t::host),
                           col.ld(), &one, out.at(memory_t::host), out.ld());
+        }
+    }
+}
+
+template <typename T>
+void
+Hamiltonian_k<T>::set_fv_h_field_response(int ispn__, lapw_hamiltonian_response_t const& response__,
+                                          la::dmatrix<std::complex<T>>& h__) const
+{
+    auto const& ctx = H0_.ctx();
+    auto const& uc  = ctx.unit_cell();
+    int n = kp_.gklo_basis_size(), nr = kp_.gklo_basis_size_row(), nc = kp_.gklo_basis_size_col();
+    int invalid = !std::is_same_v<T, double> || !ctx.full_potential() || ctx.processing_unit() != device_t::CPU ||
+                  ctx.valence_relativity() != relativity_t::none || ctx.so_correction() || ctx.num_mag_dims() == 3 ||
+                  ctx.hubbard_correction() || (ctx.num_spins() == 2 && ctx.cfg().control().use_second_variation()) ||
+                  ispn__ < 0 || ispn__ >= ctx.num_spins() || response__.context != &ctx ||
+                  response__.local.size() != uc.num_atoms() || h__.num_rows() != n || h__.num_cols() != n ||
+                  h__.num_rows_local() != nr || h__.num_cols_local() != nc || h__.bs_row() != ctx.cyclic_block_size() ||
+                  h__.bs_col() != ctx.cyclic_block_size() || (h__.size_local() && !h__.on_host()) ||
+                  !h__.has_blacs_grid() || &h__.blacs_grid() != &ctx.blacs_grid();
+    auto finite = [](auto const& field) {
+        if (field.size() && !field.on_host()) {
+            return false;
+        }
+        for (size_t i = 0; i < field.size(); i++) {
+            if (!std::isfinite(std::abs(field[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    for (auto const* field : {&response__.scalar_pw, &response__.kinetic_pw}) {
+        invalid |= field->size(0) != ctx.gvec().num_gvec() || field->size(1) != ctx.num_spins() || !finite(*field);
+    }
+    if (!invalid) {
+        for (int ia = 0; ia < uc.num_atoms(); ia++) {
+            int nb        = uc.atom(ia).type().mt_basis_size();
+            auto const& h = response__.local[ia];
+            invalid |= h.size(0) != nb || h.size(1) != nb || h.size(2) != ctx.num_spins() || !finite(h);
+        }
+    }
+    int smin = ispn__, smax = ispn__;
+    kp_.comm().template allreduce<int, mpi::op_t::min>(&smin, 1);
+    kp_.comm().template allreduce<int, mpi::op_t::max>(&smax, 1);
+    kp_.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid || smin != smax) {
+        RTE_THROW("LAPW field matrix response requires compatible finite fields and a PW/LO matrix layout");
+    }
+    h__.zero();
+    if (nr == 0 || nc == 0) {
+        return;
+    }
+    for (int ia = 0; ia < uc.num_atoms(); ia++) {
+        int nb = uc.atom(ia).type().mt_basis_size();
+        mdarray<std::complex<T>, 2> row({nr, nb}), col({nc, nb}), mt({nb, nb}), work({nr, nb});
+        lapw_basis_coefficients(ia, row, col);
+        for (int j = 0; j < nb; j++) {
+            for (int i = 0; i < nb; i++) {
+                mt(i, j) = static_cast<std::complex<T>>(response__.local[ia](i, j, ispn__));
+            }
+        }
+        auto const one = la::constant<std::complex<T>>::one(), zero = la::constant<std::complex<T>>::zero();
+        la::wrap(la::lib_t::blas)
+                .gemm('N', 'N', nr, nb, nb, &one, row.at(memory_t::host), row.ld(), mt.at(memory_t::host), mt.ld(),
+                      &zero, work.at(memory_t::host), work.ld());
+        la::wrap(la::lib_t::blas)
+                .gemm('N', 'T', nr, nc, nb, &one, work.at(memory_t::host), work.ld(), col.at(memory_t::host), col.ld(),
+                      &one, h__.at(memory_t::host), h__.ld());
+    }
+    for (int j = 0; j < kp_.num_gkvec_col(); j++) {
+        auto gj = kp_.gkvec_col().gvec(gvec_index_t::local(j));
+        auto qj = kp_.gkvec_col().gkvec_cart(gvec_index_t::local(j));
+        for (int i = 0; i < kp_.num_gkvec_row(); i++) {
+            auto gi = kp_.gkvec_row().gvec(gvec_index_t::local(i));
+            auto qi = kp_.gkvec_row().gkvec_cart(gvec_index_t::local(i));
+            int ig  = ctx.gvec().index_g12(gi, gj);
+            h__(i, j) += static_cast<std::complex<T>>(response__.scalar_pw(ig, ispn__) +
+                                                      0.5 * r3::dot(qi, qj) * response__.kinetic_pw(ig, ispn__));
         }
     }
 }

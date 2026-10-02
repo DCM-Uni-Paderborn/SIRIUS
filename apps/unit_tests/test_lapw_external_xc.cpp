@@ -850,7 +850,93 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     Density displaced(*ctx);
     Potential probe(*ctx);
     auto c = potential.lapw_xc_contractions(density);
+    std::vector<std::vector<double>> spherical_before_fields;
+    std::vector<std::array<std::vector<double>, 2>> core_xc_before_fields;
+    for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+        auto const& cls = ctx->unit_cell().atom_symmetry_class(ic);
+        spherical_before_fields.push_back(cls.spherical_potential());
+        core_xc_before_fields.push_back(cls.spherical_xc_derivatives());
+    }
+    auto restore_field_matrices = [&] {
+        potential.update_atomic_potential();
+        for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
+            cls.set_spherical_potential(spherical_before_fields[ic]);
+            cls.set_spherical_xc_derivatives(core_xc_before_fields[ic]);
+        }
+        ctx->unit_cell().generate_radial_integrals();
+    };
+    auto matrix_snapshot = [&](Potential& p, lapw_hamiltonian_response_t const* response) {
+        Hamiltonian0<double> h0(p, false);
+        h0.generate_pw_coefs(p);
+        std::vector<std::complex<double>> entries;
+        for (auto it : ks.spl_num_kpoints()) {
+            auto kp = ks.get<double>(it.i);
+            auto hk = h0(*kp);
+            int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+            la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+            la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+            for (int s = 0; s < ctx->num_spins(); s++) {
+                if (response) {
+                    hk.set_fv_h_field_response(s, *response, h);
+                } else {
+                    hk.set_fv_h_o(s, h, o);
+                }
+                for (int j = 0; j < h.num_cols_local(); j++) {
+                    for (int i = 0; i < h.num_rows_local(); i++) {
+                        entries.push_back(h(i, j));
+                    }
+                }
+            }
+        }
+        return entries;
+    };
     for (int part = 0; part < ctx->num_spins() + 1; part++) {
+        std::vector<std::complex<double>> analytic_matrices, sampled_matrices;
+        if (!mag || !second_variation) {
+            Density direction(*ctx);
+            direction.zero();
+            direction.kinetic_density().zero();
+            if (part == 0) {
+                copy(density.rho(), direction.rho());
+            } else if (part == 1) {
+                for (int j = 0; j < ctx->num_spins(); j++) {
+                    copy(density.kinetic_density().component(j), direction.kinetic_density().component(j));
+                }
+            } else {
+                copy(density.mag(0), direction.mag(0));
+            }
+            auto hartree = potential.hartree_response(direction.rho());
+            auto xc      = potential.lapw_external_xc_response(density, direction);
+            Hamiltonian0<double> h0(potential, false);
+            auto response     = h0.lapw_field_response(*hartree, xc);
+            analytic_matrices = matrix_snapshot(potential, &response);
+            if (!mag && !second_variation && part == 0) {
+                auto saved = xc.local[0][1][0][0];
+                if (ctx->comm().rank() == 0) {
+                    xc.local[0][1][0][0] = std::numeric_limits<double>::quiet_NaN();
+                }
+                reject("invalid XC field matrix input rejected collectively",
+                       [&] { h0.lapw_field_response(*hartree, xc); });
+                xc.local[0][1][0][0] = saved;
+                if (ctx->comm().rank() == 0) {
+                    saved               = hartree->mt()[0][0];
+                    hartree->mt()[0][0] = std::numeric_limits<double>::quiet_NaN();
+                }
+                reject("invalid Hartree field matrix input rejected collectively",
+                       [&] { h0.lapw_field_response(*hartree, xc); });
+                if (ctx->comm().rank() == 0) {
+                    hartree->mt()[0][0] = saved;
+                }
+                auto invalid_energy_fields = potential.lapw_external_xc_response(density, direction);
+                reject("nonfinite staged LAPW energy rejected collectively", [&] {
+                    probe.set_lapw_xc_derivatives(std::move(invalid_energy_fields),
+                                                  ctx->comm().rank() == 0 ? std::numeric_limits<double>::quiet_NaN()
+                                                                          : 0.0);
+                });
+            }
+            verify_restored();
+        }
         auto evaluate = [&](double step) {
             copy(density, displaced);
             if (part == 0) {
@@ -868,17 +954,51 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             }
             displaced.fft_transform(-1);
             displaced.kinetic_density().fft_transform(-1);
-            probe.xc(displaced);
+            if (!mag || !second_variation) {
+                try {
+                    probe.generate(displaced, false, true);
+                    probe.update_atomic_potential();
+                    ctx->unit_cell().generate_radial_integrals();
+                    sampled_matrices = matrix_snapshot(probe, nullptr);
+                } catch (...) {
+                    restore_field_matrices();
+                    throw;
+                }
+                restore_field_matrices();
+            } else {
+                probe.xc(displaced);
+            }
             return probe.energy_exc(displaced);
         };
-        for (double h : {1e-4, 5e-5}) {
-            double fd = (evaluate(h) - evaluate(-h)) / (2 * h);
+        // The quadratic fixture has an exactly linear Hamiltonian response. A larger
+        // spin-only step resolves the weak core-fixture signal above subtraction roundoff.
+        double field_step = core && part == 2 ? 0.1 : 1e-4;
+        for (double h : {field_step, 0.5 * field_step}) {
+            double plus        = evaluate(h);
+            auto plus_matrices = sampled_matrices;
+            double fd          = (plus - evaluate(-h)) / (2 * h);
+            if (!mag || !second_variation) {
+                double error{0}, peak{0};
+                for (size_t i = 0; i < analytic_matrices.size(); i++) {
+                    double e = std::abs(analytic_matrices[i] - (plus_matrices[i] - sampled_matrices[i]) / (2 * h));
+                    error    = std::isfinite(e) ? std::max(error, e) : std::numeric_limits<double>::infinity();
+                    peak     = std::max(peak, std::abs(analytic_matrices[i]));
+                }
+                ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                if (error > 3e-7 * std::max(1e-12, peak) && ctx->comm().rank() == 0) {
+                    std::cout << "field matrix FD part=" << part << " step=" << h << " error=" << error
+                              << " response=" << peak << '\n';
+                }
+                check("complete Hartree/XC Hamiltonian field response", error / std::max(1e-12, peak), 3e-7);
+            }
             check("callback physical-field derivative",
                   std::abs(fd - (part == 0   ? c.rho
                                  : part == 1 ? c.tau
                                              : c.magnetic)),
                   2e-10);
         }
+        verify_restored();
     }
     double kinetic = density.kinetic_density().scalar().integrate().total;
     double direct =

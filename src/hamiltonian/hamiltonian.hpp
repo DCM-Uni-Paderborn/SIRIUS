@@ -30,6 +30,17 @@ class Simulation_context;
 class Potential;
 class Unit_cell;
 struct radial_basis_response_t;
+struct lapw_xc_field_adjoint_t;
+template <typename T>
+class Periodic_function;
+
+/// Hartree and XC matrix response at fixed geometry and radial basis.
+struct lapw_hamiltonian_response_t
+{
+    Simulation_context const* context{nullptr};
+    mdarray<std::complex<double>, 2> scalar_pw, kinetic_pw;
+    std::vector<mdarray<std::complex<double>, 3>> local;
+};
 
 /// Atom-local radial-basis derivatives and the unperturbed overlap, in AW/LO order.
 struct lapw_atom_basis_response_t
@@ -221,6 +232,11 @@ class Hamiltonian0
     /// Collective on the context communicator, before looping over locally owned k-points.
     std::vector<lapw_atom_basis_response_t>
     lapw_radial_basis_response(std::vector<radial_basis_response_t> const& response__) const;
+
+    /// Prepare the Hartree/XC field contribution to dH without changing any ground-state fields.
+    /// Collective on the context communicator, before looping over locally owned k-points.
+    lapw_hamiltonian_response_t
+    lapw_field_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__) const;
 };
 
 template <typename T>
@@ -236,6 +252,10 @@ class Hamiltonian_k
     /// Hubbard correction.
     /** In general case it is a k-dependent matrix */
     std::shared_ptr<U_operator<T>> u_op_;
+
+    /// Frozen matching transformation from independent PW/LO to atom AW/LO coefficients.
+    void
+    lapw_basis_coefficients(int ia__, mdarray<std::complex<T>, 2>& row__, mdarray<std::complex<T>, 2>& col__) const;
 
     /// Copy constructor is forbidden.
     Hamiltonian_k(Hamiltonian_k<T> const& src__) = delete;
@@ -502,6 +522,12 @@ class Hamiltonian_k
     set_fv_h_o_radial_response(int ispn__, std::vector<radial_basis_response_t> const& response__,
                                std::vector<lapw_atom_basis_response_t> const& atoms__,
                                la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Hartree/XC field contribution to the complete PW/LO dH, at fixed basis and geometry.
+    /// Collective on the k-point communicator. The overlap has no field contribution.
+    void
+    set_fv_h_field_response(int ispn__, lapw_hamiltonian_response_t const& response__,
+                            la::dmatrix<std::complex<T>>& h__) const;
 
     /// Add interstitial contribution to apw-apw block of Hamiltonian and overlap.
     void

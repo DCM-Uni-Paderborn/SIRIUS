@@ -8,17 +8,10 @@
 namespace sirius {
 
 void
-Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<double> energy__)
+Potential::validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& d__) const
 {
-    int present_min = energy__.has_value(), present_max = present_min;
-    ctx_.comm().allreduce<int, mpi::op_t::min>(&present_min, 1);
-    ctx_.comm().allreduce<int, mpi::op_t::max>(&present_max, 1);
-    if (present_min != present_max) {
-        RTE_THROW("LAPW XC energy presence differs between context ranks");
-    }
     bool failed{false};
     try {
-        failed = energy__ && !std::isfinite(*energy__);
         int ns = ctx_.num_spins();
         if (!ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
             ctx_.spfft<double>().processing_unit() != SPFFT_PU_HOST ||
@@ -46,7 +39,7 @@ Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<do
                 }
                 for (auto const& field : d__.local[ia][part]) {
                     if (field.angular_domain_size() != sf::lmmax(ctx_.lmax_rho()) ||
-                        field.radial_grid().hash() != grid.hash()) {
+                        field.radial_grid().hash() != grid.hash() || !field.on_host()) {
                         RTE_THROW("incompatible LAPW XC radial grid or angular extent");
                     }
                     for (size_t i = 0; i < field.size(); i++) {
@@ -74,7 +67,24 @@ Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<do
     if (invalid) {
         RTE_THROW("invalid or unsupported LAPW XC derivatives on a context rank");
     }
+}
+
+void
+Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<double> energy__)
+{
+    int present_min = energy__.has_value(), present_max = present_min;
+    ctx_.comm().allreduce<int, mpi::op_t::min>(&present_min, 1);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&present_max, 1);
+    if (present_min != present_max) {
+        RTE_THROW("LAPW XC energy presence differs between context ranks");
+    }
+    validate_lapw_xc_derivatives(d__);
     if (energy__) {
+        int invalid = !std::isfinite(*energy__);
+        ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+        if (invalid) {
+            RTE_THROW("nonfinite LAPW XC energy");
+        }
         double emin = *energy__, emax = *energy__;
         ctx_.comm().allreduce<double, mpi::op_t::min>(&emin, 1);
         ctx_.comm().allreduce<double, mpi::op_t::max>(&emax, 1);

@@ -618,6 +618,138 @@ Hamiltonian0<T>::lapw_radial_basis_response(std::vector<radial_basis_response_t>
     return matrices;
 }
 
+template <typename T>
+lapw_hamiltonian_response_t
+Hamiltonian0<T>::lapw_field_response(Periodic_function<double> const& hartree__,
+                                     lapw_xc_field_adjoint_t const& xc__) const
+{
+    int lmmax = ctx_.lmmax_pot(), ns = ctx_.num_spins();
+    int invalid = !std::is_same_v<T, double> || !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
+                  ctx_.valence_relativity() != relativity_t::none || ctx_.so_correction() || ctx_.num_mag_dims() == 3 ||
+                  ctx_.hubbard_correction() || (ns == 2 && ctx_.cfg().control().use_second_variation()) ||
+                  &hartree__.ctx() != &ctx_;
+    if (!invalid) {
+        invalid |= hartree__.mt().atoms().size() != static_cast<size_t>(unit_cell_.num_atoms());
+        for (int ir = 0; ir < ctx_.spfft<double>().local_slice_size(); ir++) {
+            invalid |= !std::isfinite(hartree__.rg().value(ir));
+        }
+        if (!invalid) {
+            for (auto it : unit_cell_.spl_num_atoms()) {
+                auto const& v    = hartree__.mt()[it.i];
+                auto const& grid = unit_cell_.atom(it.i).radial_grid();
+                invalid |= v.angular_domain_size() != lmmax || v.radial_grid().hash() != grid.hash() ||
+                           v.size() != static_cast<size_t>(lmmax * grid.num_points()) || !v.on_host();
+                if (v.on_host()) {
+                    for (size_t i = 0; i < v.size(); i++) {
+                        invalid |= !std::isfinite(v[i]);
+                    }
+                }
+            }
+        }
+    }
+    ctx_.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW field matrices require finite Hartree fields and nonrelativistic scalar/collinear CPU fp64 "
+                  "states");
+    }
+    potential_->validate_lapw_xc_derivatives(xc__);
+    lapw_hamiltonian_response_t result;
+    result.context    = &ctx_;
+    result.scalar_pw  = mdarray<std::complex<double>, 2>({ctx_.gvec().num_gvec(), ns});
+    result.kinetic_pw = mdarray<std::complex<double>, 2>({ctx_.gvec().num_gvec(), ns});
+    Smooth_periodic_function<double> masked(ctx_.spfft<double>(), ctx_.gvec_fft_sptr());
+    for (int ir = 0; ir < ctx_.spfft<double>().local_slice_size(); ir++) {
+        masked.value(ir) = hartree__.rg().value(ir) * ctx_.theta(ir);
+    }
+    masked.fft_transform(-1);
+    auto hartree_pw = masked.gather_f_pw();
+    for (int s = 0; s < ns; s++) {
+        auto rho = xc__.rho[s].gather_f_pw();
+        auto tau = xc__.tau[s].gather_f_pw();
+        for (int ig = 0; ig < ctx_.gvec().num_gvec(); ig++) {
+            // The XC covectors already carry their interstitial restriction.
+            result.scalar_pw(ig, s)  = hartree_pw[ig] + rho[ig];
+            result.kinetic_pw(ig, s) = tau[ig];
+        }
+    }
+    bool simple  = ctx_.cfg().settings().simple_lapw_ri();
+    auto l_by_lm = sf::l_by_lm(ctx_.lmax_pot());
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        auto const& atom = unit_cell_.atom(ia);
+        auto const& type = atom.type();
+        auto const& grid = type.radial_grid();
+        auto const& cls  = atom.symmetry_class();
+        int nr = grid.num_points(), nrf = type.indexr().size(), nb = type.mt_basis_size();
+        int owner = unit_cell_.spl_num_atoms().location(atom_index_t::global(ia)).ib;
+        mdarray<double, 2> values({lmmax, nr});
+        if (ctx_.comm().rank() == owner) {
+            std::copy_n(hartree__.mt()[ia].at(memory_t::host), values.size(), values.at(memory_t::host));
+        }
+        ctx_.comm().bcast(values.at(memory_t::host), values.size(), owner);
+        std::vector<Spline<double>> radial;
+        for (int i = 0; i < nrf; i++) {
+            radial.emplace_back(grid);
+            for (int ir = 0; ir < nr; ir++) {
+                radial.back()(ir) = cls.radial_function(ir, i);
+            }
+            radial.back().interpolate();
+        }
+        mdarray<double, 3> integrals({lmmax, nrf, nrf});
+        integrals.zero();
+        Spline<double> field(grid), product(grid);
+        for (int lm = 0; lm < lmmax; lm++) {
+            for (int ir = 0; ir < nr; ir++) {
+                field(ir) = values(lm, ir);
+            }
+            field.interpolate();
+            for (int j = 0; j < nrf; j++) {
+                for (int i = 0; i <= j; i++) {
+                    if ((l_by_lm[lm] + type.indexr(i).am.l() + type.indexr(j).am.l()) % 2) {
+                        continue;
+                    }
+                    double value;
+                    if (lm == 0 || simple) {
+                        // The spherical Hamiltonian always uses a sampled-product spline.
+                        for (int ir = 0; ir < nr; ir++) {
+                            product(ir) = field(ir) * radial[i](ir) * radial[j](ir) * grid[ir] * grid[ir];
+                        }
+                        value = product.interpolate().integrate(0);
+                    } else {
+                        value = inner(radial[j], radial[i] * field, 2);
+                    }
+                    integrals(lm, i, j) = integrals(lm, j, i) = value;
+                }
+            }
+        }
+        result.local.emplace_back(std::array<index_range, 3>{nb, nb, ns});
+        auto& h = result.local.back();
+        h.zero();
+        for (int j = 0; j < nb; j++) {
+            auto const& b = type.indexb(j);
+            for (int i = 0; i < nb; i++) {
+                auto const& a = type.indexb(i);
+                for (auto const& g : type.gaunt_coefs().gaunt_vector(a.lm, b.lm)) {
+                    if (g.lm3 < lmmax) {
+                        for (int s = 0; s < ns; s++) {
+                            h(i, j, s) += g.coef * integrals(g.lm3, a.idxrf, b.idxrf);
+                        }
+                    }
+                }
+            }
+        }
+        LAPW_xc_atom op(atom, ctx_.lmax_rho());
+        for (int s = 0; s < ns; s++) {
+            auto xc = op.matrix_elements(xc__.local[ia][0][s], xc__.local[ia][1][s]);
+            for (int j = 0; j < nb; j++) {
+                for (int i = 0; i < nb; i++) {
+                    h(i, j, s) += xc(i, j);
+                }
+            }
+        }
+    }
+    return result;
+}
+
 template class Hamiltonian0<double>;
 #ifdef SIRIUS_USE_FP32
 template class Hamiltonian0<float>;
