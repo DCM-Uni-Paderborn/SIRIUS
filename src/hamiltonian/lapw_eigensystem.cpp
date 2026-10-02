@@ -5,6 +5,7 @@
 
 #include "hamiltonian.hpp"
 #include "k_point/k_point.hpp"
+#include "k_point/k_point_set.hpp"
 
 namespace sirius {
 namespace {
@@ -252,6 +253,187 @@ LAPW_eigensystem::density_matrix_response(perturbation_t const& direction__, std
     kp_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
     if (invalid) {
         RTE_THROW("nonfinite or non-Hermitian LAPW density-matrix response");
+    }
+    return result;
+}
+
+LAPW_density_response::LAPW_density_response(Hamiltonian0<double> const& h0__, K_point_set& ks__)
+    : ks_(ks__)
+    , fermi_{ks__.energy_fermi_fixed_mag(0), ks__.energy_fermi_fixed_mag(ks__.ctx().num_spins() - 1)}
+    , width_(ks__.ctx().smearing_width())
+    , moment_(ks__.ctx().cfg().parameters().fixed_mag())
+    , charge_(ks__.ctx().cfg().parameters().extra_charge())
+    , smearing_(static_cast<int>(ks__.ctx().smearing()))
+{
+    auto& ctx = ks_.ctx();
+    int ns = ctx.num_spins(), nb = ctx.num_bands();
+    int invalid = &ctx != &h0__.ctx() || !ctx.full_potential() || ctx.processing_unit() != device_t::CPU ||
+                  ctx.cfg().parameters().precision_wf() != "fp64" || ctx.num_mag_dims() == 3 ||
+                  ctx.valence_relativity() != relativity_t::none || ctx.so_correction() || ctx.hubbard_correction() ||
+                  (ns == 2 && ctx.cfg().control().use_second_variation());
+    for (int s = 0; s < ns; s++) {
+        invalid |= !std::isfinite(fermi_[s]);
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW density response requires a scalar/collinear nonrelativistic CPU fp64 reference");
+    }
+    for (auto it : ks_.spl_num_kpoints()) {
+        auto& kp = *ks_.get<double>(it.i);
+        int n = kp.gklo_basis_size(), bs = ctx.cyclic_block_size();
+        bands_.emplace_back(std::array<index_range, 2>{nb, ns});
+        occupations_.emplace_back(std::array<index_range, 2>{nb, ns});
+        spectra_.emplace_back();
+        try {
+            Hamiltonian_k<double> hk(h0__, kp);
+            la::dmatrix<std::complex<double>> h(n, n, ctx.blacs_grid(), bs, bs);
+            la::dmatrix<std::complex<double>> s(n, n, ctx.blacs_grid(), bs, bs);
+            for (int spin = 0; spin < ns; spin++) {
+                hk.set_fv_h_o(spin, h, s);
+                spectra_.back()[spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
+                invalid |= n < nb;
+                for (int b = 0; b < nb; b++) {
+                    double energy = kp.band_energy(b, spin), f = kp.band_occupancy(b, spin);
+                    bands_.back()(b, spin)       = energy;
+                    occupations_.back()(b, spin) = f;
+                    invalid |= !std::isfinite(energy) || !std::isfinite(f);
+                    if (b < n) {
+                        double exact = spectra_.back()[spin]->energies()[b];
+                        invalid |=
+                                std::abs(energy - exact) > std::sqrt(std::numeric_limits<double>::epsilon()) *
+                                                                   std::max({1.0, std::abs(energy), std::abs(exact)});
+                    }
+                }
+            }
+        } catch (std::exception const&) {
+            invalid = 1;
+        }
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("stored bands do not match the complete frozen LAPW Hamiltonian");
+    }
+}
+
+void
+LAPW_density_response::validate_reference() const
+{
+    auto& ctx   = ks_.ctx();
+    int invalid = spectra_.size() != ks_.spl_num_kpoints().local_size() || width_ != ctx.smearing_width() ||
+                  moment_ != ctx.cfg().parameters().fixed_mag() || charge_ != ctx.cfg().parameters().extra_charge() ||
+                  smearing_ != static_cast<int>(ctx.smearing()) || static_cast<bool>(ctx.band_occ_callback());
+    for (int s = 0; s < ctx.num_spins(); s++) {
+        invalid |= fermi_[s] != ks_.energy_fermi_fixed_mag(s);
+    }
+    size_t ik{0};
+    if (!invalid) {
+        for (auto it : ks_.spl_num_kpoints()) {
+            auto const& kp = *ks_.get<double>(it.i);
+            invalid |= bands_[ik].size(0) != ctx.num_bands() || bands_[ik].size(1) != ctx.num_spins();
+            if (!invalid) {
+                for (int s = 0; s < ctx.num_spins(); s++) {
+                    for (int b = 0; b < ctx.num_bands(); b++) {
+                        invalid |= bands_[ik](b, s) != kp.band_energy(b, s) ||
+                                   occupations_[ik](b, s) != kp.band_occupancy(b, s);
+                    }
+                }
+            }
+            ik++;
+        }
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW density response reference changed; rebuild its frozen spectra");
+    }
+}
+
+std::vector<mdarray<std::complex<double>, 3>>
+LAPW_density_response::density_matrices() const
+{
+    validate_reference();
+    auto& ctx = ks_.ctx();
+    std::vector<mdarray<std::complex<double>, 3>> result;
+    int invalid{0};
+    for (size_t ik = 0; ik < spectra_.size(); ik++) {
+        int n = spectra_[ik][0]->energies().size();
+        result.emplace_back(std::array<index_range, 3>{n, n, ctx.num_spins()});
+        try {
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                std::vector<double> f(n, 0);
+                for (int b = 0; b < ctx.num_bands(); b++) {
+                    f[b] = occupations_[ik](b, s);
+                }
+                auto p = spectra_[ik][s]->density_matrix(f);
+                std::copy_n(p.at(memory_t::host), p.size(), result.back().at(memory_t::host) + s * p.size());
+            }
+        } catch (std::exception const&) {
+            invalid = 1;
+        }
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("failed to construct the frozen LAPW density matrices");
+    }
+    return result;
+}
+
+std::vector<mdarray<std::complex<double>, 3>>
+LAPW_density_response::density_matrix_response(std::vector<matrix_direction_t> const& directions__) const
+{
+    validate_reference();
+    auto& ctx   = ks_.ctx();
+    int invalid = directions__.size() != spectra_.size();
+    for (auto const& d : directions__) {
+        for (int s = 0; s < ctx.num_spins(); s++) {
+            invalid |= !d.h[s] || !d.s[s];
+        }
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW density response requires H/S directions for every local k-point and spin");
+    }
+    std::vector<std::array<LAPW_eigensystem::perturbation_t, 2>> perturbations(spectra_.size());
+    std::vector<mdarray<double, 2>> energy_directions;
+    for (size_t ik = 0; ik < spectra_.size(); ik++) {
+        energy_directions.emplace_back(std::array<index_range, 2>{ctx.num_bands(), ctx.num_spins()});
+        try {
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                perturbations[ik][s] = spectra_[ik][s]->perturbation(*directions__[ik].h[s], *directions__[ik].s[s]);
+                for (int b = 0; b < ctx.num_bands(); b++) {
+                    energy_directions.back()(b, s) = perturbations[ik][s].energies[b];
+                }
+            }
+        } catch (std::exception const&) {
+            invalid = 1;
+        }
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("invalid LAPW Hamiltonian or overlap direction");
+    }
+    auto population = ks_.band_occupation_response(energy_directions);
+    std::vector<mdarray<std::complex<double>, 3>> result;
+    for (size_t ik = 0; ik < spectra_.size(); ik++) {
+        int n = spectra_[ik][0]->energies().size();
+        result.emplace_back(std::array<index_range, 3>{n, n, ctx.num_spins()});
+        try {
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                // Virtual states participate in mixing without extending the stored band population.
+                std::vector<double> f(n, 0), slopes(n, 0);
+                for (int b = 0; b < ctx.num_bands(); b++) {
+                    f[b]      = occupations_[ik](b, s);
+                    slopes[b] = population.slopes[ik](b, s);
+                }
+                auto p = spectra_[ik][s]->density_matrix_response(perturbations[ik][s], f, slopes, population.fermi[s]);
+                std::copy_n(p.at(memory_t::host), p.size(), result.back().at(memory_t::host) + s * p.size());
+            }
+        } catch (std::exception const&) {
+            invalid = 1;
+        }
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("failed to construct the constrained LAPW density response");
     }
     return result;
 }

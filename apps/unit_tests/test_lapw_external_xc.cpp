@@ -108,7 +108,8 @@ functional_response(Simulation_context const& ctx, xc_callback_input_t const& in
 
 auto
 context(int mag, bool distributed_fft, bool second_variation, bool core = false, bool relativistic_core = false,
-        double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false, int auto_enu = 0)
+        double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false, int auto_enu = 0,
+        std::string smearing = "")
 {
     auto config                               = R"({"parameters": {
         "electronic_structure_method": "full_potential_lapwlo", "use_symmetry": false,
@@ -125,8 +126,11 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     config["parameters"]["core_relativity"]   = relativistic_core ? "dirac" : "none";
     config["parameters"]["num_bands"]         = core ? 8 : 4;
     config["parameters"]["pw_cutoff"]         = pw_cutoff;
-    config["settings"]["simple_lapw_ri"]      = simple_radial_integrals;
-    auto ctx                                  = std::make_unique<Simulation_context>(config);
+    if (!smearing.empty()) {
+        config["parameters"]["smearing"] = smearing;
+    }
+    config["settings"]["simple_lapw_ri"] = simple_radial_integrals;
+    auto ctx                             = std::make_unique<Simulation_context>(config);
     ctx->unit_cell().set_lattice_vectors({{6, 0, 0}, {0, 7, 0}, {0, 0, 8}});
     std::string label = core ? "Ne" : "He";
     auto& type        = ctx->unit_cell().add_atom_type(label);
@@ -588,6 +592,356 @@ lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<d
         }
     }
     return errors;
+}
+
+int
+test_occupation_response(int mag, bool distributed, bool gaussian)
+{
+    auto ctx = context(mag, distributed, false, false, false, 0, 5.0, false, 0, gaussian ? "gaussian" : "fermi_dirac");
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
+    ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
+    ks.initialize();
+    int failures{0}, ns = ctx->num_spins(), nb = ctx->num_bands();
+    auto check = [&](char const* name, double error, double tolerance) {
+        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+        if (ctx->comm().rank() == 0) {
+            std::cout << "occupation response spins=" << ns << " distributed FFT=" << distributed << " " << name << ": "
+                      << error << '\n';
+        }
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    auto reject = [&](char const* name, auto&& operation) {
+        bool rejected{false};
+        try {
+            operation();
+        } catch (std::exception const&) {
+            rejected = true;
+        }
+        check(name, rejected ? 0 : 1, 0);
+    };
+    std::vector<mdarray<double, 2>> directions;
+    for (auto it : ks.spl_num_kpoints()) {
+        directions.emplace_back(std::array<index_range, 2>{nb, ns});
+        for (int s = 0; s < ns; s++) {
+            for (int b = 0; b < nb; b++) {
+                directions.back()(b, s) = 0.07 * std::cos(b + 2 * it.i + s) + 0.1 * s;
+            }
+        }
+    }
+    reject("missing chemical potential rejected", [&] { ks.band_occupation_response(directions); });
+    auto snapshot = [&] {
+        std::array<double, 2> mu{ks.energy_fermi_fixed_mag(0), ks.energy_fermi_fixed_mag(ns - 1)};
+        std::vector<double> values;
+        for (int ik = 0; ik < ks.num_kpoints(); ik++) {
+            for (int s = 0; s < ns; s++) {
+                for (int b = 0; b < nb; b++) {
+                    values.push_back(ks.get<double>(ik)->band_occupancy(b, s));
+                }
+            }
+        }
+        return std::make_pair(mu, values);
+    };
+    auto sample = [&](double step) {
+        size_t ik{0};
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& kp = *ks.get<double>(it.i);
+            for (int s = 0; s < ns; s++) {
+                for (int b = 0; b < nb; b++) {
+                    kp.band_energy(b, s, -0.03 + 0.02 * b + 0.003 * it.i + 0.005 * s + step * directions[ik](b, s));
+                }
+            }
+            ik++;
+        }
+        ks.sync_band<double, sync_band_t::energy>();
+        ks.find_band_occupancies<double>();
+        return snapshot();
+    };
+    for (double moment : mag ? std::vector<double>{0.4, 0.0} : std::vector<double>{0.0}) {
+        ctx->cfg().unlock();
+        ctx->cfg().parameters().fixed_mag(moment);
+        ctx->cfg().lock();
+        auto before   = sample(0);
+        auto response = ks.band_occupation_response(directions);
+        check("response leaves the ground-state populations unchanged", snapshot() == before ? 0 : 1, 0);
+        std::array<double, 2> count{};
+        size_t ik{0};
+        for (auto it : ks.spl_num_kpoints()) {
+            auto const& kp = *ks.get<double>(it.i);
+            for (int s = 0; s < ns; s++) {
+                for (int b = 0; b < nb; b++) {
+                    count[s] += kp.weight() * response.occupations[ik](b, s) / kp.comm().size();
+                }
+            }
+            ik++;
+        }
+        ctx->comm().allreduce(count.data(), count.size());
+        check("total charge response", std::abs(count[0] + count[1]), 1e-11);
+        if (moment != 0) {
+            check("fixed spin moment response", std::abs(count[0] - count[1]), 1e-11);
+        } else if (mag) {
+            check("unconstrained spin response is retained", std::abs(count[0] - count[1]) > 1e-3 ? 0 : 1, 0);
+            check("unconstrained spins share one chemical potential", std::abs(response.fermi[0] - response.fermi[1]),
+                  0);
+        }
+        for (double step : {1e-4, 5e-5}) {
+            auto plus = sample(step), minus = sample(-step);
+            double mu_error{0}, occupation_error{0};
+            for (int s = 0; s < ns; s++) {
+                mu_error =
+                        std::max(mu_error, std::abs(response.fermi[s] - (plus.first[s] - minus.first[s]) / (2 * step)));
+            }
+            ik = 0;
+            for (auto it : ks.spl_num_kpoints()) {
+                for (int s = 0; s < ns; s++) {
+                    for (int b = 0; b < nb; b++) {
+                        int i = (it.i * ns + s) * nb + b;
+                        occupation_error =
+                                std::max(occupation_error, std::abs(response.occupations[ik](b, s) -
+                                                                    (plus.second[i] - minus.second[i]) / (2 * step)));
+                    }
+                }
+                ik++;
+            }
+            check("chemical potential finite difference", mu_error, 3e-8);
+            check("occupation finite difference", occupation_error, 2e-6);
+        }
+        sample(0);
+    }
+    for (auto& d : directions) {
+        std::fill_n(d.at(memory_t::host), d.size(), 0.17);
+    }
+    auto uniform = ks.band_occupation_response(directions);
+    double error{0};
+    for (int s = 0; s < ns; s++) {
+        error = std::max(error, std::abs(uniform.fermi[s] - 0.17));
+    }
+    for (auto const& d : uniform.occupations) {
+        for (size_t i = 0; i < d.size(); i++) {
+            error = std::max(error, std::abs(d[i]));
+        }
+    }
+    check("uniform spectral shift leaves occupations unchanged", error, 1e-13);
+    reject("missing k-point directions rejected", [&] { ks.band_occupation_response({}); });
+    if (ctx->comm().rank() == 0 && !directions.empty()) {
+        directions[0](0, 0) = std::numeric_limits<double>::quiet_NaN();
+    }
+    reject("nonfinite directions rejected collectively", [&] { ks.band_occupation_response(directions); });
+    if (ctx->comm().rank() == 0 && !directions.empty()) {
+        directions[0](0, 0) = 0.17;
+    }
+    if (distributed && ctx->comm().size() > 1) {
+        if (ctx->comm().rank() == 0 && !directions.empty()) {
+            directions[0](0, 0) += 0.1;
+        }
+        reject("inconsistent k-point replicas rejected", [&] { ks.band_occupation_response(directions); });
+        if (ctx->comm().rank() == 0 && !directions.empty()) {
+            directions[0](0, 0) = 0.17;
+        }
+    }
+    ctx->cb().band_occ_ = [] {};
+    reject("custom occupation callback requires its own response", [&] { ks.band_occupation_response(directions); });
+    ctx->cb().band_occ_ = nullptr;
+    ctx->cfg().unlock();
+    ctx->cfg().parameters().extra_charge(ctx->unit_cell().num_valence_electrons() - nb * ctx->max_occupancy());
+    if (!mag) {
+        ctx->cfg().parameters().smearing_width(0);
+    } else {
+        ctx->cfg().parameters().fixed_mag(nb * ctx->max_occupancy());
+    }
+    ctx->cfg().lock();
+    sample(0);
+    auto constant = ks.band_occupation_response(directions);
+    error         = std::max(std::abs(constant.fermi[0]), std::abs(constant.fermi[1]));
+    for (auto const& d : constant.occupations) {
+        for (size_t i = 0; i < d.size(); i++) {
+            error = std::max(error, std::abs(d[i]));
+        }
+    }
+    check("completely filled or empty populations have zero occupation response", error, 0);
+    return failures;
+}
+
+int
+test_lapw_density_response(int mag, bool distributed)
+{
+    auto ctx = context(mag, distributed, false, false, false, 0, 5.0, false, 0, "fermi_dirac");
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
+    ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
+    ks.initialize();
+    DFT_ground_state gs(ks);
+    gs.initial_state();
+    Hamiltonian0<double> h0(gs.potential(), false);
+    h0.generate_pw_coefs(gs.potential());
+    int failures{0}, ns = ctx->num_spins(), nb = ctx->num_bands();
+    auto check = [&](char const* name, double error, double tolerance) {
+        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+        if (ctx->comm().rank() == 0) {
+            std::cout << "constrained LAPW spins=" << ns << " distributed FFT=" << distributed << " " << name << ": "
+                      << error << '\n';
+        }
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    auto reject = [&](char const* name, auto&& operation) {
+        bool rejected{false};
+        try {
+            operation();
+        } catch (std::exception const&) {
+            rejected = true;
+        }
+        check(name, rejected ? 0 : 1, 0);
+    };
+    using matrix_t = la::dmatrix<std::complex<double>>;
+    struct matrices_t
+    {
+        std::array<std::unique_ptr<matrix_t>, 2> h, s, dh, ds;
+    };
+    std::vector<matrices_t> matrices;
+    std::vector<LAPW_density_response::matrix_direction_t> directions;
+    for (auto it : ks.spl_num_kpoints()) {
+        auto& kp = *ks.get<double>(it.i);
+        Hamiltonian_k<double> hk(h0, kp);
+        int n = kp.gklo_basis_size(), bs = ctx->cyclic_block_size();
+        matrices.emplace_back();
+        directions.emplace_back();
+        auto& m = matrices.back();
+        for (int spin = 0; spin < ns; spin++) {
+            for (auto* part : {&m.h, &m.s, &m.dh, &m.ds}) {
+                (*part)[spin] = std::make_unique<matrix_t>(n, n, ctx->blacs_grid(), bs, bs);
+            }
+            hk.set_fv_h_o(spin, *m.h[spin], *m.s[spin]);
+            for (int j = 0; j < m.h[spin]->num_cols_local(); j++) {
+                for (int i = 0; i < m.h[spin]->num_rows_local(); i++) {
+                    int row = m.h[spin]->irow(i), col = m.h[spin]->icol(j);
+                    auto local          = std::polar(1.0, 0.7 * (row - col)) / ((1.0 + row) * (1.0 + col));
+                    (*m.dh[spin])(i, j) = (0.06 + 0.03 * it.i + 0.04 * spin) * (*m.s[spin])(i, j) + 0.012 * local;
+                    (*m.ds[spin])(i, j) = 0.007 * (*m.s[spin])(i, j) + 0.001 * local;
+                }
+            }
+            directions.back().h[spin] = m.dh[spin].get();
+            directions.back().s[spin] = m.ds[spin].get();
+        }
+    }
+    auto sample = [&](double step) {
+        std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra(matrices.size());
+        size_t ik{0};
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& kp = *ks.get<double>(it.i);
+            Hamiltonian_k<double> hk(h0, kp);
+            auto const& m = matrices[ik];
+            int n = kp.gklo_basis_size(), bs = ctx->cyclic_block_size();
+            matrix_t h(n, n, ctx->blacs_grid(), bs, bs), s(n, n, ctx->blacs_grid(), bs, bs);
+            for (int spin = 0; spin < ns; spin++) {
+                for (int j = 0; j < h.num_cols_local(); j++) {
+                    for (int i = 0; i < h.num_rows_local(); i++) {
+                        h(i, j) = (*m.h[spin])(i, j) + step * (*m.dh[spin])(i, j);
+                        s(i, j) = (*m.s[spin])(i, j) + step * (*m.ds[spin])(i, j);
+                    }
+                }
+                spectra[ik][spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
+                for (int b = 0; b < nb; b++) {
+                    kp.band_energy(b, spin, spectra[ik][spin]->energies()[b]);
+                }
+            }
+            ik++;
+        }
+        ks.sync_band<double, sync_band_t::energy>();
+        ks.find_band_occupancies<double>();
+        std::vector<mdarray<std::complex<double>, 3>> result;
+        ik = 0;
+        for (auto it : ks.spl_num_kpoints()) {
+            auto const& kp = *ks.get<double>(it.i);
+            int n          = kp.gklo_basis_size();
+            result.emplace_back(std::array<index_range, 3>{n, n, ns});
+            for (int spin = 0; spin < ns; spin++) {
+                std::vector<double> f(n, 0);
+                for (int b = 0; b < nb; b++) {
+                    f[b] = kp.band_occupancy(b, spin);
+                }
+                auto p = spectra[ik][spin]->density_matrix(f);
+                std::copy_n(p.at(memory_t::host), p.size(), result.back().at(memory_t::host) + spin * p.size());
+            }
+            ik++;
+        }
+        return result;
+    };
+    auto fields = [&](auto const& p) {
+        auto mapped = gs.density().lapw_density_matrix_fields(ks, p);
+        std::vector<double> result;
+        for (int spin = 0; spin < ns; spin++) {
+            for (auto const* field : {&mapped->component(spin), &mapped->kinetic_density().component(spin)}) {
+                auto values = potential_samples(*field);
+                result.insert(result.end(), values.begin(), values.end());
+            }
+        }
+        return result;
+    };
+    sample(0);
+    LAPW_density_response reference(h0, ks);
+    auto p = reference.density_matrices(), dp = reference.density_matrix_response(directions);
+    auto response = fields(dp);
+    std::array<std::complex<double>, 2> trace{};
+    size_t ik{0};
+    for (auto it : ks.spl_num_kpoints()) {
+        auto const& kp = *ks.get<double>(it.i);
+        for (int spin = 0; spin < ns; spin++) {
+            auto s = matrices[ik].s[spin]->get_full_matrix(), ds = matrices[ik].ds[spin]->get_full_matrix();
+            for (int j = 0; j < s.size(1); j++) {
+                for (int i = 0; i < s.size(0); i++) {
+                    trace[spin] += kp.weight() / kp.comm().size() *
+                                   (dp[ik](i, j, spin) * s(j, i) + p[ik](i, j, spin) * ds(j, i));
+                }
+            }
+        }
+        ik++;
+    }
+    ctx->comm().allreduce(trace.data(), trace.size());
+    check("charge including overlap response", std::abs(trace[0] + trace[1]), 1e-10);
+    if (mag) {
+        check("fixed spin including overlap response", std::abs(trace[0] - trace[1]), 1e-10);
+    }
+    // Resolve the field response above the production chemical-potential search tolerance.
+    for (double step : {1e-3, 5e-4}) {
+        auto plus = fields(sample(step)), minus = fields(sample(-step));
+        check("rho/tau matrix and occupation response finite difference",
+              potential_response_error(response, plus, minus, step), 2e-6);
+    }
+    sample(0);
+    reject("missing matrix directions rejected collectively", [&] { reference.density_matrix_response({}); });
+    std::complex<double> saved;
+    if (ctx->comm().rank() == 0 && !matrices.empty()) {
+        saved                      = (*matrices[0].dh[0])(0, 0);
+        (*matrices[0].dh[0])(0, 0) = std::numeric_limits<double>::quiet_NaN();
+    }
+    reject("nonfinite matrix direction rejected collectively", [&] { reference.density_matrix_response(directions); });
+    if (ctx->comm().rank() == 0 && !matrices.empty()) {
+        (*matrices[0].dh[0])(0, 0) = saved;
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& kp = *ks.get<double>(it.i);
+            kp.band_energy(0, 0, kp.band_energy(0, 0) + 0.1);
+            break;
+        }
+    }
+    reject("changed reference rejected collectively", [&] { reference.density_matrix_response(directions); });
+    sample(0);
+    for (auto& m : matrices) {
+        for (int spin = 0; spin < ns; spin++) {
+            m.ds[spin]->zero();
+            for (int j = 0; j < m.dh[spin]->num_cols_local(); j++) {
+                for (int i = 0; i < m.dh[spin]->num_rows_local(); i++) {
+                    (*m.dh[spin])(i, j) = 0.17 * (*m.s[spin])(i, j);
+                }
+            }
+        }
+    }
+    double invariant{0};
+    for (auto const& values : fields(reference.density_matrix_response(directions))) {
+        invariant =
+                std::isfinite(values) ? std::max(invariant, std::abs(values)) : std::numeric_limits<double>::infinity();
+    }
+    check("uniform potential shift leaves physical fields unchanged", invariant, 1e-11);
+    return failures;
 }
 
 int
@@ -2011,6 +2365,27 @@ main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
+    if (argc > 1 && std::string(argv[1]) == "density-response") {
+        for (int mag : {0, 1}) {
+            result += call_test("constrained LAPW density response", test_lapw_density_response, mag, false);
+            if (mpi::Communicator::world().size() > 1) {
+                result += call_test("distributed LAPW density response", test_lapw_density_response, mag, true);
+            }
+        }
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    if (argc > 1 && std::string(argv[1]) == "occupation-response") {
+        for (int mag : {0, 1}) {
+            result += call_test("weighted k-point occupation response", test_occupation_response, mag, false, false);
+            if (mpi::Communicator::world().size() > 1) {
+                result += call_test("distributed occupation response", test_occupation_response, mag, true, false);
+            }
+        }
+        result += call_test("Gaussian occupation response", test_occupation_response, 0, false, true);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
     if (argc > 1 && std::string(argv[1]) == "force-response") {
         for (int mag : {0, 1}) {
             result += call_test("external LAPW force response", test_lapw_force_response, mag,
@@ -2040,6 +2415,17 @@ main(int argc, char** argv)
     result += call_test("external LAPW core response guard", test_core_guard);
     result += call_test("external LAPW linearisation response", test_lapw_linearization_response);
     result += call_test("replicated LAPW eigenvector redistribution", test_replicated_eigenvector_remap);
+    for (int mag : {0, 1}) {
+        result += call_test("constrained LAPW density response", test_lapw_density_response, mag, false);
+        if (mpi::Communicator::world().size() > 1) {
+            result += call_test("distributed LAPW density response", test_lapw_density_response, mag, true);
+        }
+        result += call_test("weighted k-point occupation response", test_occupation_response, mag, false, false);
+        if (mpi::Communicator::world().size() > 1) {
+            result += call_test("distributed occupation response", test_occupation_response, mag, true, false);
+        }
+    }
+    result += call_test("Gaussian occupation response", test_occupation_response, 0, false, true);
     sirius::finalize();
     return std::min(result, 1);
 }

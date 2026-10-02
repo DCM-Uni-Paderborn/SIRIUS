@@ -29,6 +29,7 @@ class Atom;
 class Simulation_context;
 class Potential;
 class Unit_cell;
+class K_point_set;
 struct radial_basis_response_t;
 struct lapw_xc_field_adjoint_t;
 template <typename T>
@@ -73,6 +74,8 @@ class Gaunt_coefficients;
 /* forward declaration */
 template <typename T>
 class Hamiltonian_k;
+template <typename T>
+class Hamiltonian0;
 
 /// Complete frozen-basis LAPW spectrum and its generalized density-matrix response.
 /** Uses every PW/LO eigenvector, not only the stored bands. Occupations and their
@@ -134,6 +137,43 @@ class LAPW_eigensystem
     mdarray<std::complex<double>, 2>
     density_matrix_response(perturbation_t const& direction__, std::vector<double> const& occupations__,
                             std::vector<double> const& slopes__, double mu_response__ = 0) const;
+};
+
+/// Frozen LAPW density response with charge/spin constraints shared across k-points.
+/** Caches the complete spectra once. The stored bands must describe the same
+ *  Hamiltonian and remain unchanged during response calls. Returned matrices use
+ *  independent PW/LO order and can be mapped to rho/tau with
+ *  Density::lapw_density_matrix_fields. Radial-basis and geometry derivatives of
+ *  that field map are separate contributions. All calls are context-collective.
+ */
+class LAPW_density_response
+{
+  private:
+    K_point_set& ks_;
+    std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra_;
+    std::vector<mdarray<double, 2>> bands_, occupations_;
+    std::array<double, 2> fermi_;
+    double width_, moment_, charge_;
+    int smearing_;
+
+    void
+    validate_reference() const;
+
+  public:
+    struct matrix_direction_t
+    {
+        std::array<la::dmatrix<std::complex<double>> const*, 2> h{}, s{};
+    };
+
+    LAPW_density_response(Hamiltonian0<double> const& h0__, K_point_set& ks__);
+
+    /// Frozen valence density matrices, in local-k-point order, with spin as the last dimension.
+    std::vector<mdarray<std::complex<double>, 3>>
+    density_matrices() const;
+
+    /// Full occupied/virtual response, including overlap and global occupation derivatives.
+    std::vector<mdarray<std::complex<double>, 3>>
+    density_matrix_response(std::vector<matrix_direction_t> const& directions__) const;
 };
 
 /// Represent the k-point independent part of Hamiltonian.

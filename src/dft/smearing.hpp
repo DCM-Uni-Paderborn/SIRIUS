@@ -162,7 +162,7 @@ delta(smearing_t type__, double width__)
 {
     switch (type__) {
         case smearing_t::gaussian: {
-            throw std::runtime_error("not available");
+            return [width__](double x__) { return gaussian::delta(x__, width__); };
         }
         case smearing_t::fermi_dirac: {
             return [width__](double x__) { return fermi_dirac::delta(x__, width__); };
