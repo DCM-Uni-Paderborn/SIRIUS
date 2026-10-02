@@ -23,11 +23,13 @@ namespace sirius {
 
 struct radial_solver_result_t;
 
-/// Potential derivatives of the radial basis and its AW boundary data at fixed linearisation energies.
+/// Potential derivatives of the radial basis, AW boundary data and spherical core fields.
 struct radial_basis_response_t
 {
     mdarray<double, 3> radial_functions;
     mdarray<double, 2> surface_derivatives;
+    /// Spin-summed {rho, tau} response on the MT grid, without radial weights.
+    std::array<std::vector<double>, 2> core_fields;
 
     explicit radial_basis_response_t(Atom_type const& type__)
         : radial_functions({type__.num_mt_points(), type__.mt_radial_basis_size(), 2})
@@ -35,6 +37,9 @@ struct radial_basis_response_t
     {
         radial_functions.zero();
         surface_derivatives.zero();
+        for (auto& field : core_fields) {
+            field.resize(type__.num_mt_points(), 0);
+        }
     }
 };
 
@@ -100,7 +105,8 @@ class Atom_symmetry_class
 
     core_states_t
     generate_core_radial_states(std::vector<double> const* direction__ = nullptr, core_states_t* response__ = nullptr,
-                                std::array<std::vector<double>, 2> const& xc_directions__ = {}) const;
+                                std::array<std::vector<double>, 2> const& xc_directions__ = {},
+                                std::array<std::vector<double>, 2>* fields_response__     = nullptr) const;
 
     radial_solver_result_t
     solve_radial(relativity_t rel__, int dme__, int l__, double energy__, core_states_t const& core__,

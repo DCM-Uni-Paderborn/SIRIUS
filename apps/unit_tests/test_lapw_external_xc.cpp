@@ -207,6 +207,106 @@ occupied_lapw_lagrangian(Simulation_context const& ctx, K_point<double> const& k
     return value;
 }
 
+std::vector<double>
+sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::vector<double>> const& vs,
+                     std::vector<std::array<std::vector<double>, 2>> const& core_xc)
+{
+    std::vector<int> nlo;
+    for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+        nlo.push_back(ctx.unit_cell().atom(ia).type().mt_lo_basis_size());
+    }
+    std::vector<std::complex<double>> saved;
+    for (auto it : ks.spl_num_kpoints()) {
+        auto kp   = ks.get<double>(it.i);
+        auto& psi = kp->spinor_wave_functions();
+        wf::Wave_functions<double> evec(kp->gkvec_sptr(), nlo, wf::num_mag_dims(0), wf::num_bands(ctx.num_bands()),
+                                        memory_t::host);
+        for (int s = 0; s < ctx.num_spins(); s++) {
+            for (int b = 0; b < ctx.num_bands(); b++) {
+                auto spin = wf::spin_index(s);
+                auto band = wf::band_index(b);
+                auto data = psi.at(memory_t::host, 0, spin, band);
+                saved.insert(saved.end(), data, data + psi.ld());
+                for (int ig = 0; ig < kp->gkvec().count(); ig++) {
+                    evec.pw_coeffs(ig, wf::spin_index(0), band) = psi.pw_coeffs(ig, spin, band);
+                }
+                for (auto atom : evec.spl_num_atoms()) {
+                    int naw = ctx.unit_cell().atom(atom.i).type().mt_aw_basis_size();
+                    for (int j = 0; j < nlo[atom.i]; j++) {
+                        evec.mt_coeffs(j, atom.li, wf::spin_index(0), band) =
+                                psi.mt_coeffs(naw + j, atom.li, spin, band);
+                    }
+                }
+            }
+            kp->generate_lapw_wave_functions(evec, psi, s);
+        }
+    }
+    auto restore = [&] {
+        size_t offset{0};
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& psi = ks.get<double>(it.i)->spinor_wave_functions();
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                for (int b = 0; b < ctx.num_bands(); b++) {
+                    std::copy_n(saved.data() + offset, psi.ld(),
+                                psi.at(memory_t::host, 0, wf::spin_index(s), wf::band_index(b)));
+                    offset += psi.ld();
+                }
+            }
+        }
+    };
+    std::vector<double> result;
+    try {
+        Density density(ctx);
+        density.generate_core_charge_density(vs, core_xc);
+        density.generate<double>(ks, false, true, false);
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            for (auto* fields : {static_cast<Field4D*>(&density), &density.kinetic_density()}) {
+                for (int s = 0; s < ctx.num_spins(); s++) {
+                    auto const& scalar = fields->scalar().mt()[ia];
+                    for (size_t i = 0; i < scalar.size(); i++) {
+                        result.push_back(ctx.num_spins() == 1
+                                                 ? scalar[i]
+                                                 : 0.5 * (scalar[i] + (1 - 2 * s) * fields->vector(0).mt()[ia][i]));
+                    }
+                }
+            }
+        }
+    } catch (...) {
+        restore();
+        throw;
+    }
+    restore();
+    return result;
+}
+
+double
+radial_fields_error(std::vector<std::array<std::vector<Flm>, 2>> const& analytic, std::vector<double> const& plus,
+                    std::vector<double> const& minus, double step)
+{
+    size_t offset{0};
+    double error{0};
+    for (auto const& atom : analytic) {
+        for (auto const& part : atom) {
+            for (auto const& spin : part) {
+                double peak{0}, difference{0};
+                for (size_t i = 0; i < spin.size(); i++, offset++) {
+                    double fd = (plus.at(offset) - minus.at(offset)) / (2 * step);
+                    if (!std::isfinite(fd) || !std::isfinite(spin[i])) {
+                        return std::numeric_limits<double>::infinity();
+                    }
+                    peak       = std::max(peak, std::abs(spin[i]));
+                    difference = std::max(difference, std::abs(fd - spin[i]));
+                }
+                error = std::max(error, difference / std::max(1e-8, peak));
+            }
+        }
+    }
+    if (offset != plus.size() || offset != minus.size()) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return error;
+}
+
 int
 test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool core = false)
 {
@@ -550,10 +650,11 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
                 auto const& grid = ctx->unit_cell().atom_symmetry_class(ic).atom_type().radial_grid();
                 for (int ir = 0; ir < grid.num_points(); ir++) {
-                    radial_direction[ic][ir] =
-                            (part == 0 || part == 3)
-                                    ? (ic + 1) * (0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]))
-                                    : 0;
+                    // Resolve core response rather than subtracting a nearly constant potential shift.
+                    radial_direction[ic][ir] = (part == 0 || part == 3)
+                                                       ? (ic + 1) * (0.13 * std::exp(-(core ? 3.0 : 0.3) * grid[ir]) +
+                                                                     0.04 * std::sin(grid[ir]))
+                                                       : 0;
                 }
                 for (int j : {0, 1}) {
                     if (part == j + 1 || part == 3) {
@@ -567,8 +668,40 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             }
             std::cout << "Radial basis Lagrangian response part=" << part << '\n';
             double basis_derivative = gs.forces().lapw_radial_basis_derivative(radial_direction, xc_direction);
+            std::vector<radial_basis_response_t> radial_response;
+            for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                radial_response.push_back(ctx->unit_cell().atom_symmetry_class(ic).radial_basis_potential_response(
+                        radial_direction[ic], xc_direction[ic]));
+            }
+            auto field_response = density.lapw_radial_fields_response(ks, radial_response);
             verify_restored();
             if (!mag && !second_variation && part == 0) {
+                std::vector<radial_basis_response_t> zero;
+                for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                    zero.emplace_back(ctx->unit_cell().atom_symmetry_class(ic).atom_type());
+                }
+                double zero_peak{0};
+                for (auto const& atom : density.lapw_radial_fields_response(ks, zero)) {
+                    for (auto const& channel : atom) {
+                        for (auto const& spin : channel) {
+                            for (size_t i = 0; i < spin.size(); i++) {
+                                zero_peak = std::max(zero_peak, std::abs(spin[i]));
+                            }
+                        }
+                    }
+                }
+                check("zero radial field response", zero_peak, 0);
+                if (ctx->comm().rank() == 0) {
+                    zero[0].surface_derivatives[0] = std::numeric_limits<double>::quiet_NaN();
+                }
+                reject("nonfinite field response rejected collectively",
+                       [&] { density.lapw_radial_fields_response(ks, zero); });
+                zero[0].surface_derivatives[0] = 0;
+                if (ctx->comm().rank() == 0) {
+                    zero[0].core_fields[0].pop_back();
+                }
+                reject("invalid core field response rejected collectively",
+                       [&] { density.lapw_radial_fields_response(ks, zero); });
                 auto direction = radial_direction;
                 for (auto& atom : direction) {
                     std::fill(atom.begin(), atom.end(), 0);
@@ -590,7 +723,10 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 }
                 verify_restored();
             }
+            std::vector<double> sampled_fields;
             auto radial_lagrangian = [&](double step) {
+                auto shifted_vs = spherical;
+                auto shifted_xc = spherical_xc;
                 for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
                     auto v  = spherical[ic];
                     auto xc = spherical_xc[ic];
@@ -605,6 +741,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
                     cls.set_spherical_potential(v);
                     cls.set_spherical_xc_derivatives(xc);
+                    shifted_vs[ic] = v;
+                    shifted_xc[ic] = xc;
                     if (cls.generate_radial_functions(relativity_t::none, false)) {
                         RTE_THROW("radial basis derivative fixture failed");
                     }
@@ -628,10 +766,15 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     }
                 }
                 ctx->comm().allreduce(&value, 1);
+                sampled_fields = sample_radial_fields(*ctx, ks, shifted_vs, shifted_xc);
                 return value;
             };
             for (double step : {1e-3, 5e-4}) {
-                double fd = (radial_lagrangian(step) - radial_lagrangian(-step)) / (2 * step);
+                double plus      = radial_lagrangian(step);
+                auto plus_fields = sampled_fields;
+                double fd        = (plus - radial_lagrangian(-step)) / (2 * step);
+                check("radial density/tau response",
+                      radial_fields_error(field_response, plus_fields, sampled_fields, step), 3e-5);
                 check("radial basis Lagrangian derivative", std::abs(fd - basis_derivative), 2e-8);
                 check("relative radial basis Lagrangian derivative",
                       std::abs((fd - basis_derivative) / basis_derivative), 2e-5);
@@ -829,7 +972,11 @@ test_lapw_linearization_response()
     // Test moving and frozen linearisation energies against the same occupied-state contraction.
     for (bool update_enu : {false, true}) {
         double analytic = gs.forces().lapw_radial_basis_derivative({direction}, {}, update_enu);
-        auto sample     = [&](double step) {
+        std::vector<radial_basis_response_t> radial_response;
+        radial_response.push_back(cls.radial_basis_potential_response(direction, {}, update_enu));
+        auto field_response = gs.density().lapw_radial_fields_response(ks, radial_response);
+        std::vector<double> sampled_fields;
+        auto sample = [&](double step) {
             auto v = base;
             for (size_t ir = 0; ir < v.size(); ir++) {
                 v[ir] += step * direction[ir];
@@ -853,11 +1000,16 @@ test_lapw_linearization_response()
                 value += occupied_lapw_lagrangian(*ctx, *kp, 0, h, o);
             }
             ctx->comm().allreduce(&value, 1);
+            sampled_fields = sample_radial_fields(*ctx, ks, {v}, gs.potential().get_core_xc_derivatives());
             return value;
         };
         std::cout << "LAPW Lagrangian update_enu=" << update_enu << '\n';
         for (double step : {1e-2, 5e-3}) {
-            double fd = (sample(step) - sample(-step)) / (2 * step);
+            double plus      = sample(step);
+            auto plus_fields = sampled_fields;
+            double fd        = (plus - sample(-step)) / (2 * step);
+            check("automatic-energy density/tau response",
+                  radial_fields_error(field_response, plus_fields, sampled_fields, step), 3e-5);
             check("automatic-energy Lagrangian derivative", std::abs(fd - analytic), 2e-7);
             check("relative automatic-energy Lagrangian derivative", std::abs((fd - analytic) / analytic), 2e-5);
         }

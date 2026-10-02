@@ -474,6 +474,15 @@ class Density : public Field4D
     std::vector<Flm>
     generate_mt_valence_kinetic_density(int ia__) const;
 
+    /// Replicated, unsymmetrized MT {rho, tau} variations per atom and spin.
+    /** Holds PW/LO coefficients and occupations fixed. Includes AW matching, radial functions
+     *  and the variational spin-unpolarized core response.
+     *  The interstitial response is zero. Geometry, radial grids and the free-atom reference stay fixed.
+     *  This is the basis contribution to a density response, not the self-consistent orbital response.
+     */
+    std::vector<std::array<std::vector<Flm>, 2>>
+    lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis_response_t> const& response__) const;
+
     /// PAW partial-wave valence tau from the current projector density matrix.
     /** Element 0 contains AE fields and element 1 pseudo fields, with the same
      *  spin convention as generate_mt_valence_kinetic_density(). These are local

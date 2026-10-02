@@ -167,11 +167,17 @@ class Spheric_kinetic_density_operator
     }
 
     /// Accumulate one spin component, with occupations already in the density matrix.
+    /** An optional radial response accumulates the variation at fixed density matrix instead. */
     void
     add_density(mdarray<std::complex<double>, 2> const& dm__,
-                Spheric_function<function_domain_t::spectral, double>& tau__) const
+                Spheric_function<function_domain_t::spectral, double>& tau__,
+                Spheric_kinetic_density_operator const* response__ = nullptr) const
     {
         check_field(tau__);
+        if (response__ && (&response__->indexb_ != &indexb_ || response__->grid_.hash() != grid_.hash() ||
+                           response__->lmmax_ != lmmax_)) {
+            RTE_THROW("atom-local kinetic density: incompatible radial response");
+        }
         if (dm__.size(0) != indexb_.size() || dm__.size(1) != indexb_.size()) {
             RTE_THROW("atom-local kinetic density: incompatible density matrix");
         }
@@ -180,7 +186,7 @@ class Spheric_kinetic_density_operator
                 for (auto const& g : gaunt_.gaunt_vector(indexb_[i].lm, indexb_[j].lm)) {
                     double w = (i == j ? 1 : 2) * std::real(dm__(i, j) * g.coef);
                     for (int ir = 0; ir < grid_.num_points(); ir++) {
-                        tau__(g.lm3, ir) += w * radial_product(i, j, g.l3, ir);
+                        tau__(g.lm3, ir) += w * radial_product(i, j, g.l3, ir, response__);
                     }
                 }
             }

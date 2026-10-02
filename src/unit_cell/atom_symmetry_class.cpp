@@ -762,7 +762,8 @@ Atom_symmetry_class::update_enu_descriptors()
 
 Atom_symmetry_class::core_states_t
 Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* direction__, core_states_t* response__,
-                                                 std::array<std::vector<double>, 2> const& xc_directions__) const
+                                                 std::array<std::vector<double>, 2> const& xc_directions__,
+                                                 std::array<std::vector<double>, 2>* fields_response__) const
 {
     core_states_t result;
     if (!spherical_xc_derivatives_[0].empty() && atom_type_.num_core_electrons() != 0) {
@@ -786,16 +787,24 @@ Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* dire
                     grid, l, atom_type_.zn(), potential, count, spherical_xc_derivatives_, atom_type_.num_mt_points(),
                     direction__ ? &direction : nullptr, direction__ ? &response : nullptr, xc_directions__);
             for (int j = 0; j < count; j++) {
-                bool occupied{false};
+                double occupancy{0};
                 for (int i = 0; i < atom_type_.num_atomic_levels(); i++) {
                     auto const& level = atom_type_.atomic_level(i);
-                    occupied |= level.core && level.occupancy > 0 && level.l == l && level.n - l - 1 == j;
+                    if (level.core && level.l == l && level.n - l - 1 == j) {
+                        occupancy += level.occupancy;
+                    }
                 }
-                if (occupied) {
+                if (occupancy > 0) {
                     if (states[j].energy >= potential.back()) {
                         RTE_THROW("tau-dependent core state is not bound within the extended radial domain");
                     }
                     result[l].push_back(std::move(states[j]));
+                    if (fields_response__) {
+                        for (int ir = 0; ir < atom_type_.num_mt_points(); ir++) {
+                            (*fields_response__)[0][ir] += occupancy * response[j].rho[ir];
+                            (*fields_response__)[1][ir] += occupancy * response[j].tau[ir];
+                        }
+                    }
                     if (response__) {
                         (*response__)[l].push_back(std::move(response[j]));
                     }
@@ -897,8 +906,9 @@ Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& 
     mdarray<double, 2> sd({3, atom_type_.mt_radial_basis_size() - atom_type_.num_lo_descriptors()});
     rf.zero();
     sd.zero();
+    radial_basis_response_t result(atom_type_);
     core_states_t dcore;
-    auto core = generate_core_radial_states(&direction__, &dcore, xc_directions__);
+    auto core = generate_core_radial_states(&direction__, &dcore, xc_directions__, &result.core_fields);
     enu_response_t denu;
     if (update_enu__) {
         for (auto const& entry : enu_search_) {
@@ -907,7 +917,6 @@ Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& 
                                                   spherical_potential_, entry.second, direction__);
         }
     }
-    radial_basis_response_t result(atom_type_);
     if (generate_aw_radial_functions(relativity_t::none, rf, sd, core, &direction__, &result, &dcore,
                                      update_enu__ ? &denu : nullptr) ||
         generate_lo_radial_functions(relativity_t::none, rf, core, &direction__, &result, &dcore,
