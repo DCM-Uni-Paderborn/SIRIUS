@@ -1286,6 +1286,116 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         }
         auto occupation_response =
                 density.lapw_orbital_fields_response(ks, orbital_directions, {}, occupation_directions);
+        std::vector<mdarray<std::complex<double>, 3>> coefficient_matrices;
+        std::vector<std::unique_ptr<wf::Wave_functions<double>>> matched_directions;
+        std::vector<wf::Wave_functions<double>*> matched_ptrs;
+        size_t matrix_k{0};
+        std::vector<int> nlo;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            nlo.push_back(ctx->unit_cell().atom(ia).type().mt_lo_basis_size());
+        }
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& kp = *ks.get<double>(it.i);
+            int n = kp.gklo_basis_size(), npw = kp.gkvec().num_gvec();
+            coefficient_matrices.emplace_back(std::array<index_range, 3>{n, n, ctx->num_spins()});
+            auto& p = coefficient_matrices.back();
+            p.zero();
+            wf::Wave_functions<double> evec(kp.gkvec_sptr(), nlo, wf::num_mag_dims(0), wf::num_bands(ctx->num_bands()),
+                                            memory_t::host);
+            matched_directions.push_back(std::make_unique<wf::Wave_functions<double>>(
+                    kp.gkvec_sptr(), nmt, wf::num_mag_dims(ctx->num_mag_dims()), wf::num_bands(ctx->num_bands()),
+                    memory_t::host));
+            auto& delta = *matched_directions.back();
+            for (int s = 0; s < ctx->num_spins(); s++) {
+                for (int b = 0; b < ctx->num_bands(); b++) {
+                    auto all = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(b));
+                    std::vector<std::complex<double>> c(all.begin(), all.begin() + npw), dc(n);
+                    int offset = npw;
+                    for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                        int naw = ctx->unit_cell().atom(ia).type().mt_aw_basis_size();
+                        c.insert(c.end(), all.begin() + offset + naw, all.begin() + offset + nmt[ia]);
+                        offset += nmt[ia];
+                    }
+                    for (int i = 0; i < n; i++) {
+                        dc[i] = 0.007 * std::polar(1.0, 0.31 * (i + b + s)) / (1.0 + i);
+                    }
+                    double f = kp.band_occupancy(b, s), df = occupation_directions[matrix_k](b, s);
+                    for (int j = 0; j < n; j++) {
+                        for (int i = 0; i < n; i++) {
+                            p(i, j, s) += f * (dc[i] * std::conj(c[j]) + c[i] * std::conj(dc[j])) +
+                                          df * c[i] * std::conj(c[j]);
+                        }
+                    }
+                    for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                        evec.pw_coeffs(ig, wf::spin_index(0), wf::band_index(b)) = dc[kp.gkvec().offset() + ig];
+                    }
+                    for (auto atom : evec.spl_num_atoms()) {
+                        int base = npw + std::accumulate(nlo.begin(), nlo.begin() + atom.i, 0);
+                        for (int i = 0; i < nlo[atom.i]; i++) {
+                            evec.mt_coeffs(i, atom.li, wf::spin_index(0), wf::band_index(b)) = dc[base + i];
+                        }
+                    }
+                }
+                kp.generate_lapw_wave_functions(evec, delta, s);
+            }
+            matched_ptrs.push_back(&delta);
+            matrix_k++;
+        }
+        auto coefficient_fields = density.lapw_density_matrix_fields(ks, coefficient_matrices);
+        auto matched_fields     = density.lapw_orbital_fields_response(ks, matched_ptrs, {}, occupation_directions);
+        for (int part : {0, 1}) {
+            double error{0}, peak{0};
+            auto compare = [&](auto a, auto b) {
+                double residual = std::abs(a - b);
+                error = std::isfinite(residual) ? std::max(error, residual) : std::numeric_limits<double>::infinity();
+                peak  = std::max(peak, std::abs(b));
+            };
+            for (int s = 0; s < ctx->num_spins(); s++) {
+                auto const& a = part == 0 ? coefficient_fields->component(s)
+                                          : coefficient_fields->kinetic_density().component(s);
+                auto const& b =
+                        part == 0 ? matched_fields->component(s) : matched_fields->kinetic_density().component(s);
+                for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+                    compare(a.rg().f_pw_local(ig), b.rg().f_pw_local(ig));
+                }
+                for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                    compare(a.rg().value(ir), b.rg().value(ir));
+                }
+                for (auto atom : ctx->unit_cell().spl_num_atoms()) {
+                    for (size_t i = 0; i < a.mt()[atom.i].size(); i++) {
+                        compare(a.mt()[atom.i][i], b.mt()[atom.i][i]);
+                    }
+                }
+            }
+            ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+            ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+            check(part == 0 ? "PW/LO density matrix reproduces physical rho response"
+                            : "PW/LO density matrix reproduces physical tau response",
+                  error / std::max(1e-12, peak), 1e-10);
+        }
+        reject("coefficient fields reject missing k-point matrices",
+               [&] { density.lapw_density_matrix_fields(ks, {}); });
+        std::complex<double> saved_coefficient{0};
+        if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
+            saved_coefficient                = coefficient_matrices[0](0, 0, 0);
+            coefficient_matrices[0](0, 0, 0) = std::numeric_limits<double>::quiet_NaN();
+        }
+        reject("coefficient fields reject a nonfinite matrix collectively",
+               [&] { density.lapw_density_matrix_fields(ks, coefficient_matrices); });
+        if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
+            coefficient_matrices[0](0, 0, 0) = saved_coefficient;
+        }
+        if (distributed_fft && ctx->comm().size() > 1) {
+            if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
+                coefficient_matrices[0](0, 0, 0) += 0.1;
+            }
+            reject("coefficient fields reject inconsistent k-point replicas",
+                   [&] { density.lapw_density_matrix_fields(ks, coefficient_matrices); });
+            if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
+                coefficient_matrices[0](0, 0, 0) = saved_coefficient;
+            }
+        }
+        verify_restored();
         auto set_occupations = [&](double step) {
             size_t ik{0};
             for (auto it : ks.spl_num_kpoints()) {

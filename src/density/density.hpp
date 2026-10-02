@@ -498,6 +498,18 @@ class Density : public Field4D
                                  std::vector<radial_basis_response_t> const& radial__           = {},
                                  std::vector<mdarray<double, 2>> const& occupation_directions__ = {}) const;
 
+    /// Unsymmetrized valence rho/tau from signed coefficient density matrices.
+    /** Matrices use the complete independent PW/LO ket/bra order, have shape
+     *  {gklo_basis_size, gklo_basis_size, num_spins}, and are replicated within
+     *  each k-point communicator in local k-point order. K-point weights are
+     *  applied here. The geometry, radial functions and AW matching remain fixed;
+     *  core fields and radial/matching responses must be supplied separately.
+     *  The ground-state fields and orbitals are not changed.
+     */
+    std::unique_ptr<Density>
+    lapw_density_matrix_fields(K_point_set& ks__,
+                               std::vector<mdarray<std::complex<double>, 3>> const& matrices__) const;
+
     /// PAW partial-wave valence tau from the current projector density matrix.
     /** Element 0 contains AE fields and element 1 pseudo fields, with the same
      *  spin convention as generate_mt_valence_kinetic_density(). These are local

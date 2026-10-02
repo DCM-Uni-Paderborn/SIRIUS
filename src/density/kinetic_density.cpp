@@ -638,6 +638,177 @@ Density::lapw_orbital_fields_response(K_point_set& ks__, std::vector<wf::Wave_fu
     return result;
 }
 
+std::unique_ptr<Density>
+Density::lapw_density_matrix_fields(K_point_set& ks__,
+                                    std::vector<mdarray<std::complex<double>, 3>> const& matrices__) const
+{
+    int invalid = &ks__.ctx() != &ctx_ || !ctx_.full_potential() || !has_kinetic_density() ||
+                  ctx_.processing_unit() != device_t::CPU || ctx_.cfg().parameters().precision_wf() != "fp64" ||
+                  ctx_.num_mag_dims() == 3 || ctx_.so_correction() || ctx_.valence_relativity() != relativity_t::none ||
+                  ctx_.spfft<double>().processing_unit() != SPFFT_PU_HOST || ctx_.gvec_coarse().reduced() ||
+                  matrices__.size() != ks__.spl_num_kpoints().local_size();
+    if (!invalid) {
+        size_t ik{0};
+        for (auto it : ks__.spl_num_kpoints()) {
+            auto const& p = matrices__[ik++];
+            int n         = ks__.get<double>(it.i)->gklo_basis_size();
+            if (p.size(0) != n || p.size(1) != n || p.size(2) != ctx_.num_spins() || !p.on_host()) {
+                invalid = 1;
+                continue;
+            }
+            double peak{0}, error{0};
+            for (int s = 0; s < ctx_.num_spins(); s++) {
+                for (int j = 0; j < n; j++) {
+                    for (int i = 0; i < n; i++) {
+                        auto value = p(i, j, s);
+                        invalid |= !std::isfinite(value.real()) || !std::isfinite(value.imag());
+                        peak  = std::max(peak, std::abs(value));
+                        error = std::max(error, std::abs(value - std::conj(p(j, i, s))));
+                    }
+                }
+            }
+            invalid |= error > 1e-11 * std::max(1.0, peak);
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW coefficient fields require finite Hermitian scalar/collinear CPU fp64 PW/LO matrices");
+    }
+    size_t matrix_k{0};
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto const& kp = *ks__.get<double>(it.i);
+        auto const& p  = matrices__[matrix_k++];
+        if (kp.comm().size() > 1) {
+            std::vector<std::complex<double>> reference(p.at(memory_t::host), p.at(memory_t::host) + p.size());
+            kp.comm().bcast(reference.data(), reference.size(), 0);
+            for (size_t i = 0; i < p.size(); i++) {
+                invalid |= std::abs(p[i] - reference[i]) > 1e-12 * std::max(1.0, std::abs(reference[i]));
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW coefficient density matrices must agree across each k-point communicator");
+    }
+    int ns = ctx_.num_spins(), ng = ctx_.gvec_coarse().num_gvec();
+    std::array<mdarray<std::complex<double>, 2>, 2> fourier{mdarray<std::complex<double>, 2>({ng, ns}),
+                                                            mdarray<std::complex<double>, 2>({ng, ns})};
+    for (auto& field : fourier) {
+        field.zero();
+    }
+    std::vector<mdarray<std::complex<double>, 3>> dm;
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        int n = unit_cell_.atom(ia).type().mt_basis_size();
+        dm.emplace_back(std::array<index_range, 3>{n, n, ns});
+        dm.back().zero();
+    }
+    auto const one = la::constant<std::complex<double>>::one(), zero = la::constant<std::complex<double>>::zero();
+    size_t ik{0};
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto const& kp = *ks__.get<double>(it.i);
+        auto const& p  = matrices__[ik++];
+        int n = kp.gklo_basis_size(), npw = kp.gkvec().num_gvec();
+        for (int i = 0; i < kp.gkvec().count(); i++) {
+            int row = kp.gkvec().offset() + i;
+            auto gi = kp.gkvec().gvec(gvec_index_t::local(i));
+            auto qi = kp.gkvec().gkvec_cart(gvec_index_t::local(i));
+            for (int j = 0; j < npw; j++) {
+                int ig = ctx_.gvec_coarse().index_by_gvec(gi - kp.gkvec().gvec(gvec_index_t::global(j)));
+                if (ig < 0) {
+                    invalid = 1;
+                    continue;
+                }
+                double kinetic = 0.5 * dot(qi, kp.gkvec().gkvec_cart(gvec_index_t::global(j)));
+                for (int s = 0; s < ns; s++) {
+                    auto value = kp.weight() * p(row, j, s) / unit_cell_.omega();
+                    fourier[0](ig, s) += value;
+                    fourier[1](ig, s) += kinetic * value;
+                }
+            }
+        }
+        Matching_coefficients matching(unit_cell_, kp.gkvec());
+        int lo_offset = npw;
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            auto const& atom = unit_cell_.atom(ia);
+            int mt = atom.type().mt_basis_size(), naw = atom.type().mt_aw_basis_size();
+            mdarray<std::complex<double>, 2> alm({kp.gkvec().count(), naw}), map({mt, n});
+            matching.generate<false>(atom, alm);
+            map.zero();
+            for (int i = 0; i < naw; i++) {
+                for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                    map(i, kp.gkvec().offset() + ig) = alm(ig, i);
+                }
+            }
+            kp.comm().allreduce(map.at(memory_t::host), map.size());
+            for (int i = naw; i < mt; i++) {
+                map(i, lo_offset++) = 1;
+            }
+            if (ia % kp.comm().size() != kp.comm().rank()) {
+                continue;
+            }
+            mdarray<std::complex<double>, 2> work({mt, n}), local({mt, mt});
+            for (int s = 0; s < ns; s++) {
+                la::wrap(la::lib_t::blas)
+                        .gemm('N', 'N', mt, n, n, &one, map.at(memory_t::host), map.ld(), p.at(memory_t::host, 0, 0, s),
+                              p.ld(), &zero, work.at(memory_t::host), work.ld());
+                la::wrap(la::lib_t::blas)
+                        .gemm('N', 'C', mt, mt, n, &one, work.at(memory_t::host), work.ld(), map.at(memory_t::host),
+                              map.ld(), &zero, local.at(memory_t::host), local.ld());
+                for (int j = 0; j < mt; j++) {
+                    for (int i = 0; i < mt; i++) {
+                        // The atom operator stores conj(c_i) c_j, the transpose of ket/bra P.
+                        dm[ia](i, j, s) += kp.weight() * local(j, i);
+                    }
+                }
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW PW products lie outside the density reciprocal grid");
+    }
+    auto result = std::make_unique<Density>(ctx_);
+    result->zero();
+    result->kinetic_density().zero();
+    for (int part : {0, 1}) {
+        ctx_.comm().allreduce(fourier[part].at(memory_t::host), fourier[part].size());
+        for (size_t i = 0; i < fourier[part].size(); i++) {
+            invalid |= !std::isfinite(fourier[part][i].real()) || !std::isfinite(fourier[part][i].imag());
+        }
+        if (invalid) {
+            RTE_THROW("nonfinite LAPW coefficient Fourier fields");
+        }
+        auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+        for (int s = 0; s < ns; s++) {
+            for (int ig = 0; ig < ctx_.gvec_coarse().count(); ig++) {
+                int fine   = ctx_.gvec().gvec_base_mapping(ig);
+                auto value = fourier[part](ctx_.gvec_coarse().offset() + ig, s);
+                target.scalar().rg().f_pw_local(fine) += value;
+                if (ns == 2) {
+                    target.vector(0).rg().f_pw_local(fine) += double(1 - 2 * s) * value;
+                }
+            }
+        }
+        target.fft_transform(1);
+    }
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        ctx_.comm().allreduce(dm[ia].at(memory_t::host), dm[ia].size());
+        auto fields = LAPW_xc_atom(unit_cell_.atom(ia), ctx_.lmax_rho()).fields(dm[ia]);
+        for (int part : {0, 1}) {
+            auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+            for (int s = 0; s < ns; s++) {
+                target.scalar().mt()[ia] += fields[part][s];
+                if (ns == 2) {
+                    for (size_t i = 0; i < fields[part][s].size(); i++) {
+                        target.vector(0).mt()[ia][i] += (1 - 2 * s) * fields[part][s][i];
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
 template <typename T>
 std::vector<Smooth_periodic_function<double>>
 Density::generate_smooth_kinetic_density(K_point_set const& ks__) const
