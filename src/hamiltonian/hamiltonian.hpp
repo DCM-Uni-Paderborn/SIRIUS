@@ -29,6 +29,14 @@ class Atom;
 class Simulation_context;
 class Potential;
 class Unit_cell;
+struct radial_basis_response_t;
+
+/// Atom-local radial-basis derivatives and the unperturbed overlap, in AW/LO order.
+struct lapw_atom_basis_response_t
+{
+    mdarray<std::complex<double>, 3> h;
+    mdarray<double, 2> o, overlap;
+};
 template <typename T>
 class Local_operator;
 template <typename T>
@@ -208,6 +216,11 @@ class Hamiltonian0
 
     void
     generate_pw_coefs(Potential const& potential__);
+
+    /// Build atom-local dH/dS at fixed geometry and physical fields, without updating radial integrals.
+    /// Collective on the context communicator, before looping over locally owned k-points.
+    std::vector<lapw_atom_basis_response_t>
+    lapw_radial_basis_response(std::vector<radial_basis_response_t> const& response__) const;
 };
 
 template <typename T>
@@ -479,6 +492,16 @@ class Hamiltonian_k
      */
     void
     set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Radial-basis response of the complete PW/LO matrices, including AW matching.
+    /** Atom-local derivatives are prepared once by H0().lapw_radial_basis_response().
+     *  The interstitial domain, physical potentials and independent PW/LO coefficients stay fixed.
+     *  Collective on the k-point communicator.
+     */
+    void
+    set_fv_h_o_radial_response(int ispn__, std::vector<radial_basis_response_t> const& response__,
+                               std::vector<lapw_atom_basis_response_t> const& atoms__,
+                               la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
 
     /// Add interstitial contribution to apw-apw block of Hamiltonian and overlap.
     void

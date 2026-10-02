@@ -16,7 +16,6 @@
 #include "k_point/k_point_set.hpp"
 #include "density/density.hpp"
 #include "density/augmentation_operator.hpp"
-#include "density/lapw_xc_atom.hpp"
 #include "potential/potential.hpp"
 #include "beta_projectors/beta_projectors.hpp"
 #include "beta_projectors/beta_projectors_gradient.hpp"
@@ -85,125 +84,9 @@ Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& dire
                 directions__[ic], xc_directions__.empty() ? std::array<std::vector<double>, 2>{} : xc_directions__[ic],
                 update_enu__));
     }
-    struct atom_response_t
-    {
-        mdarray<std::complex<double>, 3> h;
-        mdarray<double, 2> o, overlap;
-    };
-    std::vector<atom_response_t> matrices;
-    bool simple = ctx_.cfg().settings().simple_lapw_ri();
-    int ns = ctx_.num_spins(), lmmax = sf::lmmax(ctx_.lmax_pot());
-    for (int ia = 0; ia < uc.num_atoms(); ia++) {
-        auto const& atom      = uc.atom(ia);
-        auto const& type      = atom.type();
-        auto const& cls       = atom.symmetry_class();
-        auto const& grid      = type.radial_grid();
-        auto const& spherical = cls.spherical_potential();
-        auto const& drf       = response[cls.id()].radial_functions;
-        int n = type.mt_basis_size(), nrf = type.indexr().size();
-        atom_response_t matrix{mdarray<std::complex<double>, 3>({n, n, ns}), mdarray<double, 2>({n, n}),
-                               mdarray<double, 2>({n, n})};
-        matrix.h.zero();
-        matrix.o.zero();
-        matrix.overlap.zero();
-        std::vector<Spline<double>> radial, tangent;
-        for (int i = 0; i < nrf; i++) {
-            radial.emplace_back(grid);
-            tangent.emplace_back(grid);
-            for (int ir = 0; ir < grid.num_points(); ir++) {
-                radial.back()(ir)  = cls.radial_function(ir, i);
-                tangent.back()(ir) = drf(ir, i, 0);
-            }
-            radial.back().interpolate();
-            tangent.back().interpolate();
-        }
-        mdarray<double, 4> dh({lmmax, nrf, nrf, ns});
-        mdarray<double, 2> ds({nrf, nrf});
-        dh.zero();
-        ds.zero();
-        Spline<double> product(grid), integral(grid), field(grid);
-        auto integrate_field = [&](int i, int j) {
-            if (simple) {
-                for (int ir = 0; ir < grid.num_points(); ir++) {
-                    integral(ir) = product(ir) * field(ir) * grid[ir] * grid[ir];
-                }
-                return integral.interpolate().integrate(0);
-            }
-            field.interpolate();
-            return inner(tangent[j], radial[i] * field, 2) + inner(radial[j], tangent[i] * field, 2);
-        };
-        for (int j = 0; j < nrf; j++) {
-            for (int i = 0; i <= j; i++) {
-                int l1 = type.indexr(i).am.l(), l2 = type.indexr(j).am.l();
-                for (int ir = 0; ir < grid.num_points(); ir++) {
-                    product(ir) = tangent[i](ir) * radial[j](ir) + radial[i](ir) * tangent[j](ir);
-                }
-                if (l1 == l2 && i != j) {
-                    for (int ir = 0; ir < grid.num_points(); ir++) {
-                        integral(ir) = product(ir) * (simple ? grid[ir] * grid[ir] : 1);
-                    }
-                    ds(i, j) = ds(j, i) = integral.interpolate().integrate(simple ? 0 : 2);
-                }
-                for (int lm = 0; lm < lmmax; lm++) {
-                    double value{0};
-                    if (lm == 0 && l1 == l2) {
-                        for (int ir = 0; ir < grid.num_points(); ir++) {
-                            integral(ir) = 0.5 * (drf(ir, i, 1) * cls.radial_function_derivative(ir, j) +
-                                                  cls.radial_function_derivative(ir, i) * drf(ir, j, 1)) +
-                                           product(ir) * (0.5 * l1 * (l1 + 1) + spherical[ir] * grid[ir] * grid[ir]);
-                        }
-                        value = integral.interpolate().integrate(0) / y00;
-                    } else if (lm != 0) {
-                        for (int ir = 0; ir < grid.num_points(); ir++) {
-                            field(ir) = potential_.effective_potential().mt()[ia](lm, ir);
-                        }
-                        value = integrate_field(i, j);
-                    }
-                    double magnetic{0};
-                    if (ns == 2) {
-                        for (int ir = 0; ir < grid.num_points(); ir++) {
-                            field(ir) = potential_.effective_magnetic_field(0).mt()[ia](lm, ir);
-                        }
-                        magnetic = integrate_field(i, j);
-                    }
-                    for (int s = 0; s < ns; s++) {
-                        dh(lm, i, j, s) = dh(lm, j, i, s) = value + (1 - 2 * s) * magnetic;
-                    }
-                }
-            }
-        }
-        for (int j = 0; j < n; j++) {
-            auto const& b = type.indexb(j);
-            for (int i = 0; i < n; i++) {
-                auto const& a = type.indexb(i);
-                if (a.lm == b.lm) {
-                    bool aw              = i < type.mt_aw_basis_size() && j < type.mt_aw_basis_size();
-                    matrix.overlap(i, j) = aw ? (i == j ? 1 : 0) : cls.o_radial_integral(a.am.l(), a.order, b.order);
-                    matrix.o(i, j)       = aw ? 0 : ds(a.idxrf, b.idxrf);
-                }
-                for (auto const& g : type.gaunt_coefs().gaunt_vector(a.lm, b.lm)) {
-                    if (g.lm3 < lmmax) {
-                        for (int s = 0; s < ns; s++) {
-                            matrix.h(i, j, s) += g.coef * dh(g.lm3, a.idxrf, b.idxrf, s);
-                        }
-                    }
-                }
-            }
-        }
-        if (auto const* xc = potential_.lapw_xc_derivatives()) {
-            LAPW_xc_atom op(atom, ctx_.lmax_rho());
-            for (int s = 0; s < ns; s++) {
-                auto d = op.matrix_elements(xc->local[ia][0][s], xc->local[ia][1][s], &response[cls.id()]);
-                for (int j = 0; j < n; j++) {
-                    for (int i = 0; i < n; i++) {
-                        matrix.h(i, j, s) += d(i, j);
-                    }
-                }
-            }
-        }
-        matrices.push_back(std::move(matrix));
-    }
+    auto matrices = h0.lapw_radial_basis_response(response);
 
+    int ns = ctx_.num_spins();
     double result{0};
     for (auto it : kset_.spl_num_kpoints()) {
         auto& kp = *kset_.get<double>(it.i);

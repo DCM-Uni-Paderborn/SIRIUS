@@ -344,6 +344,122 @@ Hamiltonian_k<T>::get_h_o_diag_lapw() const
 
 template <typename T>
 void
+Hamiltonian_k<T>::set_fv_h_o_radial_response(int ispn__, std::vector<radial_basis_response_t> const& response__,
+                                             std::vector<lapw_atom_basis_response_t> const& atoms__,
+                                             la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const
+{
+    auto const& ctx = H0_.ctx();
+    auto const& uc  = ctx.unit_cell();
+    int nr = kp_.gklo_basis_size_row(), nc = kp_.gklo_basis_size_col(), n = kp_.gklo_basis_size();
+    int invalid = !std::is_same_v<T, double> || !ctx.full_potential() || ctx.processing_unit() != device_t::CPU ||
+                  ctx.valence_relativity() != relativity_t::none || ctx.so_correction() || ctx.num_mag_dims() == 3 ||
+                  ctx.hubbard_correction() || (ctx.num_spins() == 2 && ctx.cfg().control().use_second_variation()) ||
+                  ispn__ < 0 || ispn__ >= ctx.num_spins() || response__.size() != uc.num_atom_symmetry_classes() ||
+                  atoms__.size() != uc.num_atoms() || &h__ == &o__;
+    for (auto const* m : {&h__, &o__}) {
+        invalid |= m->num_rows() != n || m->num_cols() != n || m->num_rows_local() != nr || m->num_cols_local() != nc ||
+                   m->bs_row() != ctx.cyclic_block_size() || m->bs_col() != ctx.cyclic_block_size() ||
+                   (m->size_local() && !m->on_host());
+        invalid |= !m->has_blacs_grid() || &m->blacs_grid() != &ctx.blacs_grid();
+    }
+    auto finite = [](auto const& a) {
+        if (a.size() && !a.on_host()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); i++) {
+            if (!std::isfinite(std::abs(a[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!invalid) {
+        for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
+            auto const& type = uc.atom_symmetry_class(ic).atom_type();
+            auto const& d    = response__[ic].surface_derivatives;
+            invalid |= d.size(0) != 3 || d.size(1) != type.mt_radial_basis_size() - type.num_lo_descriptors() ||
+                       !finite(d);
+        }
+        for (int ia = 0; ia < uc.num_atoms(); ia++) {
+            int nb        = uc.atom(ia).type().mt_basis_size();
+            auto const& d = atoms__[ia];
+            invalid |= d.h.size(0) != nb || d.h.size(1) != nb || d.h.size(2) != ctx.num_spins() || d.o.size(0) != nb ||
+                       d.o.size(1) != nb || d.overlap.size(0) != nb || d.overlap.size(1) != nb || !finite(d.h) ||
+                       !finite(d.o) || !finite(d.overlap);
+        }
+    }
+    int smin = ispn__, smax = ispn__;
+    kp_.comm().template allreduce<int, mpi::op_t::min>(&smin, 1);
+    kp_.comm().template allreduce<int, mpi::op_t::max>(&smax, 1);
+    kp_.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid || smin != smax) {
+        RTE_THROW("LAPW radial matrix response requires compatible finite atom data and PW/LO matrix layouts");
+    }
+    h__.zero();
+    o__.zero();
+    if (nr == 0 || nc == 0) {
+        return;
+    }
+    for (int ia = 0; ia < uc.num_atoms(); ia++) {
+        auto const& atom = uc.atom(ia);
+        auto const& type = atom.type();
+        int nb           = type.mt_basis_size();
+        mdarray<std::complex<T>, 2> row({nr, nb}), col({nc, nb}), drow({nr, nb}), dcol({nc, nb});
+        for (auto* m : {&row, &col, &drow, &dcol}) {
+            m->zero();
+        }
+        auto const& r = response__[atom.symmetry_class().id()];
+        if (kp_.num_gkvec_row()) {
+            kp_.alm_coeffs_row().template generate<true>(atom, row);
+            kp_.alm_coeffs_row().template generate_potential_response<true>(atom, r, drow);
+        }
+        if (kp_.num_gkvec_col()) {
+            kp_.alm_coeffs_col().template generate<false>(atom, col);
+            kp_.alm_coeffs_col().template generate_potential_response<false>(atom, r, dcol);
+        }
+        for (int i = 0; i < kp_.num_atom_lo_rows(ia); i++) {
+            int j         = kp_.lo_row(ia, i);
+            auto const& b = kp_.lo_basis_descriptor_row(j);
+            row(kp_.num_gkvec_row() + j, type.indexb().index_by_lm_order(b.lm, b.order)) = 1;
+        }
+        for (int i = 0; i < kp_.num_atom_lo_cols(ia); i++) {
+            int j         = kp_.lo_col(ia, i);
+            auto const& b = kp_.lo_basis_descriptor_col(j);
+            col(kp_.num_gkvec_col() + j, type.indexb().index_by_lm_order(b.lm, b.order)) = 1;
+        }
+        mdarray<std::complex<T>, 2> mt({nb, nb}), delta({nb, nb}), work({nr, nb});
+        for (int part : {0, 1}) {
+            for (int j = 0; j < nb; j++) {
+                for (int i = 0; i < nb; i++) {
+                    mt(i, j)    = part == 0 ? H0_.hmt(ia)(i, j, ispn__) : std::complex<T>(atoms__[ia].overlap(i, j));
+                    delta(i, j) = part == 0 ? static_cast<std::complex<T>>(atoms__[ia].h(i, j, ispn__))
+                                            : std::complex<T>(atoms__[ia].o(i, j));
+                }
+            }
+            auto& out      = part == 0 ? h__ : o__;
+            auto const one = la::constant<std::complex<T>>::one(), zero = la::constant<std::complex<T>>::zero();
+            // d(A* M A) = dA* M A + A* dM A + A* M dA, including LO identity blocks.
+            la::wrap(la::lib_t::blas)
+                    .gemm('N', 'N', nr, nb, nb, &one, row.at(memory_t::host), row.ld(), mt.at(memory_t::host), mt.ld(),
+                          &zero, work.at(memory_t::host), work.ld());
+            la::wrap(la::lib_t::blas)
+                    .gemm('N', 'T', nr, nc, nb, &one, work.at(memory_t::host), work.ld(), dcol.at(memory_t::host),
+                          dcol.ld(), &one, out.at(memory_t::host), out.ld());
+            la::wrap(la::lib_t::blas)
+                    .gemm('N', 'N', nr, nb, nb, &one, drow.at(memory_t::host), drow.ld(), mt.at(memory_t::host),
+                          mt.ld(), &zero, work.at(memory_t::host), work.ld());
+            la::wrap(la::lib_t::blas)
+                    .gemm('N', 'N', nr, nb, nb, &one, row.at(memory_t::host), row.ld(), delta.at(memory_t::host),
+                          delta.ld(), &one, work.at(memory_t::host), work.ld());
+            la::wrap(la::lib_t::blas)
+                    .gemm('N', 'T', nr, nc, nb, &one, work.at(memory_t::host), work.ld(), col.at(memory_t::host),
+                          col.ld(), &one, out.at(memory_t::host), out.ld());
+        }
+    }
+}
+
+template <typename T>
+void
 Hamiltonian_k<T>::set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const
 {
     PROFILE("sirius::Hamiltonian_k::set_fv_h_o");

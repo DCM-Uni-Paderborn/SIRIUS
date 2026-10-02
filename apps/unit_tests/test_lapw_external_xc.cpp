@@ -1118,6 +1118,57 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 radial_response.push_back(ctx->unit_cell().atom_symmetry_class(ic).radial_basis_potential_response(
                         radial_direction[ic], xc_direction[ic]));
             }
+            Hamiltonian0<double> basis_h0(potential, false);
+            auto atom_matrices = basis_h0.lapw_radial_basis_response(radial_response);
+            std::array<std::vector<std::complex<double>>, 2> analytic_matrices, sampled_matrices;
+            auto append_matrices = [](auto const& h, auto const& o, auto& values) {
+                for (int j = 0; j < h.num_cols_local(); j++) {
+                    for (int i = 0; i < h.num_rows_local(); i++) {
+                        values[0].push_back(h(i, j));
+                        values[1].push_back(o(i, j));
+                    }
+                }
+            };
+            int rejected_matrix_failures{0};
+            for (auto it : ks.spl_num_kpoints()) {
+                auto kp = ks.get<double>(it.i);
+                auto hk = basis_h0(*kp);
+                int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                la::dmatrix<std::complex<double>> dh(n, n, ctx->blacs_grid(), bs, bs);
+                la::dmatrix<std::complex<double>> ds(n, n, ctx->blacs_grid(), bs, bs);
+                for (int s = 0; s < ctx->num_spins(); s++) {
+                    hk.set_fv_h_o_radial_response(s, radial_response, atom_matrices, dh, ds);
+                    append_matrices(dh, ds, analytic_matrices);
+                }
+                if (!mag && !second_variation && part == 0) {
+                    auto expect_rejection = [&](auto&& operation) {
+                        bool rejected{false};
+                        try {
+                            operation();
+                        } catch (std::exception const&) {
+                            rejected = true;
+                        }
+                        rejected_matrix_failures += !rejected;
+                    };
+                    expect_rejection([&] {
+                        hk.set_fv_h_o_radial_response(kp->comm().rank() == 0 ? -1 : 0, radial_response, atom_matrices,
+                                                      dh, ds);
+                    });
+                    la::dmatrix<std::complex<double>> no_grid(n, n);
+                    expect_rejection(
+                            [&] { hk.set_fv_h_o_radial_response(0, radial_response, atom_matrices, no_grid, ds); });
+                    expect_rejection([&] { hk.set_fv_h_o_radial_response(0, radial_response, atom_matrices, dh, dh); });
+                    auto saved = atom_matrices[0].h[0];
+                    if (kp->comm().rank() == 0) {
+                        atom_matrices[0].h[0] = std::numeric_limits<double>::quiet_NaN();
+                    }
+                    expect_rejection([&] { hk.set_fv_h_o_radial_response(0, radial_response, atom_matrices, dh, ds); });
+                    atom_matrices[0].h[0] = saved;
+                }
+            }
+            if (!mag && !second_variation && part == 0) {
+                check("invalid radial matrix inputs rejected collectively", rejected_matrix_failures, 0);
+            }
             auto field_response = density.lapw_radial_fields_response(ks, radial_response);
             auto combined       = density.lapw_orbital_fields_response(ks, orbital_directions, radial_response);
             double combined_error{0};
@@ -1171,6 +1222,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 }
                 reject("nonfinite field response rejected collectively",
                        [&] { density.lapw_radial_fields_response(ks, zero); });
+                reject("nonfinite atom matrix response rejected collectively",
+                       [&] { basis_h0.lapw_radial_basis_response(zero); });
                 zero[0].surface_derivatives[0] = 0;
                 if (ctx->comm().rank() == 0) {
                     zero[0].core_fields[0].pop_back();
@@ -1229,6 +1282,9 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 Hamiltonian0<double> radial_h0(potential, false);
                 radial_h0.generate_pw_coefs(potential);
                 double value{0};
+                for (auto& entries : sampled_matrices) {
+                    entries.clear();
+                }
                 for (auto it : ks.spl_num_kpoints()) {
                     auto kp = ks.get<double>(it.i);
                     auto hk = radial_h0(*kp);
@@ -1237,6 +1293,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
                     for (int s = 0; s < ctx->num_spins(); s++) {
                         hk.set_fv_h_o(s, h, o);
+                        append_matrices(h, o, sampled_matrices);
                         value += occupied_lapw_lagrangian(*ctx, *kp, s, h, o);
                     }
                 }
@@ -1245,11 +1302,25 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 return value;
             };
             for (double step : {1e-3, 5e-4}) {
-                double plus       = radial_lagrangian(step);
-                auto plus_fields  = sampled_fields;
-                auto plus_hartree = sampled_hartree;
-                auto plus_xc      = sampled_xc;
-                double fd         = (plus - radial_lagrangian(-step)) / (2 * step);
+                double plus        = radial_lagrangian(step);
+                auto plus_fields   = sampled_fields;
+                auto plus_hartree  = sampled_hartree;
+                auto plus_xc       = sampled_xc;
+                auto plus_matrices = sampled_matrices;
+                double fd          = (plus - radial_lagrangian(-step)) / (2 * step);
+                for (int p : {0, 1}) {
+                    double error{0}, peak{0};
+                    for (size_t i = 0; i < analytic_matrices[p].size(); i++) {
+                        auto analytic = analytic_matrices[p][i];
+                        double e = std::abs(analytic - (plus_matrices[p][i] - sampled_matrices[p][i]) / (2 * step));
+                        error    = std::isfinite(e) ? std::max(error, e) : std::numeric_limits<double>::infinity();
+                        peak     = std::max(peak, std::abs(analytic));
+                    }
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                    check(p == 0 ? "complete radial Hamiltonian response" : "complete radial overlap response",
+                          error / std::max(1e-12, peak), 3e-5);
+                }
                 check("radial density/tau response",
                       radial_fields_error(field_response, plus_fields, sampled_fields, step), 3e-5);
                 check("radial Hartree response",
