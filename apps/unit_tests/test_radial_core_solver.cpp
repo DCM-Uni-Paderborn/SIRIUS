@@ -7,6 +7,8 @@
  */
 
 #include "radial/radial_core_solver.hpp"
+#include "unit_cell/atom_symmetry_class.hpp"
+#include "lapw/matching_coefficients.hpp"
 #include <sirius.hpp>
 #include <testing.hpp>
 #include <limits>
@@ -401,11 +403,172 @@ test_radial_potential_response()
 }
 
 int
+test_radial_basis_response()
+{
+    int failures{0};
+    auto check = [&](char const* name, double error, double tolerance) {
+        std::cout << name << ": " << error << " (limit " << tolerance << ")\n";
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    for (bool orthogonalize : {false, true}) {
+        Simulation_parameters parameters;
+        parameters.valence_relativity("none");
+        parameters.lmax_apw(3);
+        parameters.lmax_rho(6);
+        parameters.lmax_pot(6);
+        parameters.cfg().parameters().auto_rmt(0);
+        parameters.cfg().parameters().use_symmetry(false);
+        parameters.cfg().control().ortho_rf(orthogonalize);
+        Unit_cell cell(parameters, mpi::Communicator::world());
+        cell.set_lattice_vectors({{6, 0, 0}, {0, 7, 0}, {0, 0, 8}});
+        auto& type = cell.add_atom_type("He");
+        type.zn(2);
+        type.set_radial_grid(radial_grid_t::power, 801, 1e-6, 1.8, 2.0);
+        for (int l = 0; l <= 3; l++) {
+            for (int order = 0; order < (l < 2 ? 3 : (l == 2 ? 2 : 1)); order++) {
+                type.add_aw_descriptor(l + 1, l, -0.3, order, 0);
+            }
+        }
+        // Two and three boundary conditions, with two LOs of the same l to test orthogonalization.
+        for (int l : {0, 1}) {
+            for (int lo : {0, 1}) {
+                for (int order = 0; order < 2 + lo; order++) {
+                    type.add_lo_descriptor(2 * l + lo, l + 1, l, lo ? 0.8 : -0.7, order, 0);
+                }
+            }
+        }
+        cell.add_atom("He", {0.23, 0.31, 0.43});
+        cell.initialize();
+        auto& atom = cell.atom(0);
+        auto& cls  = atom.symmetry_class();
+        fft::Gvec gkvec({0.07, -0.03, 0.02}, cell.reciprocal_lattice_vectors(), 2.0, cell.comm(), false);
+        Matching_coefficients matching(cell, gkvec);
+        auto const& grid = type.radial_grid();
+        std::vector<double> potential(grid.num_points()), direction(grid.num_points());
+        for (int ir = 0; ir < grid.num_points(); ir++) {
+            potential[ir] = -2 / grid[ir] + 0.2 * std::exp(-grid[ir]);
+            direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+        }
+        auto sample = [&](double step) {
+            auto v = potential;
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                v[ir] += step * direction[ir];
+            }
+            cls.set_spherical_potential(v);
+            if (cls.generate_radial_functions(relativity_t::none, false)) {
+                RTE_THROW("radial basis response fixture construction failed");
+            }
+            std::vector<double> values;
+            for (int j : {0, 1}) {
+                for (int i = 0; i < type.mt_radial_basis_size(); i++) {
+                    for (int ir = 0; ir < grid.num_points(); ir++) {
+                        values.push_back(j ? cls.radial_function_derivative(ir, i) : cls.radial_function(ir, i));
+                    }
+                }
+            }
+            for (int l = 0; l <= 3; l++) {
+                for (int order = 0; order < type.aw_order(l); order++) {
+                    for (int dm : {0, 1, 2}) {
+                        values.push_back(cls.aw_surface_deriv(l, order, dm));
+                    }
+                }
+            }
+            return values;
+        };
+        auto baseline = sample(0);
+        auto response = cls.radial_basis_potential_response(direction);
+        auto zero     = cls.radial_basis_potential_response(std::vector<double>(grid.num_points(), 0));
+        std::vector<double> analytic(response.radial_functions.begin(), response.radial_functions.end());
+        analytic.insert(analytic.end(), response.surface_derivatives.begin(), response.surface_derivatives.end());
+        double null_error{0}, norm_error{0}, boundary_error{0}, unchanged{0};
+        for (double x : zero.radial_functions) {
+            null_error = std::max(null_error, std::abs(x));
+        }
+        for (double x : zero.surface_derivatives) {
+            null_error = std::max(null_error, std::abs(x));
+        }
+        for (int i = 0; i < type.mt_radial_basis_size(); i++) {
+            Spline<double> product(grid);
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                product(ir) = cls.radial_function(ir, i) * response.radial_functions(ir, i, 0);
+                auto j      = ir + grid.num_points() * i;
+                unchanged   = std::max(unchanged, std::abs(cls.radial_function(ir, i) - baseline[j]));
+            }
+            norm_error = std::max(norm_error, std::abs(product.interpolate().integrate(2)));
+            if (i >= type.mt_radial_basis_size() - type.num_lo_descriptors()) {
+                boundary_error =
+                        std::max(boundary_error, std::abs(response.radial_functions(grid.num_points() - 1, i, 0)));
+            }
+        }
+        std::cout << "Radial basis response orthogonalize=" << orthogonalize << '\n';
+        check("unchanged stored radial basis", unchanged, 0);
+        check("zero basis response", null_error, 0);
+        check("basis normalization response", norm_error, 2e-9);
+        check("LO boundary response", boundary_error, 2e-10);
+        for (double h : {1e-4, 5e-5}) {
+            auto plus = sample(h), minus = sample(-h);
+            double error{0}, peak{0};
+            for (size_t i = 0; i < analytic.size(); i++) {
+                error = std::max(error, std::abs(analytic[i] - (plus[i] - minus[i]) / (2 * h)));
+                peak  = std::max(peak, std::abs(analytic[i]));
+            }
+            check("nonzero radial basis response", peak > 1e-5 ? 0 : 1, 0);
+            check("AW/LO potential derivative", error / peak, 2e-6);
+        }
+        sample(0);
+        mdarray<std::complex<double>, 2> dalm({gkvec.count(), type.mt_aw_basis_size()});
+        mdarray<std::complex<double>, 2> conjugate({gkvec.count(), type.mt_aw_basis_size()});
+        mdarray<std::complex<double>, 2> plus({gkvec.count(), type.mt_aw_basis_size()});
+        mdarray<std::complex<double>, 2> minus({gkvec.count(), type.mt_aw_basis_size()});
+        matching.generate_potential_response<false>(atom, response, dalm);
+        matching.generate_potential_response<true>(atom, response, conjugate);
+        for (double h : {1e-4, 5e-5}) {
+            sample(h);
+            matching.generate<false>(atom, plus);
+            sample(-h);
+            matching.generate<false>(atom, minus);
+            double error{0}, peak{0}, conjugation_error{0};
+            for (size_t i = 0; i < dalm.size(); i++) {
+                error             = std::max(error, std::abs(dalm[i] - (plus[i] - minus[i]) / (2 * h)));
+                peak              = std::max(peak, std::abs(dalm[i]));
+                conjugation_error = std::max(conjugation_error, std::abs(dalm[i] - std::conj(conjugate[i])));
+            }
+            cell.comm().allreduce<double, mpi::op_t::max>(&error, 1);
+            cell.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+            cell.comm().allreduce<double, mpi::op_t::max>(&conjugation_error, 1);
+            check("nonzero matching response", peak > 1e-5 ? 0 : 1, 0);
+            check("APW/LAPW matching potential derivative", error / peak, 2e-6);
+            check("conjugated matching response", conjugation_error, 0);
+        }
+        for (auto invalid : {std::vector<double>{},
+                             std::vector<double>(grid.num_points(), std::numeric_limits<double>::quiet_NaN())}) {
+            bool rejected{false};
+            try {
+                cls.radial_basis_potential_response(invalid);
+            } catch (std::exception const&) {
+                rejected = true;
+            }
+            check("invalid radial basis direction", rejected ? 0 : 1, 0);
+        }
+        parameters.valence_relativity("zora");
+        bool rejected{false};
+        try {
+            cls.radial_basis_potential_response(direction);
+        } catch (std::exception const&) {
+            rejected = true;
+        }
+        check("unsupported relativistic basis response", rejected ? 0 : 1, 0);
+    }
+    return failures;
+}
+
+int
 main(int argc, char** argv)
 {
     sirius::initialize(1);
     int result = call_test("test_radial_core_solver", test_radial_core_solver);
     result += call_test("test_radial_potential_response", test_radial_potential_response);
+    result += call_test("test_radial_basis_response", test_radial_basis_response);
     sirius::finalize();
     return result;
 }

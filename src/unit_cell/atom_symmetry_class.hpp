@@ -23,6 +23,21 @@ namespace sirius {
 
 struct radial_solver_result_t;
 
+/// Potential derivatives of the radial basis and its AW boundary data at fixed linearisation energies.
+struct radial_basis_response_t
+{
+    mdarray<double, 3> radial_functions;
+    mdarray<double, 2> surface_derivatives;
+
+    explicit radial_basis_response_t(Atom_type const& type__)
+        : radial_functions({type__.num_mt_points(), type__.mt_radial_basis_size(), 2})
+        , surface_derivatives({3, type__.mt_radial_basis_size() - type__.num_lo_descriptors()})
+    {
+        radial_functions.zero();
+        surface_derivatives.zero();
+    }
+};
+
 /// Data and methods specific to the symmetry class of the atom.
 /** Atoms transforming into each other under symmetry opeartions belong to the same symmetry class. They have the
  *  same spherical part of the on-site potential and, as a consequence, the same radial functions.
@@ -81,19 +96,24 @@ class Atom_symmetry_class
     mutable std::vector<local_orbital_descriptor> lo_descriptors_;
 
     radial_solver_result_t
-    solve_radial(relativity_t rel__, int dme__, int l__, double energy__) const;
+    solve_radial(relativity_t rel__, int dme__, int l__, double energy__,
+                 std::vector<double> const* direction__ = nullptr, radial_solver_result_t* response__ = nullptr) const;
 
     /// Generate radial functions for augmented waves
     int
-    generate_aw_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__, mdarray<double, 2>& sd__) const;
+    generate_aw_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__, mdarray<double, 2>& sd__,
+                                 std::vector<double> const* direction__ = nullptr,
+                                 radial_basis_response_t* response__    = nullptr) const;
 
     /// Generate local orbital raidal functions
     int
-    generate_lo_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__) const;
+    generate_lo_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__,
+                                 std::vector<double> const* direction__ = nullptr,
+                                 radial_basis_response_t* response__    = nullptr) const;
 
     /// Orthogonalize the radial functions.
     void
-    orthogonalize_radial_functions();
+    orthogonalize_radial_functions(mdarray<double, 3>& rf__, mdarray<double, 3>* response__ = nullptr) const;
 
   public:
     /// Constructor
@@ -118,6 +138,12 @@ class Atom_symmetry_class
     /// Generate APW and LO radial functions.
     int
     generate_radial_functions(relativity_t rel__, bool update_enu__ = true);
+
+    /// Differentiate the nonrelativistic AW/LO construction without changing the stored basis or energies.
+    /** The direction is the change in the spherical potential on the MT grid. Core-projected radial functions
+     *  require a separate core-state response and are not yet supported by this operation. */
+    radial_basis_response_t
+    radial_basis_potential_response(std::vector<double> const& direction__) const;
 
     void
     sync_radial_functions(mpi::Communicator const& comm__, int const rank__);

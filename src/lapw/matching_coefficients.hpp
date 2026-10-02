@@ -233,6 +233,28 @@ class Matching_coefficients // TODO: compute on GPU
     void
     generate(Atom const& atom__, mdarray<T, 2>& alm__) const
     {
+        generate_impl<conjugate>(atom__, alm__, nullptr);
+    }
+
+    /// Differentiate matching coefficients for a radial-basis variation at fixed geometry.
+    template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
+    void
+    generate_potential_response(Atom const& atom__, radial_basis_response_t const& response__,
+                                mdarray<T, 2>& alm__) const
+    {
+        auto const& sd = response__.surface_derivatives;
+        if (sd.size(0) != 3 ||
+            sd.size(1) != atom__.type().mt_radial_basis_size() - atom__.type().num_lo_descriptors()) {
+            RTE_THROW("wrong dimensions of AW boundary response");
+        }
+        generate_impl<conjugate>(atom__, alm__, &sd);
+    }
+
+  private:
+    template <bool conjugate, typename T>
+    void
+    generate_impl(Atom const& atom__, mdarray<T, 2>& alm__, mdarray<double, 2> const* response__) const
+    {
         auto& type = atom__.type();
 
         RTE_ASSERT(type.max_aw_order() <= 3);
@@ -300,6 +322,21 @@ class Matching_coefficients // TODO: compute on GPU
                     break;
                 }
             }
+            if (response__) {
+                // A is the inverse boundary matrix, so dA = -A dB A.
+                r3::matrix<double> derivative;
+                for (int i = 0; i < num_aw; i++) {
+                    for (int j = 0; j < num_aw; j++) {
+                        for (int dm = 0; dm < num_aw; dm++) {
+                            for (int order = 0; order < num_aw; order++) {
+                                auto idxrf = type.indexr().index_of(angular_momentum(l), order);
+                                derivative(i, j) -= A(i, dm) * (*response__)(dm, idxrf) * A(order, j);
+                            }
+                        }
+                    }
+                }
+                A = derivative;
+            }
             Al[l] = A;
         }
 
@@ -334,6 +371,7 @@ class Matching_coefficients // TODO: compute on GPU
         }
     }
 
+  public:
     /// Generate matching coefficients for all atoms.
     inline void
     generate()
