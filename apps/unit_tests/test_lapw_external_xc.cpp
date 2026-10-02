@@ -300,6 +300,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     auto saved_orbitals = orbital_snapshot();
     auto saved_basis    = basis_snapshot();
     double saved_energy = gs.total_energy(), saved_exc = potential.energy_exc(density);
+    reject("incomplete external LAPW forces remain guarded", [&] { gs.forces().calc_forces_total(); });
     auto verify_restored = [&] {
         check("orbital diagnostic restores PW/AW/LO coefficients", orbital_snapshot() == saved_orbitals ? 0 : 1, 0);
         check("orbital diagnostic holds radial basis fixed", basis_snapshot() == saved_basis ? 0 : 1, 0);

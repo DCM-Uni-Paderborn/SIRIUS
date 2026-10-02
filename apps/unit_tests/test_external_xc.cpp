@@ -50,7 +50,7 @@ test_functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc
 auto
 test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool parallel_fft = false, bool external = true,
              double fixed_mag = 0, bool paw = false, bool points = false, std::string smearing = "gaussian",
-             double extra_charge = 0)
+             double extra_charge = 0, std::function<void(Simulation_context&)> setup = {})
 {
     auto conf                          = R"({"parameters": {
         "electronic_structure_method": "pseudopotential", "use_symmetry": false,
@@ -144,6 +144,9 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
             }
             ctx->cb().external_xc_points_ = std::move(quadrature);
         }
+    }
+    if (setup) {
+        setup(*ctx);
     }
     ctx->initialize();
     return ctx;
@@ -775,12 +778,114 @@ test_external_scf(bool exact, bool external, bool paw = false)
     potential.generate(density, false, true);
     double direct = gs.energy_kin_sum_pw() + 0.5 * potential.energy_vha() + energy_vloc(density, potential) +
                     potential.energy_exc(density) + potential.ewald_energy() + potential.PAW_total_energy(density);
-    double error = std::abs(ks_energy(*ctx, ks, density, potential) - direct);
+    double error  = std::abs(ks_energy(*ctx, ks, density, potential) - direct);
     if (ctx->comm().rank() == 0) {
         std::cout << (external ? "external XC " : "LibXC ") << (exact ? "exact" : "Davidson") << " PAW=" << paw
                   << " SCF converged=" << converged << " direct-energy difference=" << error << '\n';
     }
     return failures + (!converged || !std::isfinite(error) || error > 1e-7);
+}
+
+int
+test_external_forces(bool paw, int mag)
+{
+    auto calculate = [&](double displacement, bool get_force) {
+        std::array<double, 3> direction{0.7, -0.4, 0.2};
+        auto setup = [&](Simulation_context& ctx) {
+            std::array<double, 3> lengths{8, 9, 10};
+            ctx.unit_cell().atom(0).set_position({0.2 + displacement * direction[0] / lengths[0],
+                                                  0.3 + displacement * direction[1] / lengths[1],
+                                                  0.4 + displacement * direction[2] / lengths[2]});
+            ctx.unit_cell().add_atom("He", {0.48, 0.51, 0.59});
+            auto q = std::make_shared<xc_point_set_t>(ctx);
+            // Atom-following blocks sample the full cell. Unoccupied point ranks
+            // and k-point ranks must still participate in the geometry pullback.
+            if (ctx.comm().rank() == 0) {
+                for (int ia = 0; ia < 2; ia++) {
+                    auto r = ctx.unit_cell().atom(ia).position();
+                    q->block_centres.push_back({lengths[0] * r[0], lengths[1] * r[1], lengths[2] * r[2]});
+                    q->block_sizes.push_back(64);
+                    for (int z = 0; z < 4; z++) {
+                        for (int y = 0; y < 4; y++) {
+                            for (int x = 0; x < 4; x++) {
+                                q->coordinates.push_back({lengths[0] * (r[0] + 0.037 + x / 4.0),
+                                                          lengths[1] * (r[1] + 0.029 + y / 4.0),
+                                                          lengths[2] * (r[2] + 0.041 + z / 4.0)});
+                                q->energy_weights.push_back(720.0 / 128);
+                                q->descriptor_weights.push_back(720.0 / 128);
+                            }
+                        }
+                    }
+                }
+            }
+            ctx.cb().external_xc_points_   = q;
+            ctx.cb().external_xc_geometry_ = test_functional;
+            ctx.cb().external_xc_pullback_ = [](auto const& c, auto const& points, auto const& d, auto& result) {
+                int offset{0};
+                for (size_t ia = 0; ia < points.block_sizes.size(); ia++) {
+                    for (int x = 0; x < 3; x++) {
+                        result.atoms[ia][x] += d.block_centres[ia][x];
+                        for (int i = 0; i < points.block_sizes[ia]; i++) {
+                            result.atoms[ia][x] += d.coordinates[offset + i][x];
+                        }
+                    }
+                    offset += points.block_sizes[ia];
+                }
+                for (auto& r : result.atoms) {
+                    c.comm().allreduce(r.data(), 3);
+                }
+            };
+        };
+        auto ctx = test_context(false, mag, true, true, false, true, mag ? 0.6 : 0, paw, false, "gaussian", 0, setup);
+        K_point_set ks(*ctx);
+        ks.add_kpoint({0.07, 0.03, 0.02}, 0.4);
+        ks.add_kpoint({-0.06, 0.02, -0.04}, 0.6);
+        ks.initialize();
+        DFT_ground_state gs(ks);
+        gs.initial_state();
+        auto result = gs.find(1e-11, 1e-12, 1e-11, 150, false);
+        if (!result.at("converged").get<bool>()) {
+            RTE_THROW("force finite-difference SCF did not converge");
+        }
+        double derivative{0};
+        if (get_force) {
+            auto e        = gs.total_energy();
+            auto const& f = gs.forces().calc_forces_total();
+            for (int x = 0; x < 3; x++) {
+                derivative -= f(x, 0) * direction[x];
+                if (!std::isfinite(f(x, 0)) || std::abs(f(x, 0) + f(x, 1)) > 2e-7) {
+                    RTE_THROW("external XC forces violate translation invariance");
+                }
+            }
+            if (e != gs.total_energy()) {
+                RTE_THROW("force calculation changed the ground-state energy");
+            }
+            ctx->cb().external_xc_geometry_ = nullptr;
+            bool rejected{false};
+            try {
+                gs.forces().calc_forces_total();
+            } catch (std::exception const&) {
+                rejected = true;
+            }
+            if (!rejected) {
+                RTE_THROW("forces accepted an incomplete external XC geometry registration");
+            }
+        }
+        // With fractional occupations the variational force differentiates E-TS.
+        return std::array<double, 2>{free_energy(*ctx, ks, gs.density(), gs.potential()), derivative};
+    };
+    auto centre = calculate(0, true);
+    int failures{0};
+    for (double h : {2e-4, 1e-4}) {
+        double fd    = (calculate(h, false)[0] - calculate(-h, false)[0]) / (2 * h);
+        double error = std::abs(fd - centre[1]);
+        if (mpi::Communicator::world().rank() == 0) {
+            std::cout << "External XC total force PAW=" << paw << " spin=" << mag << " h=" << h
+                      << " derivative=" << centre[1] << " FD=" << fd << " error=" << error << '\n';
+        }
+        failures += !std::isfinite(error) || error > 2e-6;
+    }
+    return failures;
 }
 
 int
@@ -858,6 +963,12 @@ main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
+    if (argc == 2 && std::string(argv[1]) == "forces") {
+        result += call_test("external PW forces", test_external_forces, false, 0);
+        result += call_test("external PAW forces", test_external_forces, true, 1);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
     for (int mag : {0, 1}) {
         for (auto smearing : {"gaussian", "fermi_dirac", "cold", "methfessel_paxton"}) {
             for (double electrons : {1.0, 7.0}) {
@@ -873,8 +984,8 @@ main(int argc, char** argv)
             if (mpi::Communicator::world().size() > 1) {
                 result += call_test("external XC distributed FFT", test_external_xc, gamma, mag, true, false, false);
                 if (!gamma && mag == 1) {
-                    result += call_test("point geometry with distributed FFT", test_external_xc, gamma, mag, true,
-                                        true, false);
+                    result += call_test("point geometry with distributed FFT", test_external_xc, gamma, mag, true, true,
+                                        false);
                 }
                 result += call_test("external PAW XC distributed FFT", test_external_xc, gamma, mag, true, true, true);
             }
@@ -888,6 +999,8 @@ main(int argc, char** argv)
     for (bool exact : {false, true}) {
         result += call_test("PAW SCF energy accounting", test_external_scf, exact, true, true);
     }
+    result += call_test("external PW forces", test_external_forces, false, 0);
+    result += call_test("external PAW forces", test_external_forces, true, 1);
     for (double moment : {2.0, -2.0, 1.2}) {
         result += call_test("fixed-spin occupations", test_fixed_spin_occupancy, moment);
     }

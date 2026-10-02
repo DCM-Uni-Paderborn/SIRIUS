@@ -2975,8 +2975,9 @@ sirius_set_xc_point_geometry_callbacks:
     normalization. SIRIUS adds explicit atom-local and Fourier cell responses.
     Callbacks are collective, including empty ranks. Outputs start at zero.
     Set status nonzero on failure without unwinding across the C ABI.
-    Both null pointers disable geometry evaluation. Geometry callbacks do not
-    by themselves enable total forces or stress.
+    Both null pointers disable geometry evaluation. For PW and PAW, these callbacks
+    supply the explicit XC contribution to atomic forces. FP-LAPW forces and stress
+    require additional basis and geometry responses.
   arguments:
     handler:
       type: ctx_handler
@@ -3008,8 +3009,8 @@ sirius_get_xc_geometry_derivatives:
   doc: >-
     Evaluate explicit XC atom and cell energy derivatives for the current fields.
     Requires point geometry callbacks. Electronic coefficients, physical radial
-    fields and point-domain membership are fixed. The host still supplies orbital,
-    basis, projector and MT-boundary responses for complete forces and stress.
+    fields and point-domain membership are fixed. Complete forces and stress also
+    require orbital, basis, projector and MT-boundary responses as appropriate.
     Outputs are globally summed on every rank. No force sign or volume factor is
     applied. Cell columns vary at fixed Cartesian atoms.
   arguments:

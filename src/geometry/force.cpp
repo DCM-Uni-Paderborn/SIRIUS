@@ -196,11 +196,21 @@ Force::calc_forces_total()
 mdarray<double, 2> const&
 Force::calc_forces_total(bool add_scf_corr)
 {
+    xc_geometry_derivatives_t xc_geometry(ctx_.unit_cell().num_atoms());
     if (ctx_.cb().external_xc_) {
-        RTE_THROW("external XC geometry derivatives are not connected to forces yet");
+        if (ctx_.full_potential()) {
+            RTE_THROW("external LAPW XC basis and boundary derivatives are not connected to forces yet");
+        }
+        xc_geometry = potential_.external_xc_geometry(density_);
     }
-    if (ctx_.meta_gga()) {
+    if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
         RTE_THROW("meta-GGA geometry derivatives are not connected to forces yet");
+    }
+    forces_xc_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
+    for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
+        for (int x = 0; x < 3; x++) {
+            forces_xc_(x, ia) = -xc_geometry.atoms[ia][x];
+        }
     }
     forces_total_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
 
@@ -236,6 +246,8 @@ Force::calc_forces_total(bool add_scf_corr)
                 if (add_scf_corr) {
                     forces_total_(x, ia) += forces_scf_corr_(x, ia);
                 }
+                // Projector response is already in the nonlocal force through D_ij.
+                forces_total_(x, ia) += forces_xc_(x, ia);
             }
         }
     }
@@ -435,6 +447,10 @@ Force::calc_forces_us()
     forces_us_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
     forces_us_.zero();
 
+    if (ctx_.cb().external_xc_) {
+        potential_.xc_potential().rg().fft_transform(-1);
+    }
+
     //potential_.fft_transform(-1);
 
     auto const& unit_cell = ctx_.unit_cell();
@@ -489,9 +505,15 @@ Force::calc_forces_us()
                          * but in formula we have   i * G * exp[-iGRn] Veff*(G)
                          * the differences because we unfold complex array in the real one
                          * and need negative imagine part due to a multiplication law of complex numbers */
+                        auto v = potential_.component(ispin).rg().f_pw_local(igloc);
+                        if (ctx_.cb().external_xc_) {
+                            // Reconstructed XC excludes the Fourier Q augmentation,
+                            // just as in the corresponding PAW nonlocal operator.
+                            v -= ispin == 0 ? potential_.xc_potential().rg().f_pw_local(igloc)
+                                            : potential_.effective_magnetic_field(ispin - 1).rg().f_pw_local(igloc);
+                        }
                         auto z = std::complex<double>(0, -gvc[ivec]) *
-                                 ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) *
-                                 potential_.component(ispin).rg().f_pw_local(igloc);
+                                 ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) * v;
                         v_tmp(ia, 2 * igloc)     = z.real();
                         v_tmp(ia, 2 * igloc + 1) = z.imag();
                     }
@@ -582,12 +604,17 @@ Force::calc_forces_core()
 {
     PROFILE("sirius::Force::calc_forces_core");
 
+    forces_core_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
+    forces_core_.zero();
+    // External PAW XC includes the AE core in its atom-local geometry derivative,
+    // not a pseudo-core density in the smooth XC field. NC NLCC is rejected.
+    if (ctx_.cb().external_xc_) {
+        return forces_core_;
+    }
+
     auto q = ctx_.gvec().shells_len();
     /* get form-factors for all G shells */
     auto ff = ctx_.ri().ps_core_->values(q, ctx_.comm());
-
-    forces_core_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
-    forces_core_.zero();
 
     /* get main arrays */
     auto& xc_pot = potential_.xc_potential();
@@ -969,6 +996,10 @@ Force::print_info(std::ostream& out__, int verbosity__)
             print_forces("contribution from local potential", forces_vloc());
 
             print_forces("contribution from core density", forces_core());
+
+            if (ctx_.cb().external_xc_) {
+                print_forces("explicit contribution from external XC", forces_xc_);
+            }
 
             print_forces("Ewald forces from ions", forces_ewald());
 
