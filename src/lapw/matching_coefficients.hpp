@@ -17,6 +17,7 @@
 #include <gsl/gsl_sf_bessel.h>
 #include "unit_cell/unit_cell.hpp"
 #include "core/fft/gvec.hpp"
+#include "core/sht/sht.hpp"
 
 namespace sirius {
 
@@ -80,7 +81,9 @@ class Matching_coefficients // TODO: compute on GPU
     template <int N, bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
     inline void
     generate(int ngk, std::vector<std::complex<double>> const& phase_factors__, int iat, int l, int lm, int nu,
-             r3::matrix<double> const& A, T* alm) const
+             r3::matrix<double> const& A, T* alm, mdarray<std::complex<double>, 3> const* db__ = nullptr,
+             mdarray<std::complex<double>, 2> const* dylm__ = nullptr,
+             std::vector<double> const* dphase__            = nullptr) const
     {
         std::complex<double> zt;
 
@@ -100,7 +103,16 @@ class Matching_coefficients // TODO: compute on GPU
                     break;
                 }
             }
-            if (conjugate) {
+            if (db__) {
+                std::complex<double> dzt{0};
+                for (int j = 0; j < N; j++) {
+                    dzt += (*db__)(j, igk, l) * A(nu, j);
+                }
+                auto derivative = phase_factors__[igk] * ((dzt + std::complex<double>(0, (*dphase__)[igk]) * zt) *
+                                                                  std::conj(gkvec_ylm_(igk, lm)) +
+                                                          zt * std::conj((*dylm__)(igk, lm)));
+                alm[igk]        = conjugate ? std::conj(derivative) : derivative;
+            } else if (conjugate) {
                 alm[igk] = std::conj(phase_factors__[igk] * zt) * gkvec_ylm_(igk, lm);
             } else {
                 alm[igk] = phase_factors__[igk] * zt * std::conj(gkvec_ylm_(igk, lm));
@@ -250,10 +262,22 @@ class Matching_coefficients // TODO: compute on GPU
         generate_impl<conjugate>(atom__, alm__, &sd);
     }
 
+    /// Cartesian atom displacement and strain dA A^-1 at fixed radial functions and MT radius.
+    /// Atom displacements are independent of strain, not implicitly affine.
+    template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
+    void
+    generate_geometry_response(Atom const& atom__, r3::vector<double> const& displacement__,
+                               r3::matrix<double> const& strain__, mdarray<T, 2>& alm__) const
+    {
+        generate_impl<conjugate>(atom__, alm__, nullptr, &displacement__, &strain__);
+    }
+
   private:
     template <bool conjugate, typename T>
     void
-    generate_impl(Atom const& atom__, mdarray<T, 2>& alm__, mdarray<double, 2> const* response__) const
+    generate_impl(Atom const& atom__, mdarray<T, 2>& alm__, mdarray<double, 2> const* response__,
+                  r3::vector<double> const* displacement__ = nullptr,
+                  r3::matrix<double> const* strain__       = nullptr) const
     {
         auto& type = atom__.type();
 
@@ -340,6 +364,61 @@ class Matching_coefficients // TODO: compute on GPU
             Al[l] = A;
         }
 
+        mdarray<std::complex<double>, 3> db;
+        mdarray<std::complex<double>, 2> dylm;
+        std::vector<double> dphase;
+        if (strain__) {
+            int lmax = type.lmax_apw(), lmmax = sf::lmmax(lmax);
+            db   = mdarray<std::complex<double>, 3>({3, gkvec_.count(), lmax + 1});
+            dylm = mdarray<std::complex<double>, 2>({gkvec_.count(), lmmax});
+            db.zero();
+            dylm.zero();
+            dphase.resize(gkvec_.count());
+            double trace  = (*strain__)(0, 0) + (*strain__)(1, 1) + (*strain__)(2, 2);
+            auto position = unit_cell_.get_cartesian_coordinates(atom__.position());
+            double R      = type.mt_radius();
+            std::vector<double> bessel(lmax + 3), drlm(lmmax);
+            std::vector<std::complex<double>> dy(lmmax);
+            mdarray<double, 2> grad_rlm({lmmax, 3});
+            for (int igk = 0; igk < gkvec_.count(); igk++) {
+                auto q        = gkvec_.gkvec_cart(gvec_index_t::local(igk));
+                auto dq       = dot(transpose(*strain__), q) * -1.0;
+                dphase[igk]   = dot(q, *displacement__) + dot(dq, position);
+                double length = gkvec_len_[igk];
+                if (length > 1e-12) {
+                    double dlength = dot(q, dq) / length;
+                    gsl_sf_bessel_jl_array(lmax + 2, R * length, bessel.data());
+                    sf::dRlm_dr(lmax, q, grad_rlm);
+                    for (int lm = 0; lm < lmmax; lm++) {
+                        drlm[lm] = 0;
+                        for (int x = 0; x < 3; x++) {
+                            drlm[lm] += grad_rlm(lm, x) * dq[x];
+                        }
+                    }
+                    // convert transforms expansion coefficients, so conjugate to obtain Ylm values.
+                    SHT::convert(lmax, drlm.data(), dy.data());
+                    for (int lm = 0; lm < lmmax; lm++) {
+                        dylm(igk, lm) = std::conj(dy[lm]);
+                    }
+                    for (int l = 0; l <= lmax; l++) {
+                        double jp     = l / (R * length) * bessel[l] - bessel[l + 1];
+                        double j1p    = (l + 1) / (R * length) * bessel[l + 1] - bessel[l + 2];
+                        auto scale    = std::pow(std::complex<double>(0, 1), l) *
+                                        (fourpi / std::sqrt(unit_cell_.omega())) * dlength;
+                        db(0, igk, l) = scale * R * jp;
+                        db(1, igk, l) = scale * (-bessel[l + 1] - length * R * j1p + l * jp);
+                        db(2, igk, l) = scale * (2 * bessel[l + 1] / R + 2 * length * j1p - 2 * length * bessel[l] +
+                                                 ((l - 1) * l / R - length * length * R) * jp);
+                    }
+                }
+                for (int l = 0; l <= lmax; l++) {
+                    for (int j = 0; j < 3; j++) {
+                        db(j, igk, l) -= 0.5 * trace * alm_b_(j, igk, l, iat);
+                    }
+                }
+            }
+        }
+
         for (int xi = 0; xi < type.mt_aw_basis_size(); xi++) {
             int l  = type.indexb(xi).am.l();
             int lm = type.indexb(xi).lm;
@@ -351,17 +430,20 @@ class Matching_coefficients // TODO: compute on GPU
             switch (num_aw) {
                 /* APW */
                 case 1: {
-                    generate<1, conjugate>(gkvec_.count(), phase_factors, iat, l, lm, nu, Al[l], &alm__(0, xi));
+                    generate<1, conjugate>(gkvec_.count(), phase_factors, iat, l, lm, nu, Al[l], &alm__(0, xi),
+                                           strain__ ? &db : nullptr, &dylm, &dphase);
                     break;
                 }
                 /* LAPW */
                 case 2: {
-                    generate<2, conjugate>(gkvec_.count(), phase_factors, iat, l, lm, nu, Al[l], &alm__(0, xi));
+                    generate<2, conjugate>(gkvec_.count(), phase_factors, iat, l, lm, nu, Al[l], &alm__(0, xi),
+                                           strain__ ? &db : nullptr, &dylm, &dphase);
                     break;
                 }
                 /* Super LAPW */
                 case 3: {
-                    generate<3, conjugate>(gkvec_.count(), phase_factors, iat, l, lm, nu, Al[l], &alm__(0, xi));
+                    generate<3, conjugate>(gkvec_.count(), phase_factors, iat, l, lm, nu, Al[l], &alm__(0, xi),
+                                           strain__ ? &db : nullptr, &dylm, &dphase);
                     break;
                 }
                 default: {

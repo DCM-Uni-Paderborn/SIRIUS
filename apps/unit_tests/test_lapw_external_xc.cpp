@@ -1907,63 +1907,222 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         saved_energy = gs.total_energy();
     }
     if (!core && (!second_variation || !mag)) {
-        auto const& forces = gs.forces().calc_forces_ibs();
-        r3::vector<double> direction{0.23, -0.37, 0.19};
-        auto position = ctx->unit_cell().atom(0).position();
-        double analytic{0};
-        for (int x = 0; x < 3; x++) {
-            analytic -= direction[x] * forces(x, 0);
-        }
-        // Hold radial functions, local Hamiltonians, Fourier potentials and orbitals
-        // fixed. Only matching coefficients and the interstitial boundary move.
-        Hamiltonian0<double> h0(potential, false);
-        h0.generate_pw_coefs(potential);
-        auto evaluate = [&](double step) {
-            auto shifted = position;
-            for (int x = 0; x < 3; x++) {
-                shifted[x] += step * direction[x] / ctx->unit_cell().lattice_vector(x)[x];
+        auto lattice   = ctx->unit_cell().lattice_vectors();
+        auto position  = ctx->unit_cell().atom(0).position();
+        auto cartesian = ctx->unit_cell().get_cartesian_coordinates(position);
+        for (int part = 0; part < 3; part++) {
+            r3::vector<double> displacement{0, 0, 0};
+            r3::matrix<double> strain;
+            if (part != 1) {
+                displacement = {0.23, -0.37, 0.19};
             }
-            ctx->unit_cell().atom(0).set_position(shifted);
-            double value{0};
+            if (part != 0) {
+                strain(0, 0) = 0.07;
+                strain(1, 1) = -0.03;
+                strain(2, 2) = 0.02;
+                strain(0, 1) = -0.04;
+                strain(2, 0) = 0.05;
+            }
+            double error{0}, peak{0}, conjugation_error{0};
             for (auto it : ks.spl_num_kpoints()) {
                 auto kp = ks.get<double>(it.i);
-                kp->update();
-                auto hk = h0(*kp);
-                int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
-                la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
-                la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
-                for (int s = 0; s < ctx->num_spins(); s++) {
-                    hk.set_fv_h_o(s, h, o);
-                    // Translate the sphere's Fourier coefficients without rebuilding
-                    // the context, which would discard the frozen radial basis.
-                    for (int j = 0; j < kp->num_gkvec_col(); j++) {
-                        auto qj = kp->gkvec_col().gkvec_cart(gvec_index_t::local(j));
-                        for (int i = 0; i < kp->num_gkvec_row(); i++) {
-                            auto qi    = kp->gkvec_row().gkvec_cart(gvec_index_t::local(i));
-                            auto g     = qi - qj;
-                            auto r     = ctx->unit_cell().get_cartesian_coordinates(position);
-                            auto phase = std::exp(std::complex<double>(0, -dot(g, r)));
-                            auto delta =
-                                    -fourpi / ctx->unit_cell().omega() *
-                                    unit_step_function_form_factors(ctx->unit_cell().atom(0).mt_radius(), g.length()) *
-                                    phase * (std::exp(std::complex<double>(0, -step * dot(g, direction))) - 1.0);
-                            o(i, j) += delta;
-                            h(i, j) += 0.5 * dot(qi, qj) * delta;
+                int ng = kp->gkvec_row().count(), na = ctx->unit_cell().atom(0).type().mt_aw_basis_size();
+                mdarray<std::complex<double>, 2> derivative({ng, na}), conjugate_derivative({ng, na});
+                Matching_coefficients matching(ctx->unit_cell(), kp->gkvec_row());
+                matching.generate_geometry_response<false>(ctx->unit_cell().atom(0), displacement, strain, derivative);
+                matching.generate_geometry_response<true>(ctx->unit_cell().atom(0), displacement, strain,
+                                                          conjugate_derivative);
+                for (size_t i = 0; i < derivative.size(); i++) {
+                    peak = std::max(peak, std::abs(derivative[i]));
+                    conjugation_error =
+                            std::max(conjugation_error, std::abs(conjugate_derivative[i] - std::conj(derivative[i])));
+                }
+                auto evaluate = [&](double step) {
+                    auto shifted_lattice = lattice;
+                    auto dlattice        = dot(strain, lattice);
+                    for (int x = 0; x < 3; x++) {
+                        for (int y = 0; y < 3; y++) {
+                            shifted_lattice(x, y) += step * dlattice(x, y);
                         }
                     }
-                    value += occupied_lapw_lagrangian(*ctx, *kp, s, h, o);
+                    ctx->unit_cell().set_lattice_vectors(shifted_lattice);
+                    ctx->unit_cell().atom(0).set_position(
+                            dot(inverse(shifted_lattice), cartesian + displacement * step));
+                    kp->update();
+                    Matching_coefficients shifted(ctx->unit_cell(), kp->gkvec_row());
+                    mdarray<std::complex<double>, 2> result({ng, na});
+                    shifted.generate<false>(ctx->unit_cell().atom(0), result);
+                    return result;
+                };
+                for (double step : {1e-4, 5e-5}) {
+                    auto plus = evaluate(step), minus = evaluate(-step);
+                    for (size_t i = 0; i < derivative.size(); i++) {
+                        error = std::max(error, std::abs((plus[i] - minus[i]) / (2 * step) - derivative[i]));
+                    }
+                }
+                ctx->unit_cell().set_lattice_vectors(lattice);
+                ctx->unit_cell().atom(0).set_position(position);
+                kp->update();
+            }
+            ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+            ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+            ctx->comm().allreduce<double, mpi::op_t::max>(&conjugation_error, 1);
+            check("LAPW matching atom/cell derivative", error / std::max(1e-12, peak), 3e-8);
+            check("LAPW matching derivative conjugation", conjugation_error, 1e-14);
+            check("nonzero LAPW matching geometry derivative", peak > 1e-7 ? 0 : 1, 0);
+        }
+        auto const& forces = gs.forces().calc_forces_ibs();
+        std::vector<r3::vector<double>> positions, centres;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            positions.push_back(ctx->unit_cell().atom(ia).position());
+            centres.push_back(ctx->unit_cell().get_cartesian_coordinates(positions.back()));
+        }
+        Hamiltonian0<double> h0(potential, false);
+        h0.generate_pw_coefs(potential);
+        for (int part = 0; part < 3; part++) {
+            xc_geometry_direction_t direction(ctx->unit_cell().num_atoms());
+            if (part != 1) {
+                direction.atoms[0] = {0.23, -0.37, 0.19};
+            }
+            r3::matrix<double> strain;
+            if (part != 0) {
+                strain(0, 0) = 0.07;
+                strain(1, 1) = -0.03;
+                strain(2, 2) = 0.02;
+                strain(0, 1) = -0.04;
+                strain(2, 0) = 0.05;
+            }
+            auto dlattice = dot(strain, lattice);
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    direction.lattice[x + 3 * y] = dlattice(x, y);
                 }
             }
-            ctx->comm().allreduce(&value, 1);
-            return value;
-        };
-        for (double step : {1e-3, 5e-4}) {
-            double fd = (evaluate(step) - evaluate(-step)) / (2 * step);
-            check("LAPW basis/boundary force", std::abs(fd - analytic), 2e-8);
-            check("relative basis/boundary force error", std::abs((fd - analytic) / analytic), 2e-5);
+            int rejected_failures{0};
+            // Frozen radial basis, local matrices, Fourier covectors and independent PW/LO coefficients.
+            auto snapshot = [&](double step, bool response) {
+                if (!response) {
+                    auto shifted = lattice;
+                    for (int x = 0; x < 3; x++) {
+                        for (int y = 0; y < 3; y++) {
+                            shifted(x, y) += step * dlattice(x, y);
+                        }
+                    }
+                    ctx->unit_cell().set_lattice_vectors(shifted);
+                    for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                        r3::vector<double> dr{direction.atoms[ia][0], direction.atoms[ia][1], direction.atoms[ia][2]};
+                        ctx->unit_cell().atom(ia).set_position(dot(inverse(shifted), centres[ia] + dr * step));
+                    }
+                }
+                std::pair<double, std::array<std::vector<std::complex<double>>, 2>> result;
+                for (auto it : ks.spl_num_kpoints()) {
+                    auto kp = ks.get<double>(it.i);
+                    if (!response) {
+                        kp->update();
+                    }
+                    auto hk = h0(*kp);
+                    int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                    la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                    la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                    for (int s = 0; s < ctx->num_spins(); s++) {
+                        if (response) {
+                            hk.set_fv_h_o_geometry_response(s, direction, h, o);
+                        } else {
+                            hk.set_fv_h_o(s, h, o);
+                            // Reconstruct the moved interstitial mask without resetting the radial basis.
+                            for (int j = 0; j < kp->num_gkvec_col(); j++) {
+                                auto qj = kp->gkvec_col().gkvec_cart(gvec_index_t::local(j));
+                                for (int i = 0; i < kp->num_gkvec_row(); i++) {
+                                    auto qi = kp->gkvec_row().gkvec_cart(gvec_index_t::local(i));
+                                    auto g  = qi - qj;
+                                    int ig  = ctx->gvec().index_g12(kp->gkvec_row().gvec(gvec_index_t::local(i)),
+                                                                    kp->gkvec_col().gvec(gvec_index_t::local(j)));
+                                    std::complex<double> theta = ig == 0 ? 1 : 0;
+                                    for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                                        auto const& atom = ctx->unit_cell().atom(ia);
+                                        auto r           = ctx->unit_cell().get_cartesian_coordinates(atom.position());
+                                        theta -= fourpi / ctx->unit_cell().omega() *
+                                                 unit_step_function_form_factors(atom.mt_radius(), g.length()) *
+                                                 std::exp(std::complex<double>(0, -dot(g, r)));
+                                    }
+                                    auto delta = theta - ctx->theta_pw(ig);
+                                    o(i, j) += delta;
+                                    h(i, j) += 0.5 * dot(qi, qj) * delta;
+                                }
+                            }
+                        }
+                        for (int j = 0; j < h.num_cols_local(); j++) {
+                            for (int i = 0; i < h.num_rows_local(); i++) {
+                                result.second[0].push_back(h(i, j));
+                                result.second[1].push_back(o(i, j));
+                            }
+                        }
+                        result.first += occupied_lapw_lagrangian(*ctx, *kp, s, h, o);
+                    }
+                    if (response && part == 0 && !mag && !second_variation) {
+                        auto reject_input = [&](auto&& operation) {
+                            bool rejected{false};
+                            try {
+                                operation();
+                            } catch (std::exception const&) {
+                                rejected = true;
+                            }
+                            rejected_failures += !rejected;
+                        };
+                        auto bad = direction;
+                        if (kp->comm().rank() == 0) {
+                            bad.atoms.clear();
+                        }
+                        reject_input([&] { hk.set_fv_h_o_geometry_response(0, bad, h, o); });
+                        bad = direction;
+                        if (kp->comm().rank() == 0) {
+                            bad.lattice[0] = std::numeric_limits<double>::quiet_NaN();
+                        }
+                        reject_input([&] { hk.set_fv_h_o_geometry_response(0, bad, h, o); });
+                        reject_input([&] { hk.set_fv_h_o_geometry_response(0, direction, h, h); });
+                        if (kp->comm().size() > 1) {
+                            bad = direction;
+                            if (kp->comm().rank() == 0) {
+                                bad.atoms[0][0] += 0.01;
+                            }
+                            reject_input([&] { hk.set_fv_h_o_geometry_response(0, bad, h, o); });
+                        }
+                    }
+                }
+                ctx->comm().allreduce(&result.first, 1);
+                return result;
+            };
+            auto analytic = snapshot(0, true);
+            for (double step : {1e-4, 5e-5}) {
+                auto plus = snapshot(step, false), minus = snapshot(-step, false);
+                for (int field : {0, 1}) {
+                    double error{0}, peak{0};
+                    for (size_t i = 0; i < analytic.second[field].size(); i++) {
+                        double residual = std::abs((plus.second[field][i] - minus.second[field][i]) / (2 * step) -
+                                                   analytic.second[field][i]);
+                        error           = std::isfinite(residual) ? std::max(error, residual)
+                                                                  : std::numeric_limits<double>::infinity();
+                        peak            = std::max(peak, std::abs(analytic.second[field][i]));
+                    }
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                    check("LAPW atom/cell matrix response", error / std::max(1e-12, peak), 3e-7);
+                    check("nonzero LAPW geometry matrix response", peak > 1e-7 ? 0 : 1, 0);
+                }
+                check("LAPW geometry Lagrangian derivative",
+                      std::abs((plus.first - minus.first) / (2 * step) - analytic.first), 2e-8);
+            }
+            snapshot(0, false);
+            if (part == 0) {
+                double force{0};
+                for (int x = 0; x < 3; x++) {
+                    force -= direction.atoms[0][x] * forces(x, 0);
+                }
+                check("LAPW basis/boundary force", std::abs(analytic.first - force), 2e-8);
+                check("nonzero basis/boundary force", std::abs(force) > 1e-7 ? 0 : 1, 0);
+                check("invalid geometry matrix inputs rejected collectively", rejected_failures, 0);
+            }
         }
-        evaluate(0);
-        check("nonzero basis/boundary force", std::abs(analytic) > 1e-7 ? 0 : 1, 0);
         verify_restored();
     }
     if (!second_variation || !mag) {

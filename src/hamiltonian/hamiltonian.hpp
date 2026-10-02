@@ -32,6 +32,7 @@ class Unit_cell;
 class K_point_set;
 struct radial_basis_response_t;
 struct lapw_xc_field_adjoint_t;
+struct xc_geometry_direction_t;
 template <typename T>
 class Periodic_function;
 
@@ -624,6 +625,14 @@ class Hamiltonian_k
     set_fv_h_o_radial_response(int ispn__, std::vector<radial_basis_response_t> const& response__,
                                std::vector<lapw_atom_basis_response_t> const& atoms__,
                                la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Basis, interstitial boundary and kinetic-metric contribution to the PW/LO geometry response.
+    /** Radial functions, MT radii, local matrices and potential Fourier covectors stay fixed.
+     *  Physical-field derivatives are separate. Collective on the k-point communicator.
+     */
+    void
+    set_fv_h_o_geometry_response(int ispn__, xc_geometry_direction_t const& direction__,
+                                 la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
 
     /// Hartree/XC field contribution to the complete PW/LO dH, at fixed basis and geometry.
     /// Collective on the k-point communicator. The overlap has no field contribution.

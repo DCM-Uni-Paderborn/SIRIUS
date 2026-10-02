@@ -38,6 +38,38 @@ struct step_function_t
     mdarray<std::complex<double>, 1> pw;
 };
 
+/// Fourier derivative of the interstitial mask at fixed MT radii.
+/// Cartesian atom directions are independent of the strain dA A^-1.
+inline mdarray<std::complex<double>, 1>
+step_function_geometry_response(Unit_cell const& uc__, fft::Gvec const& gv__, mdarray<double, 2> const& atoms__,
+                                r3::matrix<double> const& strain__)
+{
+    mdarray<std::complex<double>, 1> result({gv__.num_gvec()});
+    result.zero();
+    double trace = strain__(0, 0) + strain__(1, 1) + strain__(2, 2);
+    for (int ig = 0; ig < gv__.num_gvec(); ig++) {
+        auto g        = gv__.gvec_cart(gvec_index_t::global(ig));
+        auto dg       = dot(transpose(strain__), g) * -1.0;
+        double length = g.length(), dlength = length > 1e-12 ? dot(g, dg) / length : 0;
+        for (int ia = 0; ia < uc__.num_atoms(); ia++) {
+            auto const& atom = uc__.atom(ia);
+            auto r           = uc__.get_cartesian_coordinates(atom.position());
+            r3::vector<double> dr{atoms__(0, ia), atoms__(1, ia), atoms__(2, ia)};
+            double R = atom.mt_radius(), z = R * length;
+            double f = unit_step_function_form_factors(R, length), df;
+            if (std::abs(z) < 1e-3) {
+                df = std::pow(R, 4) * z * (-1.0 / 15 + z * z * (1.0 / 210 - z * z / 7560)) * dlength;
+            } else {
+                df = (R * R * std::sin(z) / (length * length) - 3 * f / length) * dlength;
+            }
+            double phase = dot(g, dr) + dot(dg, r);
+            result[ig] -= fourpi / uc__.omega() * std::exp(std::complex<double>(0, -dot(g, r))) *
+                          (df - (trace + std::complex<double>(0, phase)) * f);
+        }
+    }
+    return result;
+}
+
 /// Unit step function is defined to be 1 in the interstitial and 0 inside muffin-tins.
 /** Unit step function is constructed from it's plane-wave expansion coefficients which are computed
  *  analytically:
