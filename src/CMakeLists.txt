@@ -37,6 +37,7 @@ set(_SOURCES
   "density/occupation_matrix.cpp"
   "dft/dft_ground_state.cpp"
   "dft/check_lapw_xc_derivative.cpp"
+  "dft/lapw_response.cpp"
   "dft/energy.cpp"
   "dft/smearing.cpp"
   "beta_projectors/beta_projectors_base.cpp"

@@ -132,6 +132,29 @@ Potential::lapw_radial_potential_response(Density const& density__, Density cons
 {
     auto derivatives = lapw_external_xc_response(density__, density_response__);
     auto hartree     = hartree_response(density_response__.rho());
+    lapw_radial_potential_response(*hartree, derivatives, scalar__, xc__);
+}
+
+void
+Potential::lapw_radial_potential_response(Periodic_function<double> const& hartree__,
+                                          lapw_xc_field_adjoint_t const& derivatives__,
+                                          std::vector<std::vector<double>>& scalar__,
+                                          std::vector<std::array<std::vector<double>, 2>>& xc__) const
+{
+    int invalid =
+            &hartree__.ctx() != &ctx_ || !ctx_.full_potential() || derivatives__.core.size() != unit_cell_.num_atoms();
+    if (!invalid) {
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            for (auto const& field : derivatives__.core[ia]) {
+                invalid |= field.size() != unit_cell_.atom(ia).type().num_mt_points() ||
+                           !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); });
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW radial potential response requires matching Hartree fields and finite core covectors");
+    }
     std::vector<std::vector<double>> spherical(unit_cell_.num_atom_symmetry_classes());
     for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
         auto const& cls = unit_cell_.atom_symmetry_class(ic);
@@ -140,12 +163,17 @@ Potential::lapw_radial_potential_response(Density const& density__, Density cons
         spherical[ic].resize(nr);
         if (ctx_.comm().rank() == owner) {
             for (int ir = 0; ir < nr; ir++) {
-                spherical[ic][ir] = y00 * hartree->mt()[ia](0, ir);
+                spherical[ic][ir] = y00 * hartree__.mt()[ia](0, ir);
+                invalid |= !std::isfinite(spherical[ic][ir]);
             }
         }
         ctx_.comm().bcast(spherical[ic].data(), nr, owner);
     }
-    xc__     = project_core_xc_derivatives(derivatives);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("nonfinite LAPW spherical Hartree response");
+    }
+    xc__     = project_core_xc_derivatives(derivatives__);
     scalar__ = std::move(spherical);
 }
 

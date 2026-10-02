@@ -344,6 +344,13 @@ class Potential : public Field4D
                                    std::vector<std::vector<double>>& scalar__,
                                    std::vector<std::array<std::vector<double>, 2>>& xc__) const;
 
+    /// Reuse already computed Hartree/XC directions in the coupled LAPW response.
+    void
+    lapw_radial_potential_response(Periodic_function<double> const& hartree__,
+                                   lapw_xc_field_adjoint_t const& derivatives__,
+                                   std::vector<std::vector<double>>& scalar__,
+                                   std::vector<std::array<std::vector<double>, 2>>& xc__) const;
+
     /// Explicit XC geometry response at fixed electronic coefficients and radial fields.
     /** Includes model coordinates and host quadrature. Basis/projector, MT-boundary
      *  and orbital-normalization responses must still be supplied by force/stress assembly.

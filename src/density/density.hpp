@@ -335,6 +335,10 @@ class Density : public Field4D
     void
     generate_pseudo_core_fields();
 
+    std::unique_ptr<Density>
+    lapw_density_matrix_fields_impl(K_point_set& ks__, std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                    std::vector<radial_basis_response_t> const* radial__) const;
+
   public:
     /// External XC enables tau automatically; it can also be requested for orbital-field diagnostics.
     Density(Simulation_context& ctx__, bool kinetic_density__ = false);
@@ -509,6 +513,16 @@ class Density : public Field4D
     std::unique_ptr<Density>
     lapw_density_matrix_fields(K_point_set& ks__,
                                std::vector<mdarray<std::complex<double>, 3>> const& matrices__) const;
+
+    /// Radial/matching and core contribution at fixed independent PW/LO density matrices.
+    /** Returns only the field-map derivative, not the unperturbed fields. Geometry,
+     *  radial grids and coefficient matrices remain fixed. Matrix layout follows
+     *  lapw_density_matrix_fields; radial directions use atom-class order.
+     */
+    std::unique_ptr<Density>
+    lapw_density_matrix_radial_response(K_point_set& ks__,
+                                        std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                        std::vector<radial_basis_response_t> const& radial__) const;
 
     /// PAW partial-wave valence tau from the current projector density matrix.
     /** Element 0 contains AE fields and element 1 pseudo fields, with the same

@@ -84,6 +84,7 @@ set_tests_properties(test_paw_xc_correction_h_setup PROPERTIES
 
 set_tests_properties(test_kinetic_density test_spheric_kinetic_density test_spheric_interpolation test_smooth_periodic_sampling test_paw_xc_correction test_lapw_xc_field_map test_lapw_external_xc test_core_kinetic_density test_external_xc PROPERTIES
   TIMEOUT 60 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+set_tests_properties(test_lapw_external_xc PROPERTIES TIMEOUT 120)
 add_test(NAME test_lapw_external_xc_core COMMAND test_lapw_external_xc core)
 set_tests_properties(test_lapw_external_xc_core PROPERTIES
   TIMEOUT 240 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
@@ -105,6 +106,7 @@ if(MPIEXEC_EXECUTABLE)
     set_tests_properties(${name}_mpi PROPERTIES
       TIMEOUT 60 PROCESSORS 2 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
   endforeach()
+  set_tests_properties(test_lapw_external_xc_mpi PROPERTIES TIMEOUT 120)
 endif()
 
 if(SIRIUS_CREATE_FORTRAN_BINDINGS)

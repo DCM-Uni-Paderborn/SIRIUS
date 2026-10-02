@@ -6,6 +6,7 @@
 #include <sirius.hpp>
 #include <testing.hpp>
 #include "dft/dft_ground_state.hpp"
+#include "dft/lapw_response.hpp"
 #include "hamiltonian/diagonalize.hpp"
 #include "hamiltonian/diagonalize_fp.hpp"
 #include "dft/smearing.hpp"
@@ -945,6 +946,197 @@ test_lapw_density_response(int mag, bool distributed)
 }
 
 int
+test_lapw_coupled_response(int mag, bool distributed)
+{
+    auto ctx = context(mag, distributed, false, false, false, 0, 5.0, false, 0, "fermi_dirac");
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
+    ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
+    ks.initialize();
+    DFT_ground_state gs(ks);
+    gs.initial_state();
+    int failures{0}, ns = ctx->num_spins();
+    auto check = [&](char const* name, double error, double tolerance) {
+        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+        if (ctx->comm().rank() == 0) {
+            std::cout << "coupled LAPW spins=" << ns << " distributed FFT=" << distributed << " " << name << ": "
+                      << error << '\n';
+        }
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    auto reject = [&](char const* name, auto&& operation) {
+        bool rejected{false};
+        try {
+            operation();
+        } catch (std::exception const&) {
+            rejected = true;
+        }
+        check(name, rejected ? 0 : 1, 0);
+    };
+    auto prepare = [&](Density& d) {
+        for (int s = 0; s < ns; s++) {
+            for (auto* f : {&d.component(s), &d.kinetic_density().component(s)}) {
+                f->rg().fft_transform(-1);
+                f->mt().sync(ctx->unit_cell().spl_num_atoms());
+            }
+        }
+    };
+    auto values = [&](Density const& d) {
+        std::vector<double> result;
+        for (int s = 0; s < ns; s++) {
+            for (auto const* f : {&d.component(s), &d.kinetic_density().component(s)}) {
+                auto v = potential_samples(*f);
+                result.insert(result.end(), v.begin(), v.end());
+            }
+        }
+        return result;
+    };
+    Density direction(*ctx), zero(*ctx);
+    copy(gs.density(), direction);
+    for (int s = 0; s < ns; s++) {
+        direction.component(s) *= 0.3 * (s + 1);
+        direction.kinetic_density().component(s) *= -0.2 * (s + 1);
+    }
+    prepare(direction);
+    zero.zero();
+    zero.kinetic_density().zero();
+    // Differentiate one production SCF map, not a manufactured Hamiltonian.
+    // Complete eigenvectors are used only for scratch density matrices; stored orbitals stay fixed.
+    auto sample = [&](double step) {
+        Density input(*ctx);
+        copy(gs.density(), input);
+        for (int s = 0; s < ns; s++) {
+            axpy(step, direction.component(s), input.component(s));
+            axpy(step, direction.kinetic_density().component(s), input.kinetic_density().component(s));
+        }
+        prepare(input);
+        Potential potential(*ctx);
+        potential.generate(input, false, true);
+        Hamiltonian0<double> h0(potential, true);
+        h0.generate_pw_coefs(potential);
+        std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra;
+        using matrix_t = la::dmatrix<std::complex<double>>;
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& kp = *ks.get<double>(it.i);
+            auto hk  = h0(kp);
+            int n = kp.gklo_basis_size(), bs = ctx->cyclic_block_size();
+            matrix_t h(n, n, ctx->blacs_grid(), bs, bs), s(n, n, ctx->blacs_grid(), bs, bs);
+            spectra.emplace_back();
+            for (int spin = 0; spin < ns; spin++) {
+                hk.set_fv_h_o(spin, h, s);
+                spectra.back()[spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
+                for (int b = 0; b < ctx->num_bands(); b++) {
+                    kp.band_energy(b, spin, spectra.back()[spin]->energies()[b]);
+                }
+            }
+        }
+        ks.sync_band<double, sync_band_t::energy>();
+        ks.find_band_occupancies<double>();
+        std::vector<mdarray<std::complex<double>, 3>> matrices;
+        size_t ik{0};
+        for (auto it : ks.spl_num_kpoints()) {
+            auto const& kp = *ks.get<double>(it.i);
+            int n          = kp.gklo_basis_size();
+            matrices.emplace_back(std::array<index_range, 3>{n, n, ns});
+            for (int spin = 0; spin < ns; spin++) {
+                std::vector<double> f(n, 0);
+                for (int b = 0; b < ctx->num_bands(); b++) {
+                    f[b] = kp.band_occupancy(b, spin);
+                }
+                auto p = spectra[ik][spin]->density_matrix(f);
+                std::copy_n(p.at(memory_t::host), p.size(), matrices.back().at(memory_t::host) + spin * p.size());
+            }
+            ik++;
+        }
+        auto result = gs.density().lapw_density_matrix_fields(ks, matrices);
+        gs.potential().update_atomic_potential();
+        ctx->unit_cell().generate_radial_functions(ctx->out());
+        ctx->unit_cell().generate_radial_integrals();
+        return result;
+    };
+    sample(0);
+    auto before = values(gs.density());
+    LAPW_response response(ks, gs.density(), gs.potential());
+    auto jx       = response.apply(direction);
+    auto analytic = values(*jx);
+    double peak{0};
+    for (auto v : analytic) {
+        peak = std::max(peak, std::abs(v));
+    }
+    ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+    check("nonzero coupled response", peak > 1e-8 ? 0 : 1, 0);
+    for (double step : {1e-3, 5e-4}) {
+        auto plus = values(*sample(step)), minus = values(*sample(-step));
+        check("complete SCF map rho/tau finite difference", potential_response_error(analytic, plus, minus, step),
+              3e-5);
+    }
+    sample(0);
+    double zero_error{0};
+    for (auto v : values(*response.apply(zero))) {
+        zero_error = std::max(zero_error, std::abs(v));
+    }
+    check("zero coupled response", zero_error, 1e-13);
+    auto zero_solution = response.solve(zero, 1e-8, 1);
+    check("zero right-hand side converges without mixing", zero_solution.residual, 0);
+    Density rhs(*ctx);
+    copy(direction, rhs);
+    for (int s = 0; s < ns; s++) {
+        axpy(-1.0, jx->component(s), rhs.component(s));
+        axpy(-1.0, jx->kinetic_density().component(s), rhs.kinetic_density().component(s));
+    }
+    prepare(rhs);
+    auto frozen = [&] {
+        auto result    = values(gs.density());
+        auto potential = potential_samples(gs.potential().effective_potential());
+        result.insert(result.end(), potential.begin(), potential.end());
+        for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto const& cls = ctx->unit_cell().atom_symmetry_class(ic);
+            for (int i = 0; i < cls.atom_type().mt_radial_basis_size(); i++) {
+                for (int ir = 0; ir < cls.atom_type().num_mt_points(); ir++) {
+                    result.push_back(cls.radial_function(ir, i));
+                    result.push_back(cls.radial_function_derivative(ir, i));
+                }
+            }
+        }
+        return result;
+    };
+    auto frozen_before = frozen();
+    auto solution      = response.solve(rhs, 1e-8, 100, 10, 0.4);
+    check("coupled solve residual", solution.residual, 1e-8);
+    auto obtained = values(*solution.fields), expected = values(direction);
+    double error{0};
+    for (size_t i = 0; i < obtained.size(); i++) {
+        error = std::max(error, std::abs(obtained[i] - expected[i]));
+    }
+    check("coupled solve recovers prescribed fields", error, 2e-8);
+    if (ctx->comm().rank() == 0) {
+        std::cout << "coupled LAPW solve iterations: " << solution.iterations << '\n';
+    }
+    reject("one iteration does not claim convergence", [&] { response.solve(rhs, 1e-8, 1); });
+    reject("invalid response controls rejected collectively",
+           [&] { response.solve(rhs, ctx->comm().rank() == 0 ? -1 : 1e-8, 10); });
+    double saved_tau = rhs.kinetic_density().scalar().rg().value(0);
+    if (ctx->comm().rank() == 0) {
+        rhs.kinetic_density().scalar().rg().value(0) = std::numeric_limits<double>::quiet_NaN();
+    }
+    reject("nonfinite kinetic-density direction rejected collectively", [&] { response.apply(rhs); });
+    rhs.kinetic_density().scalar().rg().value(0) = saved_tau;
+    auto after                                   = values(gs.density());
+    error                                        = 0;
+    for (size_t i = 0; i < before.size(); i++) {
+        error = std::max(error, std::abs(before[i] - after[i]));
+    }
+    check("ground-state fields remain unchanged", error, 0);
+    auto frozen_after = frozen();
+    error             = 0;
+    for (size_t i = 0; i < frozen_before.size(); i++) {
+        error = std::max(error, std::abs(frozen_before[i] - frozen_after[i]));
+    }
+    check("response solve preserves reference potential and radial functions", error, 0);
+    return failures;
+}
+
+int
 test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool core = false)
 {
     bool simple = !mag && second_variation && !core;
@@ -1640,7 +1832,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         }
         auto occupation_response =
                 density.lapw_orbital_fields_response(ks, orbital_directions, {}, occupation_directions);
-        std::vector<mdarray<std::complex<double>, 3>> coefficient_matrices;
+        std::vector<mdarray<std::complex<double>, 3>> coefficient_matrices, frozen_matrices;
         std::vector<std::unique_ptr<wf::Wave_functions<double>>> matched_directions;
         std::vector<wf::Wave_functions<double>*> matched_ptrs;
         size_t matrix_k{0};
@@ -1652,6 +1844,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             auto& kp = *ks.get<double>(it.i);
             int n = kp.gklo_basis_size(), npw = kp.gkvec().num_gvec();
             coefficient_matrices.emplace_back(std::array<index_range, 3>{n, n, ctx->num_spins()});
+            frozen_matrices.emplace_back(std::array<index_range, 3>{n, n, ctx->num_spins()});
+            frozen_matrices.back().zero();
             auto& p = coefficient_matrices.back();
             p.zero();
             wf::Wave_functions<double> evec(kp.gkvec_sptr(), nlo, wf::num_mag_dims(0), wf::num_bands(ctx->num_bands()),
@@ -1678,6 +1872,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                         for (int i = 0; i < n; i++) {
                             p(i, j, s) += f * (dc[i] * std::conj(c[j]) + c[i] * std::conj(dc[j])) +
                                           df * c[i] * std::conj(c[j]);
+                            frozen_matrices.back()(i, j, s) += f * c[i] * std::conj(c[j]);
                         }
                     }
                     for (int ig = 0; ig < kp.gkvec().count(); ig++) {
@@ -1890,14 +2085,25 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             if (!mag && !second_variation && part == 0) {
                 check("invalid radial matrix inputs rejected collectively", rejected_matrix_failures, 0);
             }
-            auto field_response = density.lapw_radial_fields_response(ks, radial_response);
-            auto combined       = density.lapw_orbital_fields_response(ks, orbital_directions, radial_response);
+            auto field_response     = density.lapw_radial_fields_response(ks, radial_response);
+            auto combined           = density.lapw_orbital_fields_response(ks, orbital_directions, radial_response);
+            auto coefficient_radial = density.lapw_density_matrix_radial_response(ks, frozen_matrices, radial_response);
             double combined_error{0};
             for (int p : {0, 1}) {
-                auto const& field = p == 0 ? static_cast<Field4D const&>(*combined) : combined->kinetic_density();
+                auto const& field  = p == 0 ? static_cast<Field4D const&>(*combined) : combined->kinetic_density();
+                auto const& mapped = p == 0 ? static_cast<Field4D const&>(*coefficient_radial)
+                                            : coefficient_radial->kinetic_density();
+                double coefficient_error{0}, coefficient_peak{0};
+                auto compare = [&](double a, double b) {
+                    coefficient_error = std::isfinite(a) && std::isfinite(b)
+                                                ? std::max(coefficient_error, std::abs(a - b))
+                                                : std::numeric_limits<double>::infinity();
+                    coefficient_peak  = std::max(coefficient_peak, std::abs(b));
+                };
                 for (int s = 0; s < ctx->num_spins(); s++) {
                     for (int ig = 0; ig < ctx->gvec().count(); ig++) {
                         combined_error = std::max(combined_error, std::abs(field.component(s).rg().f_pw_local(ig)));
+                        compare(std::abs(mapped.component(s).rg().f_pw_local(ig)), 0);
                     }
                 }
                 for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
@@ -1905,12 +2111,18 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                         double up      = field_response[ia][p][0][i];
                         double dn      = mag ? field_response[ia][p][1][i] : 0;
                         combined_error = std::max(combined_error, std::abs(field.scalar().mt()[ia][i] - (up + dn)));
+                        compare(mapped.scalar().mt()[ia][i], field.scalar().mt()[ia][i]);
                         if (mag) {
                             combined_error =
                                     std::max(combined_error, std::abs(field.vector(0).mt()[ia][i] - (up - dn)));
+                            compare(mapped.vector(0).mt()[ia][i], field.vector(0).mt()[ia][i]);
                         }
                     }
                 }
+                ctx->comm().allreduce<double, mpi::op_t::max>(&coefficient_error, 1);
+                ctx->comm().allreduce<double, mpi::op_t::max>(&coefficient_peak, 1);
+                check(p == 0 ? "PW/LO density matrix radial rho response" : "PW/LO density matrix radial tau response",
+                      coefficient_error / std::max(1e-12, coefficient_peak), 1e-12);
             }
             check("combined orbital/radial fields response", combined_error, 1e-13);
             auto hartree_response = radial_hartree_response(*ctx, potential, field_response);
@@ -2365,6 +2577,16 @@ main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
+    if (argc > 1 && std::string(argv[1]) == "coupled-response") {
+        for (int mag : {0, 1}) {
+            result += call_test("coupled LAPW response", test_lapw_coupled_response, mag, false);
+            if (mpi::Communicator::world().size() > 1) {
+                result += call_test("distributed coupled LAPW response", test_lapw_coupled_response, mag, true);
+            }
+        }
+        sirius::finalize();
+        return std::min(result, 1);
+    }
     if (argc > 1 && std::string(argv[1]) == "density-response") {
         for (int mag : {0, 1}) {
             result += call_test("constrained LAPW density response", test_lapw_density_response, mag, false);
@@ -2416,8 +2638,10 @@ main(int argc, char** argv)
     result += call_test("external LAPW linearisation response", test_lapw_linearization_response);
     result += call_test("replicated LAPW eigenvector redistribution", test_replicated_eigenvector_remap);
     for (int mag : {0, 1}) {
+        result += call_test("coupled LAPW response", test_lapw_coupled_response, mag, false);
         result += call_test("constrained LAPW density response", test_lapw_density_response, mag, false);
         if (mpi::Communicator::world().size() > 1) {
+            result += call_test("distributed coupled LAPW response", test_lapw_coupled_response, mag, true);
             result += call_test("distributed LAPW density response", test_lapw_density_response, mag, true);
         }
         result += call_test("weighted k-point occupation response", test_occupation_response, mag, false, false);
