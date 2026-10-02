@@ -1234,6 +1234,121 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             check("Hartree response matches production Poisson derivative",
                   potential_response_error(samples, plus, sample(-step), step), 2e-8);
         }
+        xc_geometry_direction_t geometry(ctx->unit_cell().num_atoms());
+        peak = 0;
+        for (auto x : potential_samples(*potential.hartree_geometry_response(direction, geometry))) {
+            peak = std::max(peak, std::abs(x));
+        }
+        check("zero Hartree geometry response", peak, 0);
+        // A separate context updates Poisson caches without resetting the reference radial basis.
+        auto probe = context(mag, distributed_fft, second_variation, core, false, 0, 5.0, simple);
+        Periodic_function<double> frozen(*probe, [&](int) { return lmax_t(probe->lmax_rho()); });
+        copy(direction, frozen);
+        Potential probe_potential(*probe);
+        auto lattice = ctx->unit_cell().lattice_vectors();
+        std::vector<r3::vector<double>> centres;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            centres.push_back(ctx->unit_cell().get_cartesian_coordinates(ctx->unit_cell().atom(ia).position()));
+        }
+        auto quadrature = probe->cb().external_xc_points_;
+        for (int part = 0; part < 3; part++) {
+            geometry = xc_geometry_direction_t(ctx->unit_cell().num_atoms());
+            if (part != 1) {
+                geometry.atoms[0] = {0.23, -0.37, 0.19};
+            }
+            r3::matrix<double> strain;
+            if (part != 0) {
+                strain(0, 0) = 0.07;
+                strain(1, 1) = -0.03;
+                strain(2, 2) = 0.02;
+                strain(0, 1) = -0.04;
+                strain(2, 0) = 0.05;
+            }
+            auto dlattice = dot(strain, lattice);
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    geometry.lattice[x + 3 * y] = dlattice(x, y);
+                }
+            }
+            auto evaluate = [&](double step, bool nuclei) {
+                auto shifted = lattice;
+                for (int y = 0; y < 3; y++) {
+                    for (int x = 0; x < 3; x++) {
+                        shifted(x, y) += step * dlattice(x, y);
+                    }
+                }
+                probe->unit_cell().set_lattice_vectors(shifted);
+                for (int ia = 0; ia < probe->unit_cell().num_atoms(); ia++) {
+                    auto const& d = geometry.atoms[ia];
+                    probe->unit_cell().atom(ia).set_position(
+                            dot(inverse(shifted), centres[ia] + r3::vector<double>{d[0], d[1], d[2]} * step));
+                }
+                probe->update();
+                auto next                       = std::make_shared<xc_point_set_t>(*probe);
+                next->coordinates               = quadrature->coordinates;
+                next->energy_weights            = quadrature->energy_weights;
+                next->descriptor_weights        = quadrature->descriptor_weights;
+                next->block_sizes               = quadrature->block_sizes;
+                next->block_centres             = quadrature->block_centres;
+                probe->cb().external_xc_points_ = next;
+                probe_potential.update();
+                if (nuclei) {
+                    probe_potential.poisson(frozen);
+                    return potential_samples(probe_potential.hartree_potential());
+                }
+                return potential_samples(*probe_potential.hartree_response(frozen));
+            };
+            for (bool nuclei : {false, true}) {
+                auto analytic = potential_samples(*potential.hartree_geometry_response(direction, geometry, nuclei));
+                // Larger fourth-order steps avoid nuclear-potential cancellation and pole-angle roundoff.
+                for (double step : {6e-3, 3e-3}) {
+                    auto plus       = evaluate(step, nuclei);
+                    auto minus      = evaluate(-step, nuclei);
+                    auto half_plus  = evaluate(step / 2, nuclei);
+                    auto half_minus = evaluate(-step / 2, nuclei);
+                    double error{0}, peak{0};
+                    for (size_t i = 0; i < analytic.size(); i++) {
+                        double fd = (8 * (half_plus[i] - half_minus[i]) - (plus[i] - minus[i])) / (6 * step);
+                        // Propagate four ulps of each sampled potential through the difference stencil.
+                        double roundoff = 4 * std::numeric_limits<double>::epsilon() *
+                                          (8 * (std::abs(half_plus[i]) + std::abs(half_minus[i])) + std::abs(plus[i]) +
+                                           std::abs(minus[i])) /
+                                          (6 * step);
+                        if (!std::isfinite(fd) || !std::isfinite(analytic[i])) {
+                            error = std::numeric_limits<double>::infinity();
+                        } else {
+                            error = std::max(error, std::abs(fd - analytic[i]) - roundoff);
+                            peak  = std::max(peak, std::abs(analytic[i]));
+                        }
+                    }
+                    check(nuclei ? "Hartree geometry response including nuclei"
+                                 : "electronic Hartree geometry response",
+                          error / std::max(1e-8, peak), 3e-7);
+                }
+            }
+        }
+        auto bad_geometry = geometry;
+        if (ctx->comm().rank() == 0) {
+            bad_geometry.atoms.clear();
+        }
+        reject("Hartree geometry rejects malformed directions collectively",
+               [&] { potential.hartree_geometry_response(direction, bad_geometry); });
+        bad_geometry = geometry;
+        if (ctx->comm().rank() == 0) {
+            bad_geometry.lattice[0] = std::numeric_limits<double>::quiet_NaN();
+        }
+        reject("Hartree geometry rejects nonfinite directions collectively",
+               [&] { potential.hartree_geometry_response(direction, bad_geometry); });
+        if (ctx->comm().size() > 1) {
+            bad_geometry = geometry;
+            if (ctx->comm().rank() == 0) {
+                bad_geometry.atoms[0][0] += 0.01;
+            }
+            reject("Hartree geometry rejects inconsistent replicas",
+                   [&] { potential.hartree_geometry_response(direction, bad_geometry); });
+            reject("Hartree geometry rejects inconsistent nuclear flags",
+                   [&] { potential.hartree_geometry_response(direction, geometry, ctx->comm().rank() == 0); });
+        }
         check("Hartree response preserves potential and energy",
               potential_samples(potential.hartree_potential()) != saved || potential.energy_vha() != saved_energy ? 1
                                                                                                                   : 0,
@@ -1246,6 +1361,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             direction.rg().f_pw_local(0) = std::numeric_limits<double>::quiet_NaN();
         }
         reject("nonfinite Hartree direction rejected collectively", [&] { potential.hartree_response(direction); });
+        reject("nonfinite Hartree geometry density rejected collectively",
+               [&] { potential.hartree_geometry_response(direction, geometry); });
         direction.zero();
         for (auto it : ctx->unit_cell().spl_num_atoms()) {
             if (it.i == 0) {
@@ -1256,6 +1373,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         Periodic_function<double> no_spheres(*ctx);
         no_spheres.zero();
         reject("missing MT Hartree direction rejected collectively", [&] { potential.hartree_response(no_spheres); });
+        reject("missing MT Hartree geometry density rejected collectively",
+               [&] { potential.hartree_geometry_response(no_spheres, geometry); });
     }
     if (!core) {
         Density direction(*ctx), shifted(*ctx);

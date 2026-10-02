@@ -638,6 +638,16 @@ class Potential : public Field4D
     std::unique_ptr<Periodic_function<double>>
     hartree_response(Periodic_function<double> const& density_response__) const;
 
+    /// LAPW Poisson-operator geometry derivative at fixed Fourier and atom-local density coefficients.
+    /** Includes reciprocal metric, moving multipoles and sphere boundary values, with fixed MT radii.
+     *  Atom displacements are Cartesian and independent of lattice-column changes. Directions and the
+     *  nuclear-term flag are context-replicated. Uses CPU fields and preserves potential/energy state.
+     *  Add hartree_response for the separate density variation; the zero-G gauge is unchanged.
+     */
+    std::unique_ptr<Periodic_function<double>>
+    hartree_geometry_response(Periodic_function<double> const& density__, xc_geometry_direction_t const& direction__,
+                              bool include_nuclei__ = true) const;
+
     /// Generate XC potential and energy density
     /** In case of spin-unpolarized GGA the XC potential has the following expression:
      *  \f[

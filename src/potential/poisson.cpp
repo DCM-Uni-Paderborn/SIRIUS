@@ -16,6 +16,43 @@
 #include "lapw/sum_fg_fl_yg.hpp"
 
 namespace sirius {
+namespace {
+
+void
+validate_poisson_density(Simulation_context const& ctx, Periodic_function<double> const& density)
+{
+    int invalid = &density.ctx() != &ctx;
+    if (!invalid) {
+        for (auto z : density.rg().f_pw_local()) {
+            invalid |= !std::isfinite(z.real()) || !std::isfinite(z.imag());
+        }
+        if (ctx.full_potential()) {
+            if (density.mt().atoms().size() != static_cast<size_t>(ctx.unit_cell().num_atoms())) {
+                invalid = 1;
+            } else {
+                for (auto it : ctx.unit_cell().spl_num_atoms()) {
+                    auto const& rho = density.mt()[it.i];
+                    if (rho.angular_domain_size() != ctx.lmmax_rho() ||
+                        rho.size() !=
+                                static_cast<size_t>(ctx.lmmax_rho() * ctx.unit_cell().atom(it.i).num_mt_points())) {
+                        invalid = 1;
+                        continue;
+                    }
+                    invalid |= &rho.radial_grid() != &ctx.unit_cell().atom(it.i).radial_grid();
+                    for (size_t i = 0; i < rho.size(); i++) {
+                        invalid |= !std::isfinite(rho[i]);
+                    }
+                }
+            }
+        }
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("Hartree response requires finite density fields with matching context and MT dimensions");
+    }
+}
+
+} // namespace
 
 void
 Potential::poisson_add_pseudo_pw(mdarray<std::complex<double>, 2> const& qmt__,
@@ -264,40 +301,196 @@ Potential::poisson_solve(Periodic_function<double> const& rho__, Periodic_functi
 std::unique_ptr<Periodic_function<double>>
 Potential::hartree_response(Periodic_function<double> const& density_response__) const
 {
-    int invalid = &density_response__.ctx() != &ctx_;
-    if (!invalid) {
-        for (auto z : density_response__.rg().f_pw_local()) {
-            invalid |= !std::isfinite(z.real()) || !std::isfinite(z.imag());
-        }
-        if (ctx_.full_potential()) {
-            if (density_response__.mt().atoms().size() != static_cast<size_t>(unit_cell_.num_atoms())) {
-                invalid = 1;
-            } else {
-                for (auto it : unit_cell_.spl_num_atoms()) {
-                    auto const& rho = density_response__.mt()[it.i];
-                    if (rho.angular_domain_size() != ctx_.lmmax_rho() ||
-                        rho.size() != static_cast<size_t>(ctx_.lmmax_rho() * unit_cell_.atom(it.i).num_mt_points())) {
-                        invalid = 1;
-                        continue;
-                    }
-                    invalid |= &rho.radial_grid() != &unit_cell_.atom(it.i).radial_grid();
-                    for (size_t i = 0; i < rho.size(); i++) {
-                        invalid |= !std::isfinite(rho[i]);
-                    }
-                }
-            }
-        }
-    }
-    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
-    if (invalid) {
-        RTE_THROW("Hartree response requires finite density fields with matching context and MT dimensions");
-    }
+    validate_poisson_density(ctx_, density_response__);
     auto result = ctx_.full_potential()
                           ? std::make_unique<Periodic_function<double>>(
                                     ctx_, [&](int) { return lmax_t(ctx_.lmax_pot()); }, &unit_cell_.spl_num_atoms())
                           : std::make_unique<Periodic_function<double>>(ctx_);
     result->zero();
     poisson_solve(density_response__, *result, false);
+    return result;
+}
+
+std::unique_ptr<Periodic_function<double>>
+Potential::hartree_geometry_response(Periodic_function<double> const& density__,
+                                     xc_geometry_direction_t const& direction__, bool include_nuclei__) const
+{
+    validate_poisson_density(ctx_, density__);
+    int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU || ctx_.gvec().reduced() ||
+                  direction__.atoms.size() != static_cast<size_t>(unit_cell_.num_atoms());
+    std::vector<double> values(direction__.lattice.begin(), direction__.lattice.end());
+    values.push_back(include_nuclei__ ? 1 : 0);
+    for (auto const& atom : direction__.atoms) {
+        values.insert(values.end(), atom.begin(), atom.end());
+    }
+    for (auto x : values) {
+        invalid |= !std::isfinite(x);
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW Hartree geometry response requires CPU fields and matching finite geometry directions");
+    }
+    auto root = values;
+    ctx_.comm().bcast(root.data(), root.size(), 0);
+    invalid = root != values;
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("Hartree geometry directions and nuclear flags must agree across the context communicator");
+    }
+    r3::matrix<double> dlattice;
+    for (int y = 0; y < 3; y++) {
+        for (int x = 0; x < 3; x++) {
+            dlattice(x, y) = direction__.lattice[x + 3 * y];
+        }
+    }
+    auto strain  = dot(dlattice, unit_cell_.inverse_lattice_vectors());
+    double trace = strain(0, 0) + strain(1, 1) + strain(2, 2);
+    int lmax = std::max(ctx_.lmax_rho(), ctx_.lmax_pot()), ng = ctx_.gvec().count();
+    matrix<std::complex<double>> dy({sf::lmmax(lmax), ng});
+    mdarray<double, 3> dmom({ctx_.lmax_rho() + 1, ng, unit_cell_.num_atom_types()});
+    mdarray<double, 3> dbessel({sbessel_mt_.size(0), ng, unit_cell_.num_atom_types()});
+    dy.zero();
+    dmom.zero();
+    dbessel.zero();
+    std::vector<r3::vector<double>> dg(ng);
+    std::vector<double> dlength(ng), drlm(sf::lmmax(lmax));
+    std::vector<std::complex<double>> derivative(sf::lmmax(lmax));
+    mdarray<double, 2> gradient({sf::lmmax(lmax), 3});
+    for (int ig = ctx_.gvec().skip_g0(); ig < ng; ig++) {
+        auto g        = ctx_.gvec().gvec_cart(gvec_index_t::local(ig));
+        double length = g.length();
+        dg[ig]        = dot(transpose(strain), g) * -1.0;
+        dlength[ig]   = dot(g, dg[ig]) / length;
+        sf::dRlm_dr(lmax, g, gradient);
+        for (int lm = 0; lm < sf::lmmax(lmax); lm++) {
+            drlm[lm] = 0;
+            for (int x = 0; x < 3; x++) {
+                drlm[lm] += gradient(lm, x) * dg[ig][x];
+            }
+        }
+        SHT::convert(lmax, drlm.data(), derivative.data());
+        for (int lm = 0; lm < sf::lmmax(lmax); lm++) {
+            dy(lm, ig) = std::conj(derivative[lm]);
+        }
+        for (int iat = 0; iat < unit_cell_.num_atom_types(); iat++) {
+            double R = unit_cell_.atom_type(iat).mt_radius();
+            for (int l = 0; l < dbessel.size(0); l++) {
+                double derivative =
+                        l == 0 ? -R * sbessel_mt_(1, ig, iat)
+                               : R * sbessel_mt_(l - 1, ig, iat) - (l + 1) / length * sbessel_mt_(l, ig, iat);
+                dbessel(l, ig, iat) = derivative * dlength[ig];
+            }
+            for (int l = 0; l <= ctx_.lmax_rho(); l++) {
+                dmom(l, ig, iat) = std::pow(R, l + 2) / length *
+                                   (dbessel(l + 1, ig, iat) - sbessel_mt_(l + 1, ig, iat) * dlength[ig] / length);
+            }
+        }
+    }
+    // Differentiate the radial factor, spherical harmonic and atom phase together.
+    auto multipole_response = [&](int cutoff, std::complex<double> const* fpw, auto const& fl, auto const& dfl) {
+        mdarray<std::complex<double>, 2> result({sf::lmmax(cutoff), unit_cell_.num_atoms()});
+        result.zero();
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            auto const& atom = unit_cell_.atom(ia);
+            auto r           = unit_cell_.get_cartesian_coordinates(atom.position());
+            auto const& d    = direction__.atoms[ia];
+            r3::vector<double> dr{d[0], d[1], d[2]};
+            for (int ig = 0; ig < ng; ig++) {
+                auto g     = ctx_.gvec().gvec_cart(gvec_index_t::local(ig));
+                auto phase = std::exp(std::complex<double>(0, dot(g, r)));
+                std::complex<double> dp(0, dot(dg[ig], r) + dot(g, dr));
+                for (int l = 0, lm = 0; l <= cutoff; l++) {
+                    auto scale = fourpi * zil_[l] * fpw[ig] * phase;
+                    for (int m = -l; m <= l; m++, lm++) {
+                        result(lm, ia) += scale * (dfl(l, ig, atom.type_id()) * std::conj(gvec_ylm_(lm, ig)) +
+                                                   fl(l, ig, atom.type_id()) *
+                                                           (std::conj(dy(lm, ig)) + dp * std::conj(gvec_ylm_(lm, ig))));
+                    }
+                }
+            }
+        }
+        ctx_.comm().allreduce(result.at(memory_t::host), result.size());
+        return result;
+    };
+    auto make_potential = [&] {
+        return std::make_unique<Periodic_function<double>>(
+                ctx_, [&](int) { return lmax_t(ctx_.lmax_pot()); }, &unit_cell_.spl_num_atoms());
+    };
+    auto base = make_potential(), result = make_potential();
+    base->zero();
+    result->zero();
+    // True atom-local multipoles stay fixed; the removed interstitial multipoles move.
+    auto qmt  = poisson_vmt(density__.mt(), base->mt(), include_nuclei__);
+    auto qit  = sum_fg_fl_yg(ctx_, ctx_.lmax_rho(), density__.rg().f_pw_local().at(memory_t::host), sbessel_mom_,
+                             gvec_ylm_);
+    auto dqit = multipole_response(ctx_.lmax_rho(), density__.rg().f_pw_local().at(memory_t::host), sbessel_mom_, dmom);
+    auto const& rho = density__.rg().f_pw_local();
+    std::vector<std::complex<double>> modified(rho.begin(), rho.end()), delta(ng);
+    poisson_add_pseudo_pw(qmt, qit, modified.data());
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        auto const& atom = unit_cell_.atom(ia);
+        int iat          = atom.type_id();
+        double R = atom.mt_radius(), scale = fourpi / unit_cell_.omega();
+        auto r        = unit_cell_.get_cartesian_coordinates(atom.position());
+        auto const& d = direction__.atoms[ia];
+        r3::vector<double> dr{d[0], d[1], d[2]};
+        for (int ig = 0; ig < ng; ig++) {
+            auto g        = ctx_.gvec().gvec_cart(gvec_index_t::local(ig));
+            double length = g.length();
+            if (length == 0) {
+                delta[ig] += scale * y00 * (-dqit(0, ia) - trace * (qmt(0, ia) - qit(0, ia)));
+                continue;
+            }
+            auto phase = std::exp(std::complex<double>(0, -dot(g, r)));
+            std::complex<double> dp(0, -dot(dg[ig], r) - dot(g, dr));
+            double power = std::pow(2.0 / (length * R), pseudo_density_order_ + 1);
+            for (int l = 0, lm = 0; l <= ctx_.lmax_rho(); l++) {
+                int order = l + pseudo_density_order_ + 1;
+                double b  = sbessel_mt_(order, ig, iat);
+                double db = dbessel(order, ig, iat) - b * (trace + (pseudo_density_order_ + 1) * dlength[ig] / length);
+                auto factor = scale * std::conj(zil_[l]) * gamma_factors_R_(l, iat) * power * phase;
+                for (int m = -l; m <= l; m++, lm++) {
+                    auto q = qmt(lm, ia) - qit(lm, ia), y = gvec_ylm_(lm, ig);
+                    delta[ig] += factor * (db * y * q + b * (dy(lm, ig) * q + y * (-dqit(lm, ia) + dp * q)));
+                }
+            }
+        }
+    }
+    double Rcut = 0.5 * std::cbrt(unit_cell_.omega());
+    for (int ig = ctx_.gvec().skip_g0(); ig < ng; ig++) {
+        double length = ctx_.gvec().gvec_len(gvec_index_t::local(ig));
+        double kernel = ctx_.molecule() ? 1 - std::cos(length * Rcut) : 1;
+        double dk     = ctx_.molecule() ? std::sin(length * Rcut) * Rcut * (dlength[ig] + length * trace / 3) : 0;
+        auto v        = fourpi * modified[ig] / (length * length);
+        base->rg().f_pw_local(ig) = kernel * v;
+        result->rg().f_pw_local(ig) =
+                fourpi * kernel * delta[ig] / (length * length) + (dk - 2 * kernel * dlength[ig] / length) * v;
+    }
+    auto boundary =
+            sum_fg_fl_yg(ctx_, ctx_.lmax_pot(), result->rg().f_pw_local().at(memory_t::host), sbessel_mt_, gvec_ylm_);
+    auto moved_boundary =
+            multipole_response(ctx_.lmax_pot(), base->rg().f_pw_local().at(memory_t::host), sbessel_mt_, dbessel);
+    for (auto it : unit_cell_.spl_num_atoms()) {
+        auto const& atom = unit_cell_.atom(it.i);
+        std::vector<double> vlm(ctx_.lmmax_pot());
+        for (int lm = 0; lm < ctx_.lmmax_pot(); lm++) {
+            boundary(lm, it.i) += moved_boundary(lm, it.i);
+        }
+        SHT::convert(ctx_.lmax_pot(), &boundary(0, it.i), vlm.data());
+        for (int lm = 0; lm < ctx_.lmmax_pot(); lm++) {
+            for (int ir = 0; ir < atom.num_mt_points(); ir++) {
+                result->mt()[it.i](lm, ir) = vlm[lm] * std::pow(atom.radial_grid(ir) / atom.mt_radius(), l_by_lm_[lm]);
+            }
+        }
+    }
+    if (ctx_.cfg().parameters().veff_pw_cutoff() > 0) {
+        for (int ig = 0; ig < ng; ig++) {
+            if (ctx_.gvec().gvec_len(gvec_index_t::local(ig)) > ctx_.cfg().parameters().veff_pw_cutoff()) {
+                result->rg().f_pw_local(ig) = 0;
+            }
+        }
+    }
+    result->rg().fft_transform(1);
     return result;
 }
 
