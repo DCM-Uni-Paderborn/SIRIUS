@@ -52,36 +52,46 @@ test_kinetic_density(bool gamma__)
     T weight                = occupation / volume;
     double const dv         = volume / (n * n * n);
     int nr                  = transform.local_slice_size();
-    std::vector<T> tau(nr, 0), potential(nr);
+    std::vector<T> tau(nr, 0), potential(nr), response(nr, 0);
     op.add_density(weight, phi.data(), tau.data());
+    op.add_density_response(weight, phi.data(), direction.data(), response.data());
 
-    double error{0};
+    double error{0}, response_error{0};
     for (int iz = 0; iz < transform.local_z_length(); iz++) {
         for (int iy = 0; iy < n; iy++) {
             for (int ix = 0; ix < n; ix++) {
                 int ir = ix + n * (iy + n * iz);
                 r3::vector<double> r(double(ix) / n, double(iy) / n, double(iz + transform.local_z_offset()) / n);
-                std::array<std::complex<double>, 3> grad{};
+                std::array<std::complex<double>, 3> grad{}, delta_grad{};
                 for (int ig = 0; ig < gv.num_gvec(); ig++) {
                     auto g     = gv.gvec(gvec_index_t::global(ig));
                     auto q     = dot(reciprocal, g + k);
                     auto c     = static_cast<std::complex<double>>(coefficient(g, 0));
+                    auto d     = static_cast<std::complex<double>>(coefficient(g, 1));
                     auto phase = std::exp(std::complex<double>(0, twopi * dot(g, r)));
                     for (int x = 0; x < 3; x++) {
-                        auto z = std::complex<double>(0, q[x]) * c * phase;
+                        auto z  = std::complex<double>(0, q[x]) * c * phase;
+                        auto dz = std::complex<double>(0, q[x]) * d * phase;
                         grad[x] += gamma__ ? std::complex<double>(2 * z.real(), 0) : z;
+                        delta_grad[x] += gamma__ ? std::complex<double>(2 * dz.real(), 0) : dz;
                     }
                 }
                 double reference{0};
                 for (auto z : grad) {
                     reference += 0.5 * weight * std::norm(z);
                 }
-                error         = std::max(error, std::abs(tau[ir] - reference));
-                potential[ir] = 0.8 + 0.3 * std::cos(twopi * r[0]) - 0.2 * std::sin(twopi * r[2]);
+                double delta_reference{0};
+                for (int x = 0; x < 3; x++) {
+                    delta_reference += weight * std::real(std::conj(grad[x]) * delta_grad[x]);
+                }
+                response_error = std::max(response_error, std::abs(response[ir] - delta_reference));
+                error          = std::max(error, std::abs(tau[ir] - reference));
+                potential[ir]  = 0.8 + 0.3 * std::cos(twopi * r[0]) - 0.2 * std::sin(twopi * r[2]);
             }
         }
     }
     comm.allreduce<double, mpi::op_t::max>(&error, 1);
+    comm.allreduce<double, mpi::op_t::max>(&response_error, 1);
     double const tolerance = std::is_same_v<T, double> ? 2e-11 : 2e-6;
     int failures{0};
     auto check = [&](char const* name, double difference, double threshold) {
@@ -91,6 +101,7 @@ test_kinetic_density(bool gamma__)
         failures += !std::isfinite(difference) || difference > threshold;
     };
     check("analytic tau", error, tolerance);
+    check("analytic tau response", response_error, tolerance);
 
     auto inner_pw = [&](std::vector<std::complex<T>> const& a, std::vector<std::complex<T>> const& b) {
         std::complex<double> value{0};

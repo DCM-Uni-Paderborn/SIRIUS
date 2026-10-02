@@ -483,6 +483,21 @@ class Density : public Field4D
     std::vector<std::array<std::vector<Flm>, 2>>
     lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis_response_t> const& response__) const;
 
+    /// Unsymmetrized physical rho/tau response from matched LAPW orbital directions.
+    /** Directions use the ground-state PW/AW/LO layout, in local k-point order.
+     *  Geometry stays fixed. Optional radial responses add the
+     *  basis/matching and core contributions at fixed independent PW/LO coefficients.
+     *  Orbital directions must already use the unperturbed AW matching transformation.
+     *  Optional occupation directions have shape {num_bands, num_spins}, in local
+     *  k-point order, and include responses of currently unoccupied bands.
+     *  The returned signed fields are linear-response data, not an SCF density;
+     *  neither the input wave functions nor the ground-state fields are changed.
+     */
+    std::unique_ptr<Density>
+    lapw_orbital_fields_response(K_point_set& ks__, std::vector<wf::Wave_functions<double>*> const& directions__,
+                                 std::vector<radial_basis_response_t> const& radial__           = {},
+                                 std::vector<mdarray<double, 2>> const& occupation_directions__ = {}) const;
+
     /// PAW partial-wave valence tau from the current projector density matrix.
     /** Element 0 contains AE fields and element 1 pseudo fields, with the same
      *  spin convention as generate_mt_valence_kinetic_density(). These are local

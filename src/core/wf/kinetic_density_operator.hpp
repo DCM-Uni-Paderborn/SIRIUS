@@ -82,6 +82,28 @@ class Kinetic_density_operator
         }
     }
 
+    /// Accumulate the fixed-occupation tau variation from an orbital direction.
+    void
+    add_density_response(T weight__, std::complex<T> const* phi__, std::complex<T> const* direction__, T* tau__)
+    {
+        std::vector<std::complex<T>> base(fft_.local_slice_size());
+        bool real_fft = fft_.type() == SPFFT_TRANS_R2C;
+        for (int x = 0; x < 3; x++) {
+            gradient(phi__, x);
+            auto ptr = fft_.space_domain_data(SPFFT_PU_HOST);
+            for (int ir = 0; ir < fft_.local_slice_size(); ir++) {
+                base[ir] = real_fft ? std::complex<T>(ptr[ir], 0) : reinterpret_cast<std::complex<T> const*>(ptr)[ir];
+            }
+            gradient(direction__, x);
+            ptr = fft_.space_domain_data(SPFFT_PU_HOST);
+            #pragma omp parallel for schedule(static)
+            for (int ir = 0; ir < fft_.local_slice_size(); ir++) {
+                auto d = real_fft ? std::complex<T>(ptr[ir], 0) : reinterpret_cast<std::complex<T> const*>(ptr)[ir];
+                tau__[ir] += weight__ * std::real(std::conj(base[ir]) * d);
+            }
+        }
+    }
+
     /// Add the generalized-Kohn-Sham contribution of a real v_tau to host PW coefficients.
     /** Input and output coefficient arrays must not overlap. The FFT workspace is overwritten. */
     void

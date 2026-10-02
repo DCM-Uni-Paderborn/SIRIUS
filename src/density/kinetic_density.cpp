@@ -445,6 +445,199 @@ Density::lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis
     return result;
 }
 
+std::unique_ptr<Density>
+Density::lapw_orbital_fields_response(K_point_set& ks__, std::vector<wf::Wave_functions<double>*> const& directions__,
+                                      std::vector<radial_basis_response_t> const& radial__,
+                                      std::vector<mdarray<double, 2>> const& occupation_directions__) const
+{
+    int occupation_response = !occupation_directions__.empty();
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&occupation_response, 1);
+    int invalid = &ks__.ctx() != &ctx_ || !ctx_.full_potential() || !has_kinetic_density() ||
+                  ctx_.processing_unit() != device_t::CPU ||
+                  ctx_.spfft_coarse<double>().processing_unit() != SPFFT_PU_HOST ||
+                  ctx_.cfg().parameters().precision_wf() != "fp64" || ctx_.num_mag_dims() == 3 ||
+                  ctx_.so_correction() || ctx_.valence_relativity() != relativity_t::none ||
+                  directions__.size() != ks__.spl_num_kpoints().local_size() ||
+                  (occupation_response && occupation_directions__.size() != directions__.size());
+    if (!invalid) {
+        size_t ik{0};
+        for (auto it : ks__.spl_num_kpoints()) {
+            auto const& psi = ks__.get<double>(it.i)->spinor_wave_functions();
+            auto const* d   = directions__[ik];
+            if (occupation_response) {
+                auto const& df = occupation_directions__[ik];
+                if (df.size(0) != ctx_.num_bands() || df.size(1) != ctx_.num_spins() || !df.on_host()) {
+                    invalid = 1;
+                } else {
+                    for (size_t i = 0; i < df.size(); i++) {
+                        invalid |= !std::isfinite(df[i]);
+                    }
+                }
+            }
+            ik++;
+            if (!d || &d->gkvec() != &psi.gkvec() || d->num_sc() != psi.num_sc() ||
+                d->num_wf().get() < ctx_.num_bands() || d->num_mt_coeffs() != psi.num_mt_coeffs()) {
+                invalid = 1;
+                continue;
+            }
+            if (psi.ld() == 0) {
+                continue;
+            }
+            for (int s = 0; s < ctx_.num_spins(); s++) {
+                if (!psi.pw_coeffs(wf::spin_index(s)).on_host() || !d->pw_coeffs(wf::spin_index(s)).on_host()) {
+                    invalid = 1;
+                    continue;
+                }
+                for (int b = 0; b < ctx_.num_bands(); b++) {
+                    auto p = psi.at(memory_t::host, 0, wf::spin_index(s), wf::band_index(b));
+                    auto q = d->at(memory_t::host, 0, wf::spin_index(s), wf::band_index(b));
+                    for (int i = 0; i < psi.ld(); i++) {
+                        invalid |= !std::isfinite(p[i].real()) || !std::isfinite(p[i].imag()) ||
+                                   !std::isfinite(q[i].real()) || !std::isfinite(q[i].imag());
+                    }
+                }
+            }
+        }
+    }
+    int radial_min = !radial__.empty(), radial_max = radial_min;
+    ctx_.comm().allreduce<int, mpi::op_t::min>(&radial_min, 1);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&radial_max, 1);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid || radial_min != radial_max) {
+        RTE_THROW("LAPW orbital fields response requires matching finite CPU fp64 orbitals and valid directions");
+    }
+    auto result = std::make_unique<Density>(ctx_);
+    result->zero();
+    result->kinetic_density().zero();
+    int ns = ctx_.num_spins(), nr = ctx_.spfft_coarse<double>().local_slice_size();
+    std::array<std::vector<Smooth_periodic_function<double>>, 2> coarse;
+    for (int part : {0, 1}) {
+        for (int s = 0; s < ns; s++) {
+            coarse[part].emplace_back(ctx_.spfft_coarse<double>(), ctx_.gvec_coarse_fft_sptr());
+        }
+    }
+    std::vector<mdarray<std::complex<double>, 3>> dm;
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        int n = unit_cell_.atom(ia).type().mt_basis_size();
+        dm.emplace_back(std::array<index_range, 3>{n, n, ns});
+        dm.back().zero();
+    }
+    size_t ik{0};
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto& kp       = *ks__.get<double>(it.i);
+        auto& d        = *directions__[ik];
+        auto const* df = occupation_response ? &occupation_directions__[ik] : nullptr;
+        ik++;
+        auto& fft     = kp.spfft_transform();
+        bool real_fft = fft.type() == SPFFT_TRANS_R2C;
+        wf::Kinetic_density_operator<double> kinetic(fft, *kp.gkvec_fft_sptr());
+        std::vector<std::complex<double>> base(nr);
+        std::vector<double> tau(nr);
+        for (int s = 0; s < ns; s++) {
+            int nb = kp.num_occupied_bands(s);
+            if (df) {
+                for (int b = nb; b < ctx_.num_bands(); b++) {
+                    if ((*df)(b, s) != 0) {
+                        nb = b + 1;
+                    }
+                }
+            }
+            if (nb == 0) {
+                continue;
+            }
+            wf::Wave_functions_fft<double> psi(kp.gkvec_fft_sptr(), kp.spinor_wave_functions(), wf::spin_index(s),
+                                               wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+            wf::Wave_functions_fft<double> delta(kp.gkvec_fft_sptr(), d, wf::spin_index(s), wf::band_range(0, nb),
+                                                 wf::shuffle_to::fft_layout);
+            std::fill(tau.begin(), tau.end(), 0);
+            for (int b = 0; b < psi.num_wf_local(); b++) {
+                auto band     = psi.spl_num_wf().global_index(b);
+                double weight = kp.weight() * kp.band_occupancy(band, s) / unit_cell_.omega();
+                double dw     = df ? kp.weight() * (*df)(band, s) / unit_cell_.omega() : 0;
+                auto p        = psi.at(memory_t::host, 0, wf::band_index(b));
+                auto q        = delta.at(memory_t::host, 0, wf::band_index(b));
+                fft.backward(reinterpret_cast<double const*>(p), SPFFT_PU_HOST);
+                auto values = fft.space_domain_data(SPFFT_PU_HOST);
+                for (int ir = 0; ir < nr; ir++) {
+                    base[ir] = real_fft ? std::complex<double>(values[ir], 0)
+                                        : reinterpret_cast<std::complex<double> const*>(values)[ir];
+                }
+                fft.backward(reinterpret_cast<double const*>(q), SPFFT_PU_HOST);
+                values = fft.space_domain_data(SPFFT_PU_HOST);
+                for (int ir = 0; ir < nr; ir++) {
+                    auto value = real_fft ? std::complex<double>(values[ir], 0)
+                                          : reinterpret_cast<std::complex<double> const*>(values)[ir];
+                    coarse[0][s].value(ir) +=
+                            2 * weight * std::real(std::conj(base[ir]) * value) + dw * std::norm(base[ir]);
+                }
+                kinetic.add_density_response(weight, p, q, tau.data());
+                if (dw != 0) {
+                    kinetic.add_density(dw, p, tau.data());
+                }
+            }
+            for (int ir = 0; ir < nr; ir++) {
+                coarse[1][s].value(ir) += tau[ir];
+            }
+            for (int b = 0; b < nb; b++) {
+                double weight = kp.weight() * kp.band_occupancy(b, s) / kp.comm().size();
+                double dw     = df ? kp.weight() * (*df)(b, s) / kp.comm().size() : 0;
+                auto p        = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(b));
+                auto q        = d.gather(wf::spin_index(s), wf::band_index(b));
+                int offset    = kp.gkvec().num_gvec();
+                for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+                    int n = unit_cell_.atom(ia).type().mt_basis_size();
+                    for (int j = 0; j < n; j++) {
+                        for (int i = 0; i < n; i++) {
+                            dm[ia](i, j, s) += weight * (std::conj(q[offset + i]) * p[offset + j] +
+                                                         std::conj(p[offset + i]) * q[offset + j]) +
+                                               dw * std::conj(p[offset + i]) * p[offset + j];
+                        }
+                    }
+                    offset += n;
+                }
+            }
+        }
+    }
+    for (int part : {0, 1}) {
+        auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+        for (int s = 0; s < ns; s++) {
+            auto ptr = nr ? &coarse[part][s].value(0) : nullptr;
+            ctx_.gvec_coarse_fft_sptr()->comm_ortho_fft().allreduce(ptr, nr);
+            coarse[part][s].fft_transform(-1);
+            for (int ig = 0; ig < ctx_.gvec_coarse().count(); ig++) {
+                int fine   = ctx_.gvec().gvec_base_mapping(ig);
+                auto value = coarse[part][s].f_pw_local(ig);
+                target.scalar().rg().f_pw_local(fine) += value;
+                if (ns == 2) {
+                    target.vector(0).rg().f_pw_local(fine) += double(1 - 2 * s) * value;
+                }
+            }
+        }
+        target.fft_transform(1);
+    }
+    auto radial = radial__.empty() ? std::vector<std::array<std::vector<Flm>, 2>>{}
+                                   : lapw_radial_fields_response(ks__, radial__);
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        ctx_.comm().allreduce(dm[ia].at(memory_t::host), dm[ia].size());
+        auto fields = LAPW_xc_atom(unit_cell_.atom(ia), ctx_.lmax_rho()).fields(dm[ia]);
+        for (int part : {0, 1}) {
+            auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+            for (int s = 0; s < ns; s++) {
+                if (!radial.empty()) {
+                    fields[part][s] += radial[ia][part][s];
+                }
+                target.scalar().mt()[ia] += fields[part][s];
+                if (ns == 2) {
+                    for (size_t i = 0; i < fields[part][s].size(); i++) {
+                        target.vector(0).mt()[ia][i] += (1 - 2 * s) * fields[part][s][i];
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
 template <typename T>
 std::vector<Smooth_periodic_function<double>>
 Density::generate_smooth_kinetic_density(K_point_set const& ks__) const

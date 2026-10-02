@@ -252,6 +252,42 @@ DFT_ground_state::check_lapw_xc_derivative(double step__)
             ctx_.comm().allreduce(&derivative, 1);
             return derivative;
         };
+        Density plus_fields(ctx_), minus_fields(ctx_);
+        auto field_error = [&](Density const& response, double h) {
+            double error{0}, peak{0}, relative{0};
+            auto compare = [&](auto r, auto p, auto m) {
+                double e = std::abs(r - (p - m) / (2 * h)), a = std::abs(r);
+                if (!std::isfinite(e) || !std::isfinite(a)) {
+                    error = std::numeric_limits<double>::infinity();
+                } else {
+                    error = std::max(error, e);
+                    peak  = std::max(peak, a);
+                }
+            };
+            for (int part : {0, 1}) {
+                for (int j = 0; j <= ctx_.num_mag_dims(); j++) {
+                    auto const& r = part == 0 ? response.component(j) : response.kinetic_density().component(j);
+                    auto const& p = part == 0 ? plus_fields.component(j) : plus_fields.kinetic_density().component(j);
+                    auto const& m = part == 0 ? minus_fields.component(j) : minus_fields.kinetic_density().component(j);
+                    for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
+                        compare(r.rg().f_pw_local(ig), p.rg().f_pw_local(ig), m.rg().f_pw_local(ig));
+                    }
+                    for (int ir = 0; ir < ctx_.spfft<double>().local_slice_size(); ir++) {
+                        compare(r.rg().value(ir), p.rg().value(ir), m.rg().value(ir));
+                    }
+                    for (auto it : unit_cell_.spl_num_atoms()) {
+                        for (size_t i = 0; i < r.mt()[it.i].size(); i++) {
+                            compare(r.mt()[it.i][i], p.mt()[it.i][i], m.mt()[it.i][i]);
+                        }
+                    }
+                }
+                ctx_.comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                ctx_.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                relative = std::max(relative, error / std::max(1e-12, peak));
+                error = peak = 0;
+            }
+            return relative;
+        };
         for (int direction = 0; direction < 2; direction++) {
             constexpr double offset{0.17};
             auto evaluate = [&](double t) {
@@ -263,6 +299,13 @@ DFT_ground_state::check_lapw_xc_derivative(double step__)
             evaluate(0);
             set_orbitals(direction, offset, true);
             result[direction][0] = expectation();
+            std::vector<Wf*> orbital_directions;
+            for (auto const& d : tangent) {
+                orbital_directions.push_back(d.get());
+            }
+            auto fields             = density_.lapw_orbital_fields_response(kset_, orbital_directions);
+            auto contraction        = potential.lapw_xc_contractions(*fields);
+            double field_derivative = contraction.rho + contraction.magnetic + contraction.tau;
             // Remove only XC, leaving the identical non-XC operator in place.
             lapw_xc_field_adjoint_t zero;
             for (int s = 0; s < ctx_.num_spins(); s++) {
@@ -285,10 +328,20 @@ DFT_ground_state::check_lapw_xc_derivative(double step__)
             }
             potential.set_lapw_xc_derivatives(std::move(zero), 0);
             result[direction][0] -= expectation();
+            if (std::abs(result[direction][0] - field_derivative) >
+                1e-10 * std::max({1.0, std::abs(result[direction][0]), std::abs(field_derivative)})) {
+                RTE_THROW("LAPW orbital density/tau response disagrees with the XC Hamiltonian derivative");
+            }
             for (int j = 1; j <= 2; j++) {
                 double h    = step__ / j;
-                double plus = evaluate(h), minus = evaluate(-h);
+                double plus = evaluate(h);
+                plus_fields.generate<double>(kset_, false, false, true);
+                double minus = evaluate(-h);
+                minus_fields.generate<double>(kset_, false, false, true);
                 result[direction][j] = (plus - minus) / (2 * h);
+                if (field_error(*fields, h) > std::max(5e-9, 2 * h * h)) {
+                    RTE_THROW("LAPW orbital rho/tau response fails finite differences");
+                }
             }
         }
     } catch (...) {

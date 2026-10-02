@@ -999,6 +999,96 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             spherical.push_back(cls.spherical_potential());
             spherical_xc.push_back(cls.spherical_xc_derivatives());
         }
+        std::vector<int> nmt;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            nmt.push_back(ctx->unit_cell().atom(ia).type().mt_basis_size());
+        }
+        std::vector<std::unique_ptr<wf::Wave_functions<double>>> zero_orbitals;
+        std::vector<wf::Wave_functions<double>*> orbital_directions;
+        for (auto it : ks.spl_num_kpoints()) {
+            zero_orbitals.push_back(std::make_unique<wf::Wave_functions<double>>(
+                    ks.get<double>(it.i)->gkvec_sptr(), nmt, wf::num_mag_dims(ctx->num_mag_dims()),
+                    wf::num_bands(ctx->num_bands()), memory_t::host));
+            zero_orbitals.back()->zero(memory_t::host);
+            orbital_directions.push_back(zero_orbitals.back().get());
+        }
+        std::vector<mdarray<double, 2>> occupations, occupation_directions;
+        for (auto it : ks.spl_num_kpoints()) {
+            auto const& kp = *ks.get<double>(it.i);
+            for (auto* values : {&occupations, &occupation_directions}) {
+                values->emplace_back(std::array<index_range, 2>{ctx->num_bands(), ctx->num_spins()});
+            }
+            for (int s = 0; s < ctx->num_spins(); s++) {
+                for (int b = 0; b < ctx->num_bands(); b++) {
+                    occupations.back()(b, s)           = kp.band_occupancy(b, s);
+                    occupation_directions.back()(b, s) = b == ctx->num_bands() - 1
+                                                                 ? 0.031 * (s + 1)
+                                                                 : 0.02 * std::cos(b + s) * kp.band_occupancy(b, s);
+                }
+            }
+        }
+        auto occupation_response =
+                density.lapw_orbital_fields_response(ks, orbital_directions, {}, occupation_directions);
+        auto set_occupations = [&](double step) {
+            size_t ik{0};
+            for (auto it : ks.spl_num_kpoints()) {
+                auto& kp = *ks.get<double>(it.i);
+                for (int s = 0; s < ctx->num_spins(); s++) {
+                    for (int b = 0; b < ctx->num_bands(); b++) {
+                        kp.band_occupancy(b, s, occupations[ik](b, s) + step * occupation_directions[ik](b, s));
+                    }
+                }
+                ik++;
+            }
+        };
+        Density plus(*ctx), minus(*ctx);
+        constexpr double occupation_step{1e-4};
+        try {
+            set_occupations(occupation_step);
+            plus.generate<double>(ks, false, false, true);
+            set_occupations(-occupation_step);
+            minus.generate<double>(ks, false, false, true);
+        } catch (...) {
+            set_occupations(0);
+            throw;
+        }
+        set_occupations(0);
+        double occupation_error{0}, occupation_peak{0}, occupation_relative{0};
+        auto compare_occupation = [&](auto r, auto p, auto m) {
+            double error = std::abs(r - (p - m) / (2 * occupation_step)), peak = std::abs(r);
+            if (!std::isfinite(error) || !std::isfinite(peak)) {
+                occupation_error = std::numeric_limits<double>::infinity();
+            } else {
+                occupation_error = std::max(occupation_error, error);
+                occupation_peak  = std::max(occupation_peak, peak);
+            }
+        };
+        for (int p : {0, 1}) {
+            for (int j = 0; j < ctx->num_spins(); j++) {
+                auto const& r = p == 0 ? occupation_response->component(j)
+                                       : occupation_response->kinetic_density().component(j);
+                auto const& u = p == 0 ? plus.component(j) : plus.kinetic_density().component(j);
+                auto const& v = p == 0 ? minus.component(j) : minus.kinetic_density().component(j);
+                for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+                    compare_occupation(r.rg().f_pw_local(ig), u.rg().f_pw_local(ig), v.rg().f_pw_local(ig));
+                }
+                for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                    compare_occupation(r.rg().value(ir), u.rg().value(ir), v.rg().value(ir));
+                }
+                for (auto it : ctx->unit_cell().spl_num_atoms()) {
+                    for (size_t i = 0; i < r.mt()[it.i].size(); i++) {
+                        compare_occupation(r.mt()[it.i][i], u.mt()[it.i][i], v.mt()[it.i][i]);
+                    }
+                }
+            }
+            ctx->comm().allreduce<double, mpi::op_t::max>(&occupation_error, 1);
+            ctx->comm().allreduce<double, mpi::op_t::max>(&occupation_peak, 1);
+            occupation_relative = std::max(occupation_relative, occupation_error / std::max(1e-12, occupation_peak));
+            check("nonzero occupation response", occupation_peak > 1e-8 ? 0 : 1, 0);
+            occupation_error = occupation_peak = 0;
+        }
+        check("occupation rho/tau response including empty bands", occupation_relative, 1e-8);
+        verify_restored();
         for (int part : core ? std::vector<int>{0, 1, 2, 3} : std::vector<int>{0}) {
             auto radial_direction = spherical;
             std::vector<std::array<std::vector<double>, 2>> xc_direction(spherical.size());
@@ -1028,11 +1118,39 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 radial_response.push_back(ctx->unit_cell().atom_symmetry_class(ic).radial_basis_potential_response(
                         radial_direction[ic], xc_direction[ic]));
             }
-            auto field_response   = density.lapw_radial_fields_response(ks, radial_response);
+            auto field_response = density.lapw_radial_fields_response(ks, radial_response);
+            auto combined       = density.lapw_orbital_fields_response(ks, orbital_directions, radial_response);
+            double combined_error{0};
+            for (int p : {0, 1}) {
+                auto const& field = p == 0 ? static_cast<Field4D const&>(*combined) : combined->kinetic_density();
+                for (int s = 0; s < ctx->num_spins(); s++) {
+                    for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+                        combined_error = std::max(combined_error, std::abs(field.component(s).rg().f_pw_local(ig)));
+                    }
+                }
+                for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                    for (size_t i = 0; i < field.scalar().mt()[ia].size(); i++) {
+                        double up      = field_response[ia][p][0][i];
+                        double dn      = mag ? field_response[ia][p][1][i] : 0;
+                        combined_error = std::max(combined_error, std::abs(field.scalar().mt()[ia][i] - (up + dn)));
+                        if (mag) {
+                            combined_error =
+                                    std::max(combined_error, std::abs(field.vector(0).mt()[ia][i] - (up - dn)));
+                        }
+                    }
+                }
+            }
+            check("combined orbital/radial fields response", combined_error, 1e-13);
             auto hartree_response = radial_hartree_response(*ctx, potential, field_response);
             auto xc_response      = radial_xc_response(*ctx, potential, density, field_response);
             verify_restored();
             if (!mag && !second_variation && part == 0) {
+                auto invalid_orbitals = orbital_directions;
+                if (ctx->comm().rank() == 0 && !invalid_orbitals.empty()) {
+                    invalid_orbitals[0] = nullptr;
+                }
+                reject("invalid orbital direction rejected collectively",
+                       [&] { density.lapw_orbital_fields_response(ks, invalid_orbitals); });
                 std::vector<radial_basis_response_t> zero;
                 for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
                     zero.emplace_back(ctx->unit_cell().atom_symmetry_class(ic).atom_type());
