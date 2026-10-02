@@ -207,12 +207,17 @@ class Potential : public Field4D
 
     /// Compute MT part of the potential and MT multipole moments
     mdarray<std::complex<double>, 2>
-    poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__) const;
+    poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__,
+                Spheric_function_set<double, atom_index_t>& vha_mt__, bool include_nuclei__) const;
+
+    void
+    poisson_solve(Periodic_function<double> const& rho__, Periodic_function<double>& vha__,
+                  bool include_nuclei__) const;
 
     /// Add contribution from the pseudocharge to the plane-wave expansion
     void
-    poisson_add_pseudo_pw(mdarray<std::complex<double>, 2>& qmt__, mdarray<std::complex<double>, 2>& qit__,
-                          std::complex<double>* rho_pw__);
+    poisson_add_pseudo_pw(mdarray<std::complex<double>, 2> const& qmt__, mdarray<std::complex<double>, 2> const& qit__,
+                          std::complex<double>* rho_pw__) const;
 
     /// Generate local part of pseudo potential.
     /** Total local potential is a lattice sum:
@@ -335,7 +340,7 @@ class Potential : public Field4D
     template <bool free_atom, typename T>
     std::vector<T>
     poisson_vmt(Atom const& atom__, Spheric_function<function_domain_t::spectral, T> const& rho_mt__,
-                Spheric_function<function_domain_t::spectral, T>& vha_mt__) const
+                Spheric_function<function_domain_t::spectral, T>& vha_mt__, bool include_nuclei__ = true) const
     {
         const bool use_r_prefact{false};
 
@@ -406,7 +411,7 @@ class Potential : public Field4D
                 }
             }
         }
-        if (!free_atom) {
+        if (!free_atom && include_nuclei__) {
             /* contribution from nuclear potential -z*(1/r - 1/R) */
             for (int ir = 0; ir < nmtp; ir++) {
 #ifdef __VHA_AUX
@@ -418,7 +423,9 @@ class Potential : public Field4D
             }
         }
         /* nuclear multipole moment */
-        qmt[0] -= atom__.zn() * y00;
+        if (include_nuclei__) {
+            qmt[0] -= atom__.zn() * y00;
+        }
 
         return qmt;
     }
@@ -558,6 +565,17 @@ class Potential : public Field4D
      */
     void
     poisson(Periodic_function<double> const& rho);
+
+    /// Hartree potential response to a spin-summed density variation at fixed geometry.
+    /** Uses the production Poisson operator and its zero-G gauge, without nuclear terms.
+     *  The input supplies Fourier coefficients and, for LAPW, physical MT density samples
+     *  on the owning ranks. The result has distributed MT storage and both Fourier and
+     *  real-space grid values. No density, potential, or energy state is changed.
+     *  PAW callers must include the smooth augmentation-charge response in the input
+     *  and handle atom-local PAW corrections separately.
+     */
+    std::unique_ptr<Periodic_function<double>>
+    hartree_response(Periodic_function<double> const& density_response__) const;
 
     /// Generate XC potential and energy density
     /** In case of spin-unpolarized GGA the XC potential has the following expression:

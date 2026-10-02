@@ -440,6 +440,24 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
         }
         failures += !std::isfinite(error) || error > tol;
     };
+    {
+        double saved_energy = potential.energy_vha();
+        auto response       = potential.hartree_response(density.rho());
+        double error{0};
+        for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+            double g      = ctx->gvec().gvec_len(gvec_index_t::local(ig));
+            auto expected = g == 0 ? std::complex<double>{0} : fourpi * density.rho().rg().f_pw_local(ig) / (g * g);
+            error         = std::max(error, std::abs(response->rg().f_pw_local(ig) - expected));
+            error         = std::max(
+                    error, std::abs(response->rg().f_pw_local(ig) - potential.hartree_potential().rg().f_pw_local(ig)));
+        }
+        for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+            error = std::max(error, std::abs(response->rg().value(ir) - potential.hartree_potential().rg().value(ir)));
+        }
+        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+        check("smooth Hartree response and zero-G gauge", error, 2e-13);
+        check("Hartree response preserves energy", std::abs(potential.energy_vha() - saved_energy), 0);
+    }
     if (paw) {
         auto const& coordinates = ctx->cb().external_xc_points_->coordinates;
         int np                  = static_cast<int>(coordinates.size());

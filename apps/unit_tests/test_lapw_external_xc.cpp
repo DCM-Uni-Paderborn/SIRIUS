@@ -208,8 +208,64 @@ occupied_lapw_lagrangian(Simulation_context const& ctx, K_point<double> const& k
 }
 
 std::vector<double>
+potential_samples(Periodic_function<double> const& potential)
+{
+    std::vector<double> result;
+    for (auto z : potential.rg().f_pw_local()) {
+        result.push_back(z.real());
+        result.push_back(z.imag());
+    }
+    for (auto x : potential.rg().values()) {
+        result.push_back(x);
+    }
+    for (auto it : potential.ctx().unit_cell().spl_num_atoms()) {
+        auto const& field = potential.mt()[it.i];
+        for (size_t i = 0; i < field.size(); i++) {
+            result.push_back(field[i]);
+        }
+    }
+    return result;
+}
+
+double
+potential_response_error(std::vector<double> const& response, std::vector<double> const& plus,
+                         std::vector<double> const& minus, double step)
+{
+    double error{0}, peak{0};
+    if (response.size() != plus.size() || response.size() != minus.size()) {
+        return std::numeric_limits<double>::infinity();
+    }
+    for (size_t i = 0; i < response.size(); i++) {
+        double fd = (plus[i] - minus[i]) / (2 * step);
+        if (!std::isfinite(fd) || !std::isfinite(response[i])) {
+            return std::numeric_limits<double>::infinity();
+        }
+        error = std::max(error, std::abs(fd - response[i]));
+        peak  = std::max(peak, std::abs(response[i]));
+    }
+    return error / std::max(1e-8, peak);
+}
+
+std::vector<double>
+radial_hartree_response(Simulation_context const& ctx, Potential const& potential,
+                        std::vector<std::array<std::vector<Flm>, 2>> const& fields)
+{
+    Periodic_function<double> direction(
+            ctx, [&](int) { return lmax_t(ctx.lmax_rho()); }, &ctx.unit_cell().spl_num_atoms());
+    direction.zero();
+    // Fixed PW/LO coefficients give no interstitial response. Sum physical spin densities in each sphere.
+    for (auto it : ctx.unit_cell().spl_num_atoms()) {
+        for (auto const& spin : fields[it.i][0]) {
+            direction.mt()[it.i] += spin;
+        }
+    }
+    return potential_samples(*potential.hartree_response(direction));
+}
+
+std::vector<double>
 sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::vector<double>> const& vs,
-                     std::vector<std::array<std::vector<double>, 2>> const& core_xc)
+                     std::vector<std::array<std::vector<double>, 2>> const& core_xc,
+                     std::vector<double>* hartree = nullptr)
 {
     std::vector<int> nlo;
     for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
@@ -259,6 +315,11 @@ sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::
         Density density(ctx);
         density.generate_core_charge_density(vs, core_xc);
         density.generate<double>(ks, false, true, false);
+        if (hartree) {
+            Potential potential(ctx);
+            // Omit the fixed nuclear potential before subtraction to avoid near-origin cancellation.
+            *hartree = potential_samples(*potential.hartree_response(density.rho()));
+        }
         for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
             for (auto* fields : {static_cast<Field4D*>(&density), &density.kinetic_density()}) {
                 for (int s = 0; s < ctx.num_spins(); s++) {
@@ -339,6 +400,76 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     gs.initial_state();
     auto& density   = gs.density();
     auto& potential = gs.potential();
+    {
+        Periodic_function<double> direction(*ctx, [&](int) { return lmax_t(ctx->lmax_rho()); });
+        direction.zero();
+        auto saved          = potential_samples(potential.hartree_potential());
+        double saved_energy = potential.energy_vha();
+        std::vector<double> saved_origins;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            saved_origins.push_back(potential.vh_el(ia));
+        }
+        double peak{0};
+        for (auto x : potential_samples(*potential.hartree_response(direction))) {
+            peak = std::max(peak, std::abs(x));
+        }
+        check("zero Hartree response has no nuclear contribution", peak, 0);
+        for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+            auto g = ctx->gvec().gvec(gvec_index_t::local(ig));
+            if (std::abs(g[0]) + std::abs(g[1]) + std::abs(g[2]) == 1) {
+                direction.rg().f_pw_local(ig) = {0.01, 0.02 * (g[0] + g[1] + g[2])};
+            }
+        }
+        direction.rg().fft_transform(1);
+        auto angular_l = sf::l_by_lm(ctx->lmax_rho());
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            auto const& grid = ctx->unit_cell().atom(ia).radial_grid();
+            for (int lm = 0; lm < ctx->lmmax_rho(); lm++) {
+                int l = angular_l[lm];
+                for (int ir = 0; ir < grid.num_points(); ir++) {
+                    direction.mt()[ia](lm, ir) =
+                            0.3 * (ia + 1) * std::pow(grid[ir], l) * std::exp(-grid[ir]) / (lm + 1);
+                }
+            }
+        }
+        auto response = potential.hartree_response(direction);
+        auto samples  = potential_samples(*response);
+        Potential displaced(*ctx);
+        Density shifted(*ctx);
+        for (double step : {0.125, 0.0625}) {
+            auto sample = [&](double h) {
+                copy(density.rho(), shifted.rho());
+                axpy(h, direction, shifted.rho());
+                displaced.poisson(shifted.rho());
+                return potential_samples(displaced.hartree_potential());
+            };
+            auto plus = sample(step);
+            check("Hartree response matches production Poisson derivative",
+                  potential_response_error(samples, plus, sample(-step), step), 2e-8);
+        }
+        check("Hartree response preserves potential and energy",
+              potential_samples(potential.hartree_potential()) != saved || potential.energy_vha() != saved_energy ? 1
+                                                                                                                  : 0,
+              0);
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            check("Hartree response preserves potential at nuclei", std::abs(potential.vh_el(ia) - saved_origins[ia]),
+                  0);
+        }
+        if (ctx->comm().rank() == 0) {
+            direction.rg().f_pw_local(0) = std::numeric_limits<double>::quiet_NaN();
+        }
+        reject("nonfinite Hartree direction rejected collectively", [&] { potential.hartree_response(direction); });
+        direction.zero();
+        for (auto it : ctx->unit_cell().spl_num_atoms()) {
+            if (it.i == 0) {
+                direction.mt()[it.i](0, 0) = std::numeric_limits<double>::quiet_NaN();
+            }
+        }
+        reject("nonfinite MT Hartree direction rejected collectively", [&] { potential.hartree_response(direction); });
+        Periodic_function<double> no_spheres(*ctx);
+        no_spheres.zero();
+        reject("missing MT Hartree direction rejected collectively", [&] { potential.hartree_response(no_spheres); });
+    }
     Density regenerated(*ctx);
     copy(density, regenerated);
     regenerated.generate<double>(ks, false, true, true);
@@ -673,7 +804,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 radial_response.push_back(ctx->unit_cell().atom_symmetry_class(ic).radial_basis_potential_response(
                         radial_direction[ic], xc_direction[ic]));
             }
-            auto field_response = density.lapw_radial_fields_response(ks, radial_response);
+            auto field_response   = density.lapw_radial_fields_response(ks, radial_response);
+            auto hartree_response = radial_hartree_response(*ctx, potential, field_response);
             verify_restored();
             if (!mag && !second_variation && part == 0) {
                 std::vector<radial_basis_response_t> zero;
@@ -723,7 +855,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 }
                 verify_restored();
             }
-            std::vector<double> sampled_fields;
+            std::vector<double> sampled_fields, sampled_hartree;
             auto radial_lagrangian = [&](double step) {
                 auto shifted_vs = spherical;
                 auto shifted_xc = spherical_xc;
@@ -766,15 +898,18 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     }
                 }
                 ctx->comm().allreduce(&value, 1);
-                sampled_fields = sample_radial_fields(*ctx, ks, shifted_vs, shifted_xc);
+                sampled_fields = sample_radial_fields(*ctx, ks, shifted_vs, shifted_xc, &sampled_hartree);
                 return value;
             };
             for (double step : {1e-3, 5e-4}) {
-                double plus      = radial_lagrangian(step);
-                auto plus_fields = sampled_fields;
-                double fd        = (plus - radial_lagrangian(-step)) / (2 * step);
+                double plus       = radial_lagrangian(step);
+                auto plus_fields  = sampled_fields;
+                auto plus_hartree = sampled_hartree;
+                double fd         = (plus - radial_lagrangian(-step)) / (2 * step);
                 check("radial density/tau response",
                       radial_fields_error(field_response, plus_fields, sampled_fields, step), 3e-5);
+                check("radial Hartree response",
+                      potential_response_error(hartree_response, plus_hartree, sampled_hartree, step), 3e-5);
                 check("radial basis Lagrangian derivative", std::abs(fd - basis_derivative), 2e-8);
                 check("relative radial basis Lagrangian derivative",
                       std::abs((fd - basis_derivative) / basis_derivative), 2e-5);
@@ -974,8 +1109,9 @@ test_lapw_linearization_response()
         double analytic = gs.forces().lapw_radial_basis_derivative({direction}, {}, update_enu);
         std::vector<radial_basis_response_t> radial_response;
         radial_response.push_back(cls.radial_basis_potential_response(direction, {}, update_enu));
-        auto field_response = gs.density().lapw_radial_fields_response(ks, radial_response);
-        std::vector<double> sampled_fields;
+        auto field_response   = gs.density().lapw_radial_fields_response(ks, radial_response);
+        auto hartree_response = radial_hartree_response(*ctx, gs.potential(), field_response);
+        std::vector<double> sampled_fields, sampled_hartree;
         auto sample = [&](double step) {
             auto v = base;
             for (size_t ir = 0; ir < v.size(); ir++) {
@@ -1000,16 +1136,20 @@ test_lapw_linearization_response()
                 value += occupied_lapw_lagrangian(*ctx, *kp, 0, h, o);
             }
             ctx->comm().allreduce(&value, 1);
-            sampled_fields = sample_radial_fields(*ctx, ks, {v}, gs.potential().get_core_xc_derivatives());
+            sampled_fields =
+                    sample_radial_fields(*ctx, ks, {v}, gs.potential().get_core_xc_derivatives(), &sampled_hartree);
             return value;
         };
         std::cout << "LAPW Lagrangian update_enu=" << update_enu << '\n';
         for (double step : {1e-2, 5e-3}) {
-            double plus      = sample(step);
-            auto plus_fields = sampled_fields;
-            double fd        = (plus - sample(-step)) / (2 * step);
+            double plus       = sample(step);
+            auto plus_fields  = sampled_fields;
+            auto plus_hartree = sampled_hartree;
+            double fd         = (plus - sample(-step)) / (2 * step);
             check("automatic-energy density/tau response",
                   radial_fields_error(field_response, plus_fields, sampled_fields, step), 3e-5);
+            check("automatic-energy Hartree response",
+                  potential_response_error(hartree_response, plus_hartree, sampled_hartree, step), 3e-5);
             check("automatic-energy Lagrangian derivative", std::abs(fd - analytic), 2e-7);
             check("relative automatic-energy Lagrangian derivative", std::abs((fd - analytic) / analytic), 2e-5);
         }

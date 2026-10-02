@@ -545,7 +545,8 @@ Potential::update_atomic_potential()
 }
 
 mdarray<std::complex<double>, 2>
-Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__) const
+Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__,
+                       Spheric_function_set<double, atom_index_t>& vha_mt__, bool include_nuclei__) const
 {
     PROFILE("sirius::Potential::poisson_vmt");
 
@@ -555,7 +556,7 @@ Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__
     for (auto it : unit_cell_.spl_num_atoms()) {
         auto ia = it.i;
 
-        auto qmt_re = poisson_vmt<false>(unit_cell_.atom(ia), rhomt__[ia], hartree_potential_->mt()[ia]);
+        auto qmt_re = poisson_vmt<false>(unit_cell_.atom(ia), rhomt__[ia], vha_mt__[ia], include_nuclei__);
 
         SHT::convert(ctx_.lmax_rho(), &qmt_re[0], &qmt(0, ia));
     }
