@@ -150,6 +150,183 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
 }
 
 int
+test_point_geometry(Simulation_context& ctx, Density const& density, Potential& potential)
+{
+    auto original  = ctx.cb().external_xc_points_;
+    auto evaluator = ctx.cb().external_xc_;
+    auto lattice = ctx.unit_cell().lattice_vectors(), reciprocal = ctx.gvec().lattice_vectors();
+    auto fractional = ctx.unit_cell().atom(0).position();
+    auto atom       = r3::dot(lattice, fractional);
+    std::array<double, 3> atom_scale{0.03, -0.02, 0.01};
+    auto image = [](int p, int y) { return (p / (y == 0 ? 1 : y == 1 ? 3 : 9)) % 3 - 1; };
+    // Independent dependence on fields, points, centres and both weight arrays.
+    ctx.cb().external_xc_ = [](auto const& c, auto const& in, auto& out) {
+        auto const& q = *in.points;
+        int nr        = in.num_points;
+        double moment{0}, energy{0};
+        for (int j = 0; j < nr * in.num_spins; j++) {
+            moment += q.descriptor_weights[j % nr] * in.rho[j];
+        }
+        c.comm().allreduce(&moment, 1);
+        for (int s = 0; s < in.num_spins; s++) {
+            for (int p = 0; p < nr; p++) {
+                int j    = p + nr * s;
+                double n = in.rho[j], t = in.tau[j], w = q.energy_weights[p];
+                double local = 0.3 * n * n + 0.2 * t * t;
+                out.vrho[j]  = w * 0.6 * n + q.descriptor_weights[p] * 0.04 * moment;
+                out.vtau[j]  = w * 0.4 * t;
+                for (int x = 0; x < 3; x++) {
+                    int k = p + nr * (x + 3 * s);
+                    local +=
+                            0.1 * in.gradient[k] * in.gradient[k] + 0.004 * q.coordinates[p][x] * q.block_centres[0][x];
+                    out.vgradient[k] = w * 0.2 * in.gradient[k];
+                    if (out.geometry) {
+                        out.geometry->coordinates[p][x] += w * 0.004 * q.block_centres[0][x];
+                        out.geometry->block_centres[0][x] += w * 0.004 * q.coordinates[p][x];
+                    }
+                }
+                energy += w * local;
+                if (out.geometry) {
+                    out.geometry->energy_weights[p] += local;
+                    out.geometry->descriptor_weights[p] += 0.04 * moment * n;
+                }
+            }
+        }
+        c.comm().allreduce(&energy, 1);
+        out.energy = energy + 0.02 * moment * moment;
+    };
+    ctx.cb().external_xc_geometry_ = ctx.cb().external_xc_;
+    ctx.cb().external_xc_pullback_ = [&](auto const& c, auto const&, auto const& d, auto& out) {
+        double weight{0};
+        for (size_t p = 0; p < d.coordinates.size(); p++) {
+            weight += original->energy_weights[p] * d.energy_weights[p] -
+                      0.4 * original->descriptor_weights[p] * d.descriptor_weights[p];
+            for (int x = 0; x < 3; x++) {
+                out.atoms[0][x] += d.coordinates[p][x];
+                for (int y = 0; y < 3; y++) {
+                    out.lattice[x + 3 * y] += d.coordinates[p][x] * image(p, y);
+                }
+            }
+        }
+        for (int x = 0; x < 3; x++) {
+            out.atoms[0][x] += weight * atom_scale[x];
+            for (auto const& centre : d.block_centres) {
+                out.atoms[0][x] += centre[x];
+            }
+        }
+        for (int i = 0; i < 9; i++) {
+            out.lattice[i] += weight * 0.002 * (i + 1);
+        }
+        c.comm().allreduce(out.atoms[0].data(), 3);
+        c.comm().allreduce(out.lattice.data(), 9);
+    };
+    int failures{0};
+    auto check = [&](char const* name, double error, double tolerance) {
+        if (ctx.comm().rank() == 0) {
+            std::cout << name << ": " << error << '\n';
+        }
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    auto rho_hash       = density.rho().rg().hash_f_pw();
+    auto potential_hash = potential.effective_potential().rg().hash_f_pw();
+    auto derivative     = potential.external_xc_geometry(density);
+    check("geometry getter preserves density and potential",
+          rho_hash == density.rho().rg().hash_f_pw() &&
+                          potential_hash == potential.effective_potential().rg().hash_f_pw()
+                  ? 0
+                  : 1,
+          0);
+    auto displaced_energy = [&](int component, double step) {
+        auto cell     = lattice;
+        auto position = atom;
+        if (component < 3) {
+            position[component] += step;
+        } else {
+            cell((component - 3) % 3, (component - 3) / 3) += step;
+        }
+        ctx.unit_cell().set_lattice_vectors(cell);
+        ctx.unit_cell().atom(0).set_position(r3::dot(r3::inverse(cell), position));
+        ctx.gvec_sptr()->lattice_vectors(twopi * r3::transpose(r3::inverse(cell)));
+        auto q                = std::make_shared<xc_point_set_t>(ctx);
+        q->coordinates        = original->coordinates;
+        q->block_sizes        = original->block_sizes;
+        q->block_centres      = original->block_centres;
+        q->energy_weights     = original->energy_weights;
+        q->descriptor_weights = original->descriptor_weights;
+        double scale          = step * (component < 3 ? atom_scale[component] : 0.002 * (component - 2));
+        for (size_t p = 0; p < q->coordinates.size(); p++) {
+            int x = component < 3 ? component : (component - 3) % 3;
+            q->coordinates[p][x] += step * (component < 3 ? 1 : image(p, (component - 3) / 3));
+            q->energy_weights[p] *= 1 + scale;
+            q->descriptor_weights[p] *= 1 - 0.4 * scale;
+        }
+        if (component < 3 && !q->block_centres.empty()) {
+            q->block_centres[0][component] += step;
+        }
+        ctx.cb().external_xc_points_ = q;
+        potential.generate(density, false, true);
+        return potential.energy_exc(density);
+    };
+    for (double step : {1e-4, 5e-5}) {
+        double error{0};
+        for (int i = 0; i < 12; i++) {
+            double plus = displaced_energy(i, step), minus = displaced_energy(i, -step);
+            double exact = i < 3 ? derivative.atoms[0][i] : derivative.lattice[i - 3];
+            error = std::max(error, std::abs((plus - minus) / (2 * step) - exact) / std::max(1.0, std::abs(exact)));
+        }
+        check("combined point/weight/field geometry derivative", error, 2e-8);
+    }
+    ctx.unit_cell().set_lattice_vectors(lattice);
+    ctx.unit_cell().atom(0).set_position(fractional);
+    ctx.gvec_sptr()->lattice_vectors(reciprocal);
+    ctx.cb().external_xc_points_ = original;
+    auto reject                  = [&](char const* name) {
+        bool rejected{false};
+        try {
+            potential.external_xc_geometry(density);
+        } catch (std::exception const&) {
+            rejected = true;
+        }
+        check(name, rejected ? 0 : 1, 0);
+    };
+    auto geometry_callback = ctx.cb().external_xc_geometry_;
+    for (bool nonfinite : {false, true}) {
+        ctx.cb().external_xc_geometry_ = [&](auto const& c, auto const& in, auto& out) {
+            geometry_callback(c, in, out);
+            if (c.comm().rank() == 0) {
+                if (nonfinite) {
+                    out.geometry->energy_weights[0] = std::numeric_limits<double>::quiet_NaN();
+                } else {
+                    out.geometry->coordinates.pop_back();
+                }
+            }
+        };
+        reject("collective invalid geometry callback rejection");
+    }
+    ctx.cb().external_xc_geometry_ = geometry_callback;
+    auto pullback                  = ctx.cb().external_xc_pullback_;
+    ctx.cb().external_xc_pullback_ = [&](auto const& c, auto const& q, auto const& d, auto& out) {
+        pullback(c, q, d, out);
+        if (c.comm().rank() == 0) {
+            out.atoms.pop_back();
+        }
+    };
+    reject("collective invalid quadrature pullback rejection");
+    if (ctx.comm().size() > 1) {
+        ctx.cb().external_xc_pullback_ = [&](auto const& c, auto const& q, auto const& d, auto& out) {
+            pullback(c, q, d, out);
+            out.lattice[0] += c.comm().rank();
+        };
+        reject("collective unreduced quadrature pullback rejection");
+    }
+    ctx.cb().external_xc_geometry_ = nullptr;
+    ctx.cb().external_xc_pullback_ = nullptr;
+    ctx.cb().external_xc_          = evaluator;
+    potential.generate(density, false, true);
+    return failures;
+}
+
+int
 test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bool paw = false)
 {
     auto ctx = test_context(gamma, mag, false, false, parallel_fft, true, 0, paw, points);
@@ -380,6 +557,9 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
     diagnostic.potential().generate(diagnostic.density(), false, true);
     check("diagnostic restores evaluator", evaluations == 3 ? 0 : 1, 0);
     ctx->cb().external_xc_ = test_functional;
+    if (points && !paw && !gamma && mag == 1) {
+        failures += test_point_geometry(*ctx, density, potential);
+    }
     if (paw) {
         ctx->cb().external_xc_ = [](auto const& c, auto const& in, auto& out) {
             test_functional(c, in, out);
@@ -692,6 +872,10 @@ main(int argc, char** argv)
             result += call_test("external PAW XC energy and operator", test_external_xc, gamma, mag, false, true, true);
             if (mpi::Communicator::world().size() > 1) {
                 result += call_test("external XC distributed FFT", test_external_xc, gamma, mag, true, false, false);
+                if (!gamma && mag == 1) {
+                    result += call_test("point geometry with distributed FFT", test_external_xc, gamma, mag, true,
+                                        true, false);
+                }
                 result += call_test("external PAW XC distributed FFT", test_external_xc, gamma, mag, true, true, true);
             }
         }
