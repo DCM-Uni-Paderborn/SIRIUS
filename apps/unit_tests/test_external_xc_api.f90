@@ -9,6 +9,9 @@ module external_xc_test
   type, bind(C) :: callback_state
     integer(C_INT) :: calls, failures, fail_next
     real(C_DOUBLE) :: energy
+    integer(C_INT) :: owner = 0, rows = 64, blocks = 1
+    real(C_DOUBLE) :: first(3) = [0.296d0, 0.261d0, 0.410d0]
+    real(C_DOUBLE) :: centre(3) = [1.6d0, 2.7d0, 4.d0]
   end type
 contains
   subroutine evaluate_xc(user_data, nr, ns, dims, z_offset, context_comm, fft_comm, &
@@ -69,11 +72,12 @@ contains
     state%calls = state%calls + 1
     call MPI_COMM_RANK(comm, rank, ierr)
     if (sum(block_sizes) /= nr) state%failures = state%failures + 1
-    if (rank == 0) then
-      if (nr /= 64 .or. nb /= 1) state%failures = state%failures + 1
-      if (maxval(abs(coordinates(:,1) - [0.296d0, 0.261d0, 0.410d0])) > 1.d-12) &
-        state%failures = state%failures + 1
-      if (maxval(abs(centres(:,1) - [1.6d0, 2.7d0, 4.d0])) > 1.d-12) state%failures = state%failures + 1
+    if (rank == state%owner) then
+      if (nr /= state%rows .or. nb /= state%blocks) state%failures = state%failures + 1
+      if (nr > 0 .and. nb > 0) then
+        if (maxval(abs(coordinates(:,1) - state%first)) > 1.d-12) state%failures = state%failures + 1
+        if (maxval(abs(centres(:,1) - state%centre)) > 1.d-12) state%failures = state%failures + 1
+      endif
     else
       if (nr /= 0 .or. nb /= 0) state%failures = state%failures + 1
     endif
@@ -155,6 +159,7 @@ end module
 program test_external_xc_api
   use sirius
   use external_xc_test
+  use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite
   implicit none
   type(sirius_context_handler) :: ctx
   type(sirius_kpoint_set_handler) :: ks
@@ -162,14 +167,15 @@ program test_external_xc_api
   type(callback_state), target :: state
   integer, parameter :: n = 400
   real(8) :: r(n), v(n), rho(n), orbital(n), lattice(3,3), dion(0,0), kpoint(3,1), energy
-  real(8) :: datoms(3,1), dlattice(3,3), repeat_energy
+  real(8) :: datoms(3,1), dlattice(3,3), repeat_energy, updated_energy
   real(8), allocatable :: coordinates(:,:), weights(:), descriptor_weights(:), centres(:,:)
   integer, allocatable :: blocks(:)
-  integer :: i, ierr, mag, failures, all_failures, mode, rank, nr, nb, x, y, z, calls
+  integer :: i, ierr, mag, failures, all_failures, mode, rank, nr, nb, x, y, z, calls, ranks, old_basis, new_basis
   logical :: converged
 
   call sirius_initialize(call_mpi_init=.true.)
   call MPI_COMM_RANK(MPI_COMM_WORLD, rank, ierr)
+  call MPI_COMM_SIZE(MPI_COMM_WORLD, ranks, ierr)
   failures = 0
   do mode = 0, 1
   do mag = 0, 1
@@ -180,7 +186,7 @@ program test_external_xc_api
       '"pw_cutoff":8.0,"gk_cutoff":2.6,"num_bands":4,"xc_functionals":[],"smearing_width":0.01},' // &
       '"control":{"mpi_grid_dims":[1,1],"processing_unit":"CPU","verbosity":0},' // &
       '"mixer":{"type":"linear","beta":0.4,"use_hartree":false},' // &
-      '"iterative_solver":{"min_tolerance":1e-11,"num_steps":80}}')
+      '"iterative_solver":{"type":"exact","min_tolerance":1e-11,"num_steps":80}}')
     call sirius_set_parameters(ctx, num_mag_dims=mag)
     if (mode == 0) call sirius_set_xc_callback(ctx, C_FUNLOC(evaluate_xc), C_LOC(state))
     lattice = 0
@@ -234,6 +240,9 @@ program test_external_xc_api
       call sirius_set_xc_point_geometry_callbacks(ctx, C_FUNLOC(evaluate_geometry), C_FUNLOC(fixed_quadrature), &
                                                   C_LOC(state), error_code=ierr)
       if (ierr /= 0) failures = failures + 1
+      call sirius_update_xc_point_set(ctx, nr, nb, coordinates, weights, descriptor_weights, blocks, centres, &
+                                     error_code=ierr)
+      if (ierr == 0) failures = failures + 1
       call sirius_set_xc_point_geometry_callbacks(ctx, C_FUNLOC(evaluate_geometry), C_NULL_FUNPTR, &
                                                   C_LOC(state), error_code=ierr)
       if (ierr == 0) failures = failures + 1
@@ -269,6 +278,98 @@ program test_external_xc_api
     endif
     call sirius_get_energy(gs, 'exc', repeat_energy)
     if (repeat_energy /= energy) failures = failures + 1
+    if (mode == 1) then
+      ! Change atoms and cell, then redistribute a different-sized quadrature.
+      ! Keep the same cutoff-selected basis: ground-state updates retain its G indices.
+      lattice(1,1) = 8.001d0
+      lattice(1,2) = 0.0003d0
+      call sirius_set_lattice_vectors(ctx, lattice(:,1), lattice(:,2), lattice(:,3))
+      call sirius_set_atom_position(ctx, 1, [0.21d0, 0.31d0, 0.39d0])
+      calls = state%calls
+      call sirius_generate_effective_potential(gs, error_code=ierr)
+      if (ierr == 0 .or. state%calls /= calls) failures = failures + 1
+      state%owner = ranks - 1
+      state%rows = 27
+      state%blocks = 2
+      state%first = matmul(lattice, [0.037d0, 0.029d0, 0.041d0])
+      state%centre = matmul(lattice, [0.21d0, 0.31d0, 0.39d0])
+      nr = 0
+      nb = 0
+      if (rank == state%owner) then
+        nr = state%rows
+        nb = state%blocks
+      endif
+      allocate(coordinates(3,nr), weights(nr), descriptor_weights(nr), centres(3,nb), blocks(nb))
+      if (nb > 0) then
+        i = 0
+        do z = 0, 2
+          do y = 0, 2
+            do x = 0, 2
+              i = i + 1
+              coordinates(:,i) = matmul(lattice, [0.037d0+x/3.d0, 0.029d0+y/3.d0, 0.041d0+z/3.d0])
+            enddo
+          enddo
+        enddo
+        centres(:,1) = state%centre
+        centres(:,2) = state%centre + 0.1d0
+        blocks = [14, 13]
+      endif
+      weights = product([lattice(1,1), lattice(2,2), lattice(3,3)])/27
+      descriptor_weights = 0.9d0*weights
+      call sirius_update_xc_point_set(ctx, nr, nb, coordinates, weights, descriptor_weights, blocks, centres, &
+                                     error_code=ierr)
+      if (ierr /= 0) failures = failures + 1
+      ! Failed updates must preserve the copied data and both geometry callbacks.
+      coordinates = 0
+      if (nb > 0) blocks(1) = 13
+      call sirius_update_xc_point_set(ctx, nr, nb, coordinates, weights, descriptor_weights, blocks, centres, &
+                                     error_code=ierr)
+      if (ierr == 0) failures = failures + 1
+      if (nb > 0) then
+        blocks(1) = 14
+        weights(1) = ieee_value(0.d0, ieee_quiet_nan)
+      endif
+      call sirius_update_xc_point_set(ctx, nr, nb, coordinates, weights, descriptor_weights, blocks, centres, &
+                                     error_code=ierr)
+      if (ierr == 0) failures = failures + 1
+      deallocate(coordinates, weights, descriptor_weights, centres, blocks)
+      call sirius_update_ground_state(gs)
+      converged = .false.
+      call sirius_find_ground_state(gs, density_tol=1.d-8, energy_tol=1.d-9, iter_solver_tol=1.d-8, &
+                                   initial_guess=.false., max_niter=100, save_state=.false., converged=converged)
+      if (.not. converged) then
+        print *, 'Updated point SCF did not converge', mag
+        failures = failures + 1
+      endif
+      call sirius_get_energy(gs, 'total', updated_energy)
+      call sirius_get_max_num_gkvec(ks, old_basis)
+      calls = state%calls
+      call sirius_get_xc_geometry_derivatives(gs, 1, datoms, dlattice, error_code=ierr)
+      if (ierr /= 0 .or. state%calls /= calls + 2) failures = failures + 1
+      call sirius_free_handler(gs)
+      call sirius_free_handler(ks)
+      call sirius_create_kset(ctx, 1, kpoint, [1.d0], .true., ks)
+      call sirius_get_max_num_gkvec(ks, new_basis)
+      if (old_basis /= new_basis) stop 'Point-update fixture crosses the orbital cutoff'
+      call sirius_create_ground_state(ks, gs)
+      converged = .false.
+      call sirius_find_ground_state(gs, density_tol=1.d-8, energy_tol=1.d-9, iter_solver_tol=1.d-8, &
+                                   max_niter=100, save_state=.false., converged=converged)
+      call sirius_get_energy(gs, 'total', repeat_energy)
+      if (.not. converged .or. .not. ieee_is_finite(updated_energy) .or. .not. ieee_is_finite(repeat_energy) .or. &
+          abs(updated_energy-repeat_energy) > 1.d-9) then
+        print *, 'Updated/fresh point SCF mismatch', mag, converged, updated_energy, repeat_energy
+        print *, 'Plane-wave basis sizes', old_basis, new_basis
+        failures = failures + 1
+      endif
+    else
+      allocate(coordinates(3,0), weights(0), descriptor_weights(0), centres(3,0), blocks(0))
+      call sirius_update_xc_point_set(ctx, 0, 0, coordinates, weights, descriptor_weights, blocks, centres, &
+                                     error_code=ierr)
+      if (ierr == 0) failures = failures + 1
+      deallocate(coordinates, weights, descriptor_weights, centres, blocks)
+    endif
+    if (state%failures /= 0) print *, 'Callback checks failed', mode, mag, state%failures
     failures = failures + state%failures
     state%fail_next = 1
     if (mode == 1) then

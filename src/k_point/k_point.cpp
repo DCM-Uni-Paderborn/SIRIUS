@@ -389,6 +389,9 @@ K_point<T>::update()
 
     gkvec_->lattice_vectors(unit_cell_.reciprocal_lattice_vectors());
     gkvec_partition_->update_gkvec_cart();
+    // Matrix construction and projectors use separate block-cyclic copies.
+    gkvec_row_->lattice_vectors(unit_cell_.reciprocal_lattice_vectors());
+    gkvec_col_->lattice_vectors(unit_cell_.reciprocal_lattice_vectors());
 
     if (ctx_.full_potential()) {
         bool all_atoms = {false};

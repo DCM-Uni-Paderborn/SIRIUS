@@ -2901,8 +2901,9 @@ sirius_set_xc_point_callback:
     user_data until the context is destroyed. Geometry changes invalidate the
     supplied quadrature. CPU scalar/collinear PW and PAW are supported, without
     symmetry reduction. PAW requires explicitly supplied positive core tau.
-    Nonrelativistic FP-LAPW fields are also supported. Forces, stress and SOC
-    are not supported by this point path.
+    Nonrelativistic FP-LAPW fields are also supported. PW and PAW atomic forces
+    additionally require the point geometry callbacks. FP-LAPW forces, stress
+    and SOC are not supported by this point path.
   arguments:
     handler:
       type: ctx_handler
@@ -2954,6 +2955,61 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                              int const* num_blocks__, double const* coordinates__, double const* energy_weights__,
                              double const* descriptor_weights__, int const* block_sizes__,
                              double const* block_centres__, int* error_code__);
+
+/*
+sirius_update_xc_point_set:
+  doc: >-
+    Replace the copied quadrature of an initialized external point XC context
+    without changing its field or geometry callbacks or their user data.
+    Call collectively between SCF calculations, after setting the new lattice
+    and atom positions and before updating the ground state. This call does not
+    update the density, potential or orbitals. Local point and block counts may
+    change, including redistribution to previously empty ranks. The array
+    conventions are those of sirius_set_xc_point_callback. An invalid replacement
+    leaves the previous quadrature and callbacks unchanged.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Initialized simulation context handler.
+    num_points:
+      type: int
+      attr: in, required
+      doc: Number of local point rows.
+    num_blocks:
+      type: int
+      attr: in, required
+      doc: Number of complete local atom blocks.
+    coordinates:
+      type: double
+      attr: in, required, dimension(3,num_points)
+      doc: Cartesian target coordinates.
+    energy_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Energy quadrature and partition weights.
+    descriptor_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Independent descriptor quadrature weights.
+    block_sizes:
+      type: int
+      attr: in, required, dimension(num_blocks)
+      doc: Positive consecutive row counts summing to num_points.
+    block_centres:
+      type: double
+      attr: in, required, dimension(3,num_blocks)
+      doc: Cartesian centres of the atom blocks.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+*/
+void
+sirius_update_xc_point_set(void* const* handler__, int const* num_points__, int const* num_blocks__,
+                           double const* coordinates__, double const* energy_weights__,
+                           double const* descriptor_weights__, int const* block_sizes__, double const* block_centres__,
+                           int* error_code__);
 
 /*
 sirius_set_xc_point_geometry_callbacks:
