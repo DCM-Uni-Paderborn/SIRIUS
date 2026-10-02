@@ -74,6 +74,68 @@ class Gaunt_coefficients;
 template <typename T>
 class Hamiltonian_k;
 
+/// Complete frozen-basis LAPW spectrum and its generalized density-matrix response.
+/** Uses every PW/LO eigenvector, not only the stored bands. Occupations and their
+ *  energy derivatives are supplied explicitly for this spectrum. All calls are
+ *  collective on the k-point communicator and leave the ground state unchanged.
+ */
+class LAPW_eigensystem
+{
+  private:
+    Simulation_context& ctx_;
+    K_point<double>& kp_;
+    mdarray<std::complex<double>, 2> vectors_, overlap_;
+    std::vector<double> energies_;
+
+    void
+    validate_matrix(la::dmatrix<std::complex<double>> const& matrix__) const;
+
+    void
+    validate_occupations(std::vector<double> const& occupations__) const;
+
+  public:
+    struct perturbation_t
+    {
+        LAPW_eigensystem const* reference{nullptr};
+        mdarray<std::complex<double>, 2> h, s;
+        std::vector<double> energies;
+    };
+
+    LAPW_eigensystem(Hamiltonian_k<double> const& hk__, la::dmatrix<std::complex<double>> const& h__,
+                     la::dmatrix<std::complex<double>> const& s__);
+    LAPW_eigensystem(LAPW_eigensystem const&) = delete;
+    LAPW_eigensystem&
+    operator=(LAPW_eigensystem const&) = delete;
+
+    auto const&
+    energies() const
+    {
+        return energies_;
+    }
+
+    auto const&
+    overlap() const
+    {
+        return overlap_;
+    }
+
+    /// Transform dH/dS and compute energy directions without changing the eigenvectors.
+    perturbation_t
+    perturbation(la::dmatrix<std::complex<double>> const& h__, la::dmatrix<std::complex<double>> const& s__) const;
+
+    /// Coefficient density matrix C f C^H in independent PW/LO order.
+    mdarray<std::complex<double>, 2>
+    density_matrix(std::vector<double> const& occupations__) const;
+
+    /// Includes the generalized-overlap response and the degenerate spectral limit.
+    /** Slopes are df/de, not df/dmu. mu_response__ is shared by the relevant
+     *  charge/spin population and must be determined across k-points by the caller.
+     */
+    mdarray<std::complex<double>, 2>
+    density_matrix_response(perturbation_t const& direction__, std::vector<double> const& occupations__,
+                            std::vector<double> const& slopes__, double mu_response__ = 0) const;
+};
+
 /// Represent the k-point independent part of Hamiltonian.
 /** \tparam T   Precision of the wave-functions (float or double).
  */

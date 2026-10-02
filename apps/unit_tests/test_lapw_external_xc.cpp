@@ -8,6 +8,7 @@
 #include "dft/dft_ground_state.hpp"
 #include "hamiltonian/diagonalize.hpp"
 #include "hamiltonian/diagonalize_fp.hpp"
+#include "dft/smearing.hpp"
 #include "lapw/step_function.hpp"
 
 using namespace sirius;
@@ -468,6 +469,127 @@ radial_fields_error(std::vector<std::array<std::vector<Flm>, 2>> const& analytic
     return error;
 }
 
+std::array<double, 4>
+lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<double>>& dh)
+{
+    auto& ctx = hk.H0().ctx();
+    auto& kp  = hk.kp();
+    int n = kp.gklo_basis_size(), bs = ctx.cyclic_block_size();
+    la::dmatrix<std::complex<double>> h(n, n, ctx.blacs_grid(), bs, bs);
+    la::dmatrix<std::complex<double>> s(n, n, ctx.blacs_grid(), bs, bs);
+    la::dmatrix<std::complex<double>> ds(n, n, ctx.blacs_grid(), bs, bs);
+    la::dmatrix<std::complex<double>> shifted_h(n, n, ctx.blacs_grid(), bs, bs);
+    la::dmatrix<std::complex<double>> shifted_s(n, n, ctx.blacs_grid(), bs, bs);
+    hk.set_fv_h_o(0, h, s);
+    for (int j = 0; j < ds.num_cols_local(); j++) {
+        for (int i = 0; i < ds.num_rows_local(); i++) {
+            int row = ds.irow(i), col = ds.icol(j);
+            ds(i, j) = 0.03 * s(i, j) + 0.002 * std::polar(1.0, 0.7 * (row - col)) / ((1.0 + row) * (1.0 + col));
+        }
+    }
+    auto full_ds = ds.get_full_matrix();
+    std::array<double, 4> errors{};
+    for (bool degenerate : {false, true}) {
+        if (degenerate) {
+            for (int j = 0; j < h.num_cols_local(); j++) {
+                for (int i = 0; i < h.num_rows_local(); i++) {
+                    h(i, j) = 0.25 * s(i, j);
+                }
+            }
+        }
+        LAPW_eigensystem reference(hk, h, s);
+        auto direction         = reference.perturbation(dh, ds);
+        double mu              = degenerate ? 0.25 : reference.energies()[ctx.num_bands() / 2];
+        constexpr double width = 0.4;
+        auto occupations       = [&](auto const& spectrum, double chemical_potential) {
+            std::vector<double> f;
+            for (double energy : spectrum.energies()) {
+                f.push_back(ctx.max_occupancy() * smearing::gaussian::occupancy(chemical_potential - energy, width));
+            }
+            return f;
+        };
+        auto f = occupations(reference, mu);
+        std::vector<double> slopes;
+        double slope_sum{0}, energy_sum{0};
+        for (int i = 0; i < n; i++) {
+            slopes.push_back(-ctx.max_occupancy() * smearing::gaussian::delta(mu - reference.energies()[i], width));
+            slope_sum += slopes.back();
+            energy_sum += slopes.back() * direction.energies[i];
+        }
+        auto p = reference.density_matrix(f);
+        for (bool fixed_charge : {false, true}) {
+            double dmu    = fixed_charge ? energy_sum / slope_sum : 0;
+            auto response = reference.density_matrix_response(direction, f, slopes, dmu);
+            std::complex<double> trace{0};
+            for (int j = 0; j < n; j++) {
+                for (int i = 0; i < n; i++) {
+                    trace += response(i, j) * reference.overlap()(j, i) + p(i, j) * full_ds(j, i);
+                }
+            }
+            errors[2]   = std::max(errors[2], std::abs(trace - (energy_sum - slope_sum * dmu)));
+            auto sample = [&](double step) {
+                for (int j = 0; j < h.num_cols_local(); j++) {
+                    for (int i = 0; i < h.num_rows_local(); i++) {
+                        shifted_h(i, j) = h(i, j) + step * dh(i, j);
+                        shifted_s(i, j) = s(i, j) + step * ds(i, j);
+                    }
+                }
+                LAPW_eigensystem shifted(hk, shifted_h, shifted_s);
+                return shifted.density_matrix(occupations(shifted, mu + step * dmu));
+            };
+            for (double step : {1e-4, 5e-5}) {
+                auto plus = sample(step), minus = sample(-step);
+                double error{0}, peak{0};
+                for (size_t i = 0; i < response.size(); i++) {
+                    double e = std::abs(response[i] - (plus[i] - minus[i]) / (2 * step));
+                    error    = std::isfinite(e) ? std::max(error, e) : std::numeric_limits<double>::infinity();
+                    peak     = std::max(peak, std::abs(response[i]));
+                }
+                errors[degenerate] = std::max(errors[degenerate], error / std::max(1.0, peak));
+            }
+        }
+        if (degenerate) {
+            auto expect_rejection = [&](auto&& operation) {
+                try {
+                    operation();
+                    errors[3]++;
+                } catch (std::exception const&) {
+                }
+            };
+            auto inconsistent = f;
+            inconsistent[0] += 0.1;
+            expect_rejection([&] { reference.density_matrix_response(direction, inconsistent, slopes); });
+            auto incomplete = f;
+            incomplete.pop_back();
+            expect_rejection([&] { reference.density_matrix(incomplete); });
+            expect_rejection([&] {
+                reference.density_matrix_response(direction, f, slopes,
+                                                  kp.comm().rank() == 0 ? std::numeric_limits<double>::quiet_NaN() : 0);
+            });
+            std::complex<double> saved{0};
+            if (kp.comm().rank() == 0) {
+                saved    = dh(0, 0);
+                dh(0, 0) = std::numeric_limits<double>::quiet_NaN();
+            }
+            expect_rejection([&] { reference.perturbation(dh, ds); });
+            if (kp.comm().rank() == 0) {
+                dh(0, 0) = saved;
+            }
+            if (kp.comm().size() > 1) {
+                auto different = f;
+                if (kp.comm().rank() == 0) {
+                    different[0] += 0.1;
+                }
+                expect_rejection([&] { reference.density_matrix(different); });
+                expect_rejection([&] {
+                    reference.density_matrix_response(direction, f, slopes, kp.comm().rank() == 0 ? 0.1 : 0);
+                });
+            }
+        }
+    }
+    return errors;
+}
+
 int
 test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool core = false)
 {
@@ -866,6 +988,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         }
         ctx->unit_cell().generate_radial_integrals();
     };
+    bool spectrum_checked{false};
+    std::array<double, 4> spectrum_errors{};
     auto matrix_snapshot = [&](Potential& p, lapw_hamiltonian_response_t const* response) {
         Hamiltonian0<double> h0(p, false);
         h0.generate_pw_coefs(p);
@@ -879,6 +1003,12 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             for (int s = 0; s < ctx->num_spins(); s++) {
                 if (response) {
                     hk.set_fv_h_field_response(s, *response, h);
+                    if (!core && !second_variation && !spectrum_checked && s == 0) {
+                        auto errors = lapw_spectrum_checks(hk, h);
+                        for (size_t i = 0; i < errors.size(); i++) {
+                            spectrum_errors[i] = std::max(spectrum_errors[i], errors[i]);
+                        }
+                    }
                 } else {
                     hk.set_fv_h_o(s, h, o);
                 }
@@ -911,6 +1041,13 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             Hamiltonian0<double> h0(potential, false);
             auto response     = h0.lapw_field_response(*hartree, xc);
             analytic_matrices = matrix_snapshot(potential, &response);
+            if (!core && !second_variation && !spectrum_checked) {
+                check("complete-spectrum density-matrix response", spectrum_errors[0], 3e-7);
+                check("degenerate-spectrum density-matrix response", spectrum_errors[1], 3e-7);
+                check("generalized density response preserves the charge constraint", spectrum_errors[2], 3e-10);
+                check("invalid spectrum-response inputs rejected collectively", spectrum_errors[3], 0);
+                spectrum_checked = true;
+            }
             if (!mag && !second_variation && part == 0) {
                 auto saved = xc.local[0][1][0][0];
                 if (ctx->comm().rank() == 0) {
