@@ -141,7 +141,7 @@ test_radial_core_solver()
                                 peak     = std::max(peak, std::abs(d));
                                 error    = std::max(
                                         error, std::abs(d - ((*std::get<1>(fields))[ir] - (*std::get<2>(fields))[ir]) /
-                                                                       (2 * h)));
+                                                                    (2 * h)));
                             }
                         }
                         check("projected radial energy derivative", error / peak, 2e-6);
@@ -324,10 +324,88 @@ test_radial_core_solver()
 }
 
 int
+test_radial_potential_response()
+{
+    int failures{0};
+    auto check = [&](char const* name, double error, double tolerance) {
+        std::cout << name << ": " << error << " (limit " << tolerance << ")\n";
+        failures += !std::isfinite(error) || error > tolerance;
+    };
+    // The long sphere also exercises rescaling of growing forward solutions.
+    for (double radius : {1.8, 14.0}) {
+        auto grid = Radial_grid_factory<double>(radial_grid_t::power, 801, 1e-6, radius, 2.0);
+        std::vector<double> potential(grid.num_points()), direction(grid.num_points()), zero(grid.num_points(), 0);
+        for (int ir = 0; ir < grid.num_points(); ir++) {
+            potential[ir] = -2 / grid[ir] + 0.2 * std::exp(-grid[ir]);
+            direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+        }
+        double energy = radius > 2 ? -4.0 : -0.3;
+        Radial_solver solver(2, potential, grid, 1e-11, 1e-11);
+        for (int l : {0, 1, 2, 3}) {
+            for (int order : {0, 1, 2}) {
+                auto response  = solver.solve_potential_response(order, l, energy, direction);
+                auto reference = solver.solve(relativity_t::none, order, l, energy);
+                auto null      = solver.solve_potential_response(order, l, energy, zero);
+                double value_error{0}, null_error{0};
+                Spline<double> product(grid);
+                for (int ir = 0; ir < grid.num_points(); ir++) {
+                    value_error = std::max(value_error, std::abs(response.value.p[ir] - reference.p[ir]));
+                    null_error  = std::max({null_error, std::abs(null.p[ir]), std::abs(null.rdudr[ir])});
+                    product(ir) = response.value.p[ir] * response.p[ir];
+                }
+                std::cout << "Potential response radius=" << radius << " l=" << l << " order=" << order << '\n';
+                check("unchanged radial solution", value_error, 2e-9);
+                check("zero potential direction", null_error, 0);
+                check("normalization response", std::abs(product.interpolate().integrate(0)), 2e-10);
+                for (double step : {1e-4, 5e-5}) {
+                    auto shifted = [&](double sign) {
+                        auto v = potential;
+                        for (int ir = 0; ir < grid.num_points(); ir++) {
+                            v[ir] += sign * step * direction[ir];
+                        }
+                        return Radial_solver(2, v, grid, 1e-11, 1e-11).solve(relativity_t::none, order, l, energy);
+                    };
+                    auto plus = shifted(1), minus = shifted(-1);
+                    double error{0}, peak{0}, boundary_error{0};
+                    for (auto fields : {std::make_tuple(&response.p, &plus.p, &minus.p),
+                                        std::make_tuple(&response.rdudr, &plus.rdudr, &minus.rdudr)}) {
+                        for (int ir = 0; ir < grid.num_points(); ir++) {
+                            double analytic = (*std::get<0>(fields))[ir];
+                            double fd       = ((*std::get<1>(fields))[ir] - (*std::get<2>(fields))[ir]) / (2 * step);
+                            error           = std::max(error, std::abs(analytic - fd));
+                            peak            = std::max(peak, std::abs(analytic));
+                        }
+                    }
+                    for (int j : {0, 1, 2}) {
+                        double fd      = (plus.uderiv[j] - minus.uderiv[j]) / (2 * step);
+                        boundary_error = std::max(boundary_error, std::abs(response.uderiv[j] - fd));
+                    }
+                    check("nonzero potential response", peak > 1e-5 ? 0 : 1, 0);
+                    check("radial potential derivative", error / peak, 2e-6);
+                    check("matching-data potential derivative", boundary_error, 2e-7);
+                }
+            }
+        }
+        for (auto invalid : {std::vector<double>{},
+                             std::vector<double>(grid.num_points(), std::numeric_limits<double>::quiet_NaN())}) {
+            bool rejected{false};
+            try {
+                solver.solve_potential_response(0, 0, energy, invalid);
+            } catch (std::exception const&) {
+                rejected = true;
+            }
+            check("invalid potential response direction", rejected ? 0 : 1, 0);
+        }
+    }
+    return failures;
+}
+
+int
 main(int argc, char** argv)
 {
     sirius::initialize(1);
     int result = call_test("test_radial_core_solver", test_radial_core_solver);
+    result += call_test("test_radial_potential_response", test_radial_potential_response);
     sirius::finalize();
     return result;
 }
