@@ -94,12 +94,7 @@ test_kinetic_density(bool gamma__)
     comm.allreduce<double, mpi::op_t::max>(&response_error, 1);
     double const tolerance = std::is_same_v<T, double> ? 2e-11 : 2e-6;
     int failures{0};
-    auto check = [&](char const* name, double difference, double threshold) {
-        if (comm.rank() == 0) {
-            std::cout << (gamma__ ? "Gamma " : "k-point ") << name << ": " << difference << '\n';
-        }
-        failures += !std::isfinite(difference) || difference > threshold;
-    };
+    Test_check check(failures, comm, gamma__ ? "Gamma" : "k-point");
     check("analytic tau", error, tolerance);
     check("analytic tau response", response_error, tolerance);
 

@@ -649,23 +649,9 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
     ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
     ks.initialize();
     int failures{0}, ns = ctx->num_spins(), nb = ctx->num_bands();
-    auto check = [&](char const* name, double error, double tolerance) {
-        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
-        if (ctx->comm().rank() == 0) {
-            std::cout << "occupation response spins=" << ns << " distributed FFT=" << distributed << " " << name << ": "
-                      << error << '\n';
-        }
-        failures += !std::isfinite(error) || error > tolerance;
-    };
-    auto reject = [&](char const* name, auto&& operation) {
-        bool rejected{false};
-        try {
-            operation();
-        } catch (std::exception const&) {
-            rejected = true;
-        }
-        check(name, rejected ? 0 : 1, 0);
-    };
+    Test_check check(failures, ctx->comm(),
+                     "occupation response spins=" + std::to_string(ns) +
+                             " distributed FFT=" + std::to_string(distributed));
     std::vector<mdarray<double, 2>> directions;
     for (auto it : ks.spl_num_kpoints()) {
         directions.emplace_back(std::array<index_range, 2>{nb, ns});
@@ -675,7 +661,7 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
             }
         }
     }
-    reject("missing chemical potential rejected", [&] { ks.band_occupation_response(directions); });
+    check.reject("missing chemical potential rejected", [&] { ks.band_occupation_response(directions); });
     auto snapshot = [&] {
         std::array<double, 2> mu{ks.energy_fermi_fixed_mag(0), ks.energy_fermi_fixed_mag(ns - 1)};
         std::vector<double> values;
@@ -768,11 +754,11 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
         }
     }
     check("uniform spectral shift leaves occupations unchanged", error, 1e-13);
-    reject("missing k-point directions rejected", [&] { ks.band_occupation_response({}); });
+    check.reject("missing k-point directions rejected", [&] { ks.band_occupation_response({}); });
     if (ctx->comm().rank() == 0 && !directions.empty()) {
         directions[0](0, 0) = std::numeric_limits<double>::quiet_NaN();
     }
-    reject("nonfinite directions rejected collectively", [&] { ks.band_occupation_response(directions); });
+    check.reject("nonfinite directions rejected collectively", [&] { ks.band_occupation_response(directions); });
     if (ctx->comm().rank() == 0 && !directions.empty()) {
         directions[0](0, 0) = 0.17;
     }
@@ -780,13 +766,14 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
         if (ctx->comm().rank() == 0 && !directions.empty()) {
             directions[0](0, 0) += 0.1;
         }
-        reject("inconsistent k-point replicas rejected", [&] { ks.band_occupation_response(directions); });
+        check.reject("inconsistent k-point replicas rejected", [&] { ks.band_occupation_response(directions); });
         if (ctx->comm().rank() == 0 && !directions.empty()) {
             directions[0](0, 0) = 0.17;
         }
     }
     ctx->cb().band_occ_ = [] {};
-    reject("custom occupation callback requires its own response", [&] { ks.band_occupation_response(directions); });
+    check.reject("custom occupation callback requires its own response",
+                 [&] { ks.band_occupation_response(directions); });
     ctx->cb().band_occ_ = nullptr;
     ctx->cfg().unlock();
     ctx->cfg().parameters().extra_charge(ctx->unit_cell().num_valence_electrons() - nb * ctx->max_occupancy());
@@ -821,23 +808,9 @@ test_lapw_density_response(int mag, bool distributed)
     Hamiltonian0<double> h0(gs.potential(), false);
     h0.generate_pw_coefs(gs.potential());
     int failures{0}, ns = ctx->num_spins(), nb = ctx->num_bands();
-    auto check = [&](char const* name, double error, double tolerance) {
-        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
-        if (ctx->comm().rank() == 0) {
-            std::cout << "constrained LAPW spins=" << ns << " distributed FFT=" << distributed << " " << name << ": "
-                      << error << '\n';
-        }
-        failures += !std::isfinite(error) || error > tolerance;
-    };
-    auto reject = [&](char const* name, auto&& operation) {
-        bool rejected{false};
-        try {
-            operation();
-        } catch (std::exception const&) {
-            rejected = true;
-        }
-        check(name, rejected ? 0 : 1, 0);
-    };
+    Test_check check(failures, ctx->comm(),
+                     "constrained LAPW spins=" + std::to_string(ns) +
+                             " distributed FFT=" + std::to_string(distributed));
     using matrix_t = la::dmatrix<std::complex<double>>;
     struct matrices_t
     {
@@ -960,9 +933,9 @@ test_lapw_density_response(int mag, bool distributed)
               std::abs((plus_entropy - minus_entropy) / (2 * step) - entropy_response), 2e-8);
     }
     sample(0);
-    reject("missing matrix directions rejected collectively", [&] { reference.density_matrix_response({}); });
+    check.reject("missing matrix directions rejected collectively", [&] { reference.density_matrix_response({}); });
     if (ctx->comm().size() > 1) {
-        reject("inconsistent entropy output rejected collectively", [&] {
+        check.reject("inconsistent entropy output rejected collectively", [&] {
             reference.density_matrix_response(directions, ctx->comm().rank() == 0 ? &entropy_response : nullptr);
         });
     }
@@ -971,7 +944,8 @@ test_lapw_density_response(int mag, bool distributed)
         saved                      = (*matrices[0].dh[0])(0, 0);
         (*matrices[0].dh[0])(0, 0) = std::numeric_limits<double>::quiet_NaN();
     }
-    reject("nonfinite matrix direction rejected collectively", [&] { reference.density_matrix_response(directions); });
+    check.reject("nonfinite matrix direction rejected collectively",
+                 [&] { reference.density_matrix_response(directions); });
     if (ctx->comm().rank() == 0 && !matrices.empty()) {
         (*matrices[0].dh[0])(0, 0) = saved;
         for (auto it : ks.spl_num_kpoints()) {
@@ -980,7 +954,7 @@ test_lapw_density_response(int mag, bool distributed)
             break;
         }
     }
-    reject("changed reference rejected collectively", [&] { reference.density_matrix_response(directions); });
+    check.reject("changed reference rejected collectively", [&] { reference.density_matrix_response(directions); });
     sample(0);
     for (auto& m : matrices) {
         for (int spin = 0; spin < ns; spin++) {
@@ -1065,23 +1039,8 @@ test_lapw_coupled_response(int mag, bool distributed)
     DFT_ground_state gs(ks);
     gs.initial_state();
     int failures{0}, ns = ctx->num_spins();
-    auto check = [&](char const* name, double error, double tolerance) {
-        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
-        if (ctx->comm().rank() == 0) {
-            std::cout << "coupled LAPW spins=" << ns << " distributed FFT=" << distributed << " " << name << ": "
-                      << error << '\n';
-        }
-        failures += !std::isfinite(error) || error > tolerance;
-    };
-    auto reject = [&](char const* name, auto&& operation) {
-        bool rejected{false};
-        try {
-            operation();
-        } catch (std::exception const&) {
-            rejected = true;
-        }
-        check(name, rejected ? 0 : 1, 0);
-    };
+    Test_check check(failures, ctx->comm(),
+                     "coupled LAPW spins=" + std::to_string(ns) + " distributed FFT=" + std::to_string(distributed));
     auto prepare = [&](Density& d) {
         for (int s = 0; s < ns; s++) {
             for (auto* f : {&d.component(s), &d.kinetic_density().component(s)}) {
@@ -1283,7 +1242,8 @@ test_lapw_coupled_response(int mag, bool distributed)
         }
     }
     ctx->cb().external_xc_quadrature_direction_ = nullptr;
-    reject("geometry right-hand side requires a host quadrature tangent", [&] { response.geometry_rhs(geometry); });
+    check.reject("geometry right-hand side requires a host quadrature tangent",
+                 [&] { response.geometry_rhs(geometry); });
     ctx->cb().external_xc_quadrature_direction_ = quadrature_tangent;
     auto zero_solution                          = response.solve(zero, 1e-8, 1);
     check("zero right-hand side converges without mixing", zero_solution.residual, 0);
@@ -1321,14 +1281,14 @@ test_lapw_coupled_response(int mag, bool distributed)
     if (ctx->comm().rank() == 0) {
         std::cout << "coupled LAPW solve iterations: " << solution.iterations << '\n';
     }
-    reject("one iteration does not claim convergence", [&] { response.solve(rhs, 1e-8, 1); });
-    reject("invalid response controls rejected collectively",
-           [&] { response.solve(rhs, ctx->comm().rank() == 0 ? -1 : 1e-8, 10); });
+    check.reject("one iteration does not claim convergence", [&] { response.solve(rhs, 1e-8, 1); });
+    check.reject("invalid response controls rejected collectively",
+                 [&] { response.solve(rhs, ctx->comm().rank() == 0 ? -1 : 1e-8, 10); });
     double saved_tau = rhs.kinetic_density().scalar().rg().value(0);
     if (ctx->comm().rank() == 0) {
         rhs.kinetic_density().scalar().rg().value(0) = std::numeric_limits<double>::quiet_NaN();
     }
-    reject("nonfinite kinetic-density direction rejected collectively", [&] { response.apply(rhs); });
+    check.reject("nonfinite kinetic-density direction rejected collectively", [&] { response.apply(rhs); });
     rhs.kinetic_density().scalar().rg().value(0) = saved_tau;
     auto after                                   = values(gs.density());
     error                                        = 0;
@@ -1351,25 +1311,11 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     bool simple = !mag && second_variation && !core;
     auto ctx    = context(mag, distributed_fft, second_variation, core, false, 0, 5.0, simple);
     int failures{0};
-    auto check = [&](char const* name, double error, double tolerance) {
-        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
-        if (ctx->comm().rank() == 0) {
-            std::cout << "external LAPW core=" << core << " spins=" << ctx->num_spins()
-                      << " atoms=" << ctx->unit_cell().num_atoms() << " distributed FFT=" << distributed_fft
-                      << " second variation=" << second_variation << " simple radial integrals=" << simple << " "
-                      << name << ": " << error << '\n';
-        }
-        failures += !std::isfinite(error) || error > tolerance;
-    };
-    auto reject = [&](char const* name, auto&& operation) {
-        bool rejected{false};
-        try {
-            operation();
-        } catch (std::exception const&) {
-            rejected = true;
-        }
-        check(name, rejected ? 0 : 1, 0);
-    };
+    Test_check check(failures, ctx->comm(),
+                     "external LAPW core=" + std::to_string(core) + " spins=" + std::to_string(ctx->num_spins()) +
+                             " atoms=" + std::to_string(ctx->unit_cell().num_atoms()) + " distributed FFT=" +
+                             std::to_string(distributed_fft) + " second variation=" + std::to_string(second_variation) +
+                             " simple radial integrals=" + std::to_string(simple));
     K_point_set ks(*ctx);
     ks.add_kpoint({0.07, -0.03, 0.02}, 1);
     ks.initialize();
@@ -1521,23 +1467,23 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         if (ctx->comm().rank() == 0) {
             bad_geometry.atoms.clear();
         }
-        reject("Hartree geometry rejects malformed directions collectively",
-               [&] { potential.hartree_geometry_response(direction, bad_geometry); });
+        check.reject("Hartree geometry rejects malformed directions collectively",
+                     [&] { potential.hartree_geometry_response(direction, bad_geometry); });
         bad_geometry = geometry;
         if (ctx->comm().rank() == 0) {
             bad_geometry.lattice[0] = std::numeric_limits<double>::quiet_NaN();
         }
-        reject("Hartree geometry rejects nonfinite directions collectively",
-               [&] { potential.hartree_geometry_response(direction, bad_geometry); });
+        check.reject("Hartree geometry rejects nonfinite directions collectively",
+                     [&] { potential.hartree_geometry_response(direction, bad_geometry); });
         if (ctx->comm().size() > 1) {
             bad_geometry = geometry;
             if (ctx->comm().rank() == 0) {
                 bad_geometry.atoms[0][0] += 0.01;
             }
-            reject("Hartree geometry rejects inconsistent replicas",
-                   [&] { potential.hartree_geometry_response(direction, bad_geometry); });
-            reject("Hartree geometry rejects inconsistent nuclear flags",
-                   [&] { potential.hartree_geometry_response(direction, geometry, ctx->comm().rank() == 0); });
+            check.reject("Hartree geometry rejects inconsistent replicas",
+                         [&] { potential.hartree_geometry_response(direction, bad_geometry); });
+            check.reject("Hartree geometry rejects inconsistent nuclear flags",
+                         [&] { potential.hartree_geometry_response(direction, geometry, ctx->comm().rank() == 0); });
         }
         check("Hartree response preserves potential and energy",
               potential_samples(potential.hartree_potential()) != saved || potential.energy_vha() != saved_energy ? 1
@@ -1550,21 +1496,24 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         if (ctx->comm().rank() == 0) {
             direction.rg().f_pw_local(0) = std::numeric_limits<double>::quiet_NaN();
         }
-        reject("nonfinite Hartree direction rejected collectively", [&] { potential.hartree_response(direction); });
-        reject("nonfinite Hartree geometry density rejected collectively",
-               [&] { potential.hartree_geometry_response(direction, geometry); });
+        check.reject("nonfinite Hartree direction rejected collectively",
+                     [&] { potential.hartree_response(direction); });
+        check.reject("nonfinite Hartree geometry density rejected collectively",
+                     [&] { potential.hartree_geometry_response(direction, geometry); });
         direction.zero();
         for (auto it : ctx->unit_cell().spl_num_atoms()) {
             if (it.i == 0) {
                 direction.mt()[it.i](0, 0) = std::numeric_limits<double>::quiet_NaN();
             }
         }
-        reject("nonfinite MT Hartree direction rejected collectively", [&] { potential.hartree_response(direction); });
+        check.reject("nonfinite MT Hartree direction rejected collectively",
+                     [&] { potential.hartree_response(direction); });
         Periodic_function<double> no_spheres(*ctx);
         no_spheres.zero();
-        reject("missing MT Hartree direction rejected collectively", [&] { potential.hartree_response(no_spheres); });
-        reject("missing MT Hartree geometry density rejected collectively",
-               [&] { potential.hartree_geometry_response(no_spheres, geometry); });
+        check.reject("missing MT Hartree direction rejected collectively",
+                     [&] { potential.hartree_response(no_spheres); });
+        check.reject("missing MT Hartree geometry density rejected collectively",
+                     [&] { potential.hartree_geometry_response(no_spheres, geometry); });
     }
     if (!core) {
         Density direction(*ctx), shifted(*ctx);
@@ -1662,23 +1611,23 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
               0);
         ctx->cb().external_xc_          = functional;
         ctx->cb().external_xc_response_ = nullptr;
-        reject("missing XC response callback rejected collectively",
-               [&] { potential.lapw_external_xc_response(density, direction); });
+        check.reject("missing XC response callback rejected collectively",
+                     [&] { potential.lapw_external_xc_response(density, direction); });
         ctx->cb().external_xc_response_ = [](auto const& c, auto const& in, auto const& d, auto& out) {
             functional_response(c, in, d, out);
             if (c.comm().rank() == 0) {
                 out.vrho[0] = std::numeric_limits<double>::quiet_NaN();
             }
         };
-        reject("nonfinite XC response rejected collectively",
-               [&] { potential.lapw_external_xc_response(density, direction); });
+        check.reject("nonfinite XC response rejected collectively",
+                     [&] { potential.lapw_external_xc_response(density, direction); });
         ctx->cb().external_xc_response_ = [](auto const& c, auto const&, auto const&, auto&) {
             if (c.comm().rank() == 0) {
                 RTE_THROW("XC response fixture failure");
             }
         };
-        reject("XC response callback failure propagated collectively",
-               [&] { potential.lapw_external_xc_response(density, direction); });
+        check.reject("XC response callback failure propagated collectively",
+                     [&] { potential.lapw_external_xc_response(density, direction); });
         ctx->cb().external_xc_response_          = functional_response;
         ctx->cb().external_xc_geometry_          = functional;
         ctx->cb().external_xc_geometry_response_ = true;
@@ -1728,32 +1677,32 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         if (ctx->comm().rank() == 0) {
             bad_host.atoms.clear();
         }
-        reject("wrong host geometry shape rejected collectively",
-               [&] { potential.external_xc_quadrature_direction(bad_host); });
+        check.reject("wrong host geometry shape rejected collectively",
+                     [&] { potential.external_xc_quadrature_direction(bad_host); });
         bad_host = host_direction;
         if (ctx->comm().rank() == 0) {
             bad_host.lattice[0] = std::numeric_limits<double>::quiet_NaN();
         }
-        reject("nonfinite host geometry direction rejected collectively",
-               [&] { potential.external_xc_quadrature_direction(bad_host); });
+        check.reject("nonfinite host geometry direction rejected collectively",
+                     [&] { potential.external_xc_quadrature_direction(bad_host); });
         if (ctx->comm().size() > 1) {
             bad_host = host_direction;
             if (ctx->comm().rank() == 0) {
                 bad_host.atoms[0][0] += 1;
             }
-            reject("inconsistent host geometry replicas rejected collectively",
-                   [&] { potential.external_xc_quadrature_direction(bad_host); });
+            check.reject("inconsistent host geometry replicas rejected collectively",
+                         [&] { potential.external_xc_quadrature_direction(bad_host); });
         }
         ctx->cb().external_xc_quadrature_direction_ = [](auto const& c, auto const&, auto const&, auto& out) {
             if (c.comm().rank() == 0) {
                 out.energy_weights[0] = std::numeric_limits<double>::quiet_NaN();
             }
         };
-        reject("nonfinite host quadrature tangent rejected collectively",
-               [&] { potential.external_xc_quadrature_direction(host_direction); });
+        check.reject("nonfinite host quadrature tangent rejected collectively",
+                     [&] { potential.external_xc_quadrature_direction(host_direction); });
         ctx->cb().external_xc_quadrature_direction_ = nullptr;
-        reject("missing host tangent is not silently treated as fixed quadrature",
-               [&] { potential.external_xc_quadrature_direction(host_direction); });
+        check.reject("missing host tangent is not silently treated as fixed quadrature",
+                     [&] { potential.external_xc_quadrature_direction(host_direction); });
         auto geometry_sample = [&](double step) {
             auto displacement = step * r3::dot(ctx->unit_cell().inverse_lattice_vectors(), translation);
             for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
@@ -1816,12 +1765,12 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         if (ctx->comm().rank() == 0) {
             geometry.coordinates.push_back({0, 0, 0});
         }
-        reject("wrong quadrature direction shape rejected collectively", apply_point);
+        check.reject("wrong quadrature direction shape rejected collectively", apply_point);
         geometry = xc_point_derivatives_t(quadrature);
         if (ctx->comm().rank() == 0) {
             geometry.energy_weights[0] = std::numeric_limits<double>::quiet_NaN();
         }
-        reject("nonfinite quadrature direction rejected collectively", apply_point);
+        check.reject("nonfinite quadrature direction rejected collectively", apply_point);
         geometry                        = xc_point_derivatives_t(quadrature);
         ctx->cb().external_xc_response_ = [](auto const& c, auto const& in, auto const& d, auto& out) {
             functional_response(c, in, d, out);
@@ -1829,15 +1778,15 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 out.geometry->coordinates[0][0] = std::numeric_limits<double>::quiet_NaN();
             }
         };
-        reject("nonfinite quadrature response rejected collectively", apply_point);
+        check.reject("nonfinite quadrature response rejected collectively", apply_point);
         ctx->cb().external_xc_response_          = functional_response;
         ctx->cb().external_xc_geometry_response_ = false;
-        reject("field-only callback rejects quadrature differentiation", apply_point);
+        check.reject("field-only callback rejects quadrature differentiation", apply_point);
         if (ctx->comm().rank() == 0) {
             direction.rho().mt()[0](0, 0) = std::numeric_limits<double>::quiet_NaN();
         }
-        reject("nonfinite XC MT direction rejected collectively",
-               [&] { potential.lapw_external_xc_response(density, direction); });
+        check.reject("nonfinite XC MT direction rejected collectively",
+                     [&] { potential.lapw_external_xc_response(density, direction); });
     }
     Density regenerated(*ctx);
     copy(density, regenerated);
@@ -1911,7 +1860,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         check("XC operator is staged", potential.lapw_xc_derivatives() ? 0 : 1, 0);
     };
     check_energy();
-    reject("point potential cannot be symmetrized independently", [&] { potential.generate(density, true, true); });
+    check.reject("point potential cannot be symmetrized independently",
+                 [&] { potential.generate(density, true, true); });
 
     auto result = gs.find(1e-9, 1e-10, 1e-9, 100, false);
     check("SCF convergence", result.at("converged").get<bool>() ? 0 : 1, 0);
@@ -1949,8 +1899,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     auto saved_orbitals = orbital_snapshot();
     auto saved_basis    = basis_snapshot();
     double saved_energy = gs.total_energy(), saved_exc = potential.energy_exc(density);
-    reject("LAPW forces require complete host geometry callbacks", [&] { gs.forces().calc_forces_total(); });
-    reject("LAPW stress requires complete host geometry callbacks", [&] { gs.stress().calc_stress_total(); });
+    check.reject("LAPW forces require complete host geometry callbacks", [&] { gs.forces().calc_forces_total(); });
+    check.reject("LAPW stress requires complete host geometry callbacks", [&] { gs.stress().calc_stress_total(); });
     auto verify_restored = [&] {
         check("orbital diagnostic restores PW/AW/LO coefficients", orbital_snapshot() == saved_orbitals ? 0 : 1, 0);
         check("orbital diagnostic holds radial basis fixed", basis_snapshot() == saved_basis ? 0 : 1, 0);
@@ -1977,7 +1927,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             throw std::runtime_error("deliberate LAPW derivative-check callback failure");
         }
     };
-    reject("orbital diagnostic propagates callback failure", [&] { gs.check_external_xc_derivative(1e-4); });
+    check.reject("orbital diagnostic propagates callback failure", [&] { gs.check_external_xc_derivative(1e-4); });
     verify_restored();
     potential.generate(density, false, true);
     check("orbital diagnostic restores evaluator", evaluations == 3 ? 0 : 1, 0);
@@ -2080,20 +2030,20 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 if (ctx->comm().rank() == 0) {
                     xc.local[0][1][0][0] = std::numeric_limits<double>::quiet_NaN();
                 }
-                reject("invalid XC field matrix input rejected collectively",
-                       [&] { h0.lapw_field_response(*hartree, xc); });
+                check.reject("invalid XC field matrix input rejected collectively",
+                             [&] { h0.lapw_field_response(*hartree, xc); });
                 xc.local[0][1][0][0] = saved;
                 if (ctx->comm().rank() == 0) {
                     saved               = hartree->mt()[0][0];
                     hartree->mt()[0][0] = std::numeric_limits<double>::quiet_NaN();
                 }
-                reject("invalid Hartree field matrix input rejected collectively",
-                       [&] { h0.lapw_field_response(*hartree, xc); });
+                check.reject("invalid Hartree field matrix input rejected collectively",
+                             [&] { h0.lapw_field_response(*hartree, xc); });
                 if (ctx->comm().rank() == 0) {
                     hartree->mt()[0][0] = saved;
                 }
                 auto invalid_energy_fields = potential.lapw_external_xc_response(density, direction);
-                reject("nonfinite staged LAPW energy rejected collectively", [&] {
+                check.reject("nonfinite staged LAPW energy rejected collectively", [&] {
                     probe.set_lapw_xc_derivatives(std::move(invalid_energy_fields),
                                                   ctx->comm().rank() == 0 ? std::numeric_limits<double>::quiet_NaN()
                                                                           : 0.0);
@@ -2562,15 +2512,15 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                             : "PW/LO density matrix reproduces physical tau response",
                   error / std::max(1e-12, peak), 1e-10);
         }
-        reject("coefficient fields reject missing k-point matrices",
-               [&] { density.lapw_density_matrix_fields(ks, {}); });
+        check.reject("coefficient fields reject missing k-point matrices",
+                     [&] { density.lapw_density_matrix_fields(ks, {}); });
         std::complex<double> saved_coefficient{0};
         if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
             saved_coefficient                = coefficient_matrices[0](0, 0, 0);
             coefficient_matrices[0](0, 0, 0) = std::numeric_limits<double>::quiet_NaN();
         }
-        reject("coefficient fields reject a nonfinite matrix collectively",
-               [&] { density.lapw_density_matrix_fields(ks, coefficient_matrices); });
+        check.reject("coefficient fields reject a nonfinite matrix collectively",
+                     [&] { density.lapw_density_matrix_fields(ks, coefficient_matrices); });
         if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
             coefficient_matrices[0](0, 0, 0) = saved_coefficient;
         }
@@ -2578,8 +2528,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
                 coefficient_matrices[0](0, 0, 0) += 0.1;
             }
-            reject("coefficient fields reject inconsistent k-point replicas",
-                   [&] { density.lapw_density_matrix_fields(ks, coefficient_matrices); });
+            check.reject("coefficient fields reject inconsistent k-point replicas",
+                         [&] { density.lapw_density_matrix_fields(ks, coefficient_matrices); });
             if (ctx->comm().rank() == 0 && !coefficient_matrices.empty()) {
                 coefficient_matrices[0](0, 0, 0) = saved_coefficient;
             }
@@ -2683,21 +2633,21 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 if (ctx->comm().rank() == 0) {
                     bad.atoms.clear();
                 }
-                reject("geometry fields reject malformed directions collectively",
-                       [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
+                check.reject("geometry fields reject malformed directions collectively",
+                             [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
                 bad = direction;
                 if (ctx->comm().rank() == 0) {
                     bad.lattice[0] = std::numeric_limits<double>::quiet_NaN();
                 }
-                reject("geometry fields reject nonfinite directions collectively",
-                       [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
+                check.reject("geometry fields reject nonfinite directions collectively",
+                             [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
                 if (ctx->comm().size() > 1) {
                     bad = direction;
                     if (ctx->comm().rank() == 0) {
                         bad.atoms[0][0] += 0.01;
                     }
-                    reject("geometry fields reject inconsistent replicas",
-                           [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
+                    check.reject("geometry fields reject inconsistent replicas",
+                                 [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
                 }
             }
             verify_restored();
@@ -2890,8 +2840,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 if (ctx->comm().rank() == 0 && !invalid_orbitals.empty()) {
                     invalid_orbitals[0] = nullptr;
                 }
-                reject("invalid orbital direction rejected collectively",
-                       [&] { density.lapw_orbital_fields_response(ks, invalid_orbitals); });
+                check.reject("invalid orbital direction rejected collectively",
+                             [&] { density.lapw_orbital_fields_response(ks, invalid_orbitals); });
                 std::vector<radial_basis_response_t> zero;
                 for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
                     zero.emplace_back(ctx->unit_cell().atom_symmetry_class(ic).atom_type());
@@ -2910,16 +2860,16 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 if (ctx->comm().rank() == 0) {
                     zero[0].surface_derivatives[0] = std::numeric_limits<double>::quiet_NaN();
                 }
-                reject("nonfinite field response rejected collectively",
-                       [&] { density.lapw_radial_fields_response(ks, zero); });
-                reject("nonfinite atom matrix response rejected collectively",
-                       [&] { basis_h0.lapw_radial_basis_response(zero); });
+                check.reject("nonfinite field response rejected collectively",
+                             [&] { density.lapw_radial_fields_response(ks, zero); });
+                check.reject("nonfinite atom matrix response rejected collectively",
+                             [&] { basis_h0.lapw_radial_basis_response(zero); });
                 zero[0].surface_derivatives[0] = 0;
                 if (ctx->comm().rank() == 0) {
                     zero[0].core_fields[0].pop_back();
                 }
-                reject("invalid core field response rejected collectively",
-                       [&] { density.lapw_radial_fields_response(ks, zero); });
+                check.reject("invalid core field response rejected collectively",
+                             [&] { density.lapw_radial_fields_response(ks, zero); });
                 auto direction = radial_direction;
                 for (auto& atom : direction) {
                     std::fill(atom.begin(), atom.end(), 0);
@@ -2929,15 +2879,15 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 if (ctx->comm().rank() == 0) {
                     direction[0].pop_back();
                 }
-                reject("invalid radial direction rejected collectively",
-                       [&] { gs.forces().lapw_radial_basis_derivative(direction); });
+                check.reject("invalid radial direction rejected collectively",
+                             [&] { gs.forces().lapw_radial_basis_derivative(direction); });
                 for (int j : {0, 1}) {
                     auto invalid_xc = xc_direction;
                     if (ctx->comm().rank() == 0) {
                         invalid_xc[0][j] = {std::numeric_limits<double>::quiet_NaN()};
                     }
-                    reject("invalid radial XC direction rejected collectively",
-                           [&] { gs.forces().lapw_radial_basis_derivative(radial_direction, invalid_xc); });
+                    check.reject("invalid radial XC direction rejected collectively",
+                                 [&] { gs.forces().lapw_radial_basis_derivative(radial_direction, invalid_xc); });
                 }
                 verify_restored();
             }
@@ -3565,11 +3515,7 @@ test_lapw_linearization_response()
         direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
     }
     int failures{0};
-    auto check = [&](char const* name, double error, double tolerance) {
-        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
-        std::cout << name << ": " << error << " (limit " << tolerance << ")\n";
-        failures += !std::isfinite(error) || error > tolerance;
-    };
+    Test_check check(failures, ctx->comm());
     // Test moving and frozen linearisation energies against the same occupied-state contraction.
     for (bool update_enu : {false, true}) {
         double analytic = gs.forces().lapw_radial_basis_derivative({direction}, {}, update_enu);
@@ -3762,10 +3708,8 @@ main(int argc, char** argv)
     }
     for (int mag : {0, 1}) {
         for (bool second : {false, true}) {
-            result += call_test("external LAPW SCF", test_lapw_external, mag, false, second, false);
-            if (mpi::Communicator::world().size() > 1) {
-                result += call_test("external LAPW distributed FFT SCF", test_lapw_external, mag, true, second, false);
-            }
+            bool distributed = mpi::Communicator::world().size() > 1 && mag != second;
+            result += call_test("external LAPW SCF", test_lapw_external, mag, distributed, second, false);
         }
     }
     result += call_test("external LAPW core response guard", test_core_guard);
