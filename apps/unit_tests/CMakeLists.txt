@@ -95,6 +95,11 @@ add_test(NAME test_lapw_external_xc_core COMMAND test_lapw_external_xc core)
 set_tests_properties(test_lapw_external_xc_core PROPERTIES
   TIMEOUT 240 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 if(MPIEXEC_EXECUTABLE)
+  add_test(NAME test_lapw_external_xc_core_cell_mpi
+    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+            $<TARGET_FILE:test_lapw_external_xc> core-cell 1 ${MPIEXEC_POSTFLAGS})
+  set_tests_properties(test_lapw_external_xc_core_cell_mpi PROPERTIES
+    TIMEOUT 600 PROCESSORS 2 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
   add_test(NAME test_lapw_external_xc_force_mpi
     COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
             $<TARGET_FILE:test_lapw_external_xc> force-response ${MPIEXEC_POSTFLAGS})
