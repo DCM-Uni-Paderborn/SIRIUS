@@ -27,6 +27,10 @@ class LAPW_response
     std::unique_ptr<LAPW_density_response> spectrum_;
     std::vector<mdarray<std::complex<double>, 3>> matrices_;
 
+    std::unique_ptr<Density>
+    potential_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__,
+                       xc_geometry_direction_t const* geometry__ = nullptr) const;
+
   public:
     struct result_t
     {
@@ -41,6 +45,15 @@ class LAPW_response
     /** Directions use synchronized total/magnetization rho/tau fields. */
     std::unique_ptr<Density>
     apply(Density const& direction__) const;
+
+    /// Explicit SCF-map geometry derivative at fixed input rho/tau coefficients.
+    /** Includes Poisson/XC sampling, radial functions, PW/LO matrices, occupations
+     *  and the output field map. Requires the host quadrature tangent and joint XC
+     *  Hessian. MT radii and point-domain membership remain fixed. Use solve to
+     *  include the induced SCF response.
+     */
+    std::unique_ptr<Density>
+    geometry_rhs(xc_geometry_direction_t const& direction__) const;
 
     /// Solve (I-J)*x=rhs by stable Anderson mixing with an independently checked residual.
     /** The residual is the maximum fieldwise infinity norm of rhs+J*x-x,

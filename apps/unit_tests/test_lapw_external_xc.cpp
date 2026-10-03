@@ -17,6 +17,9 @@ using namespace sirius;
 
 namespace {
 
+// A fixed model parameter keeps geometry dependence in the explicit quadrature data.
+constexpr double functional_normalization = 336.0;
+
 double
 functional_scale(Simulation_context const& ctx)
 {
@@ -37,7 +40,7 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
         }
     }
     ctx.comm().allreduce(&moment, 1);
-    double nonlocal = 0.01 * moment / ctx.unit_cell().omega();
+    double nonlocal = 0.01 * moment / functional_normalization;
     for (int s = 0; s < in.num_spins; s++) {
         for (int p = 0; p < in.num_points; p++) {
             int j    = p + in.num_points * s;
@@ -98,8 +101,8 @@ functional_response(Simulation_context const& ctx, xc_callback_input_t const& in
     }
     ctx.comm().allreduce(&moment, 1);
     ctx.comm().allreduce(&base_moment, 1);
-    double nonlocal = 0.01 * moment / ctx.unit_cell().omega(), scale = functional_scale(ctx);
-    double base_nonlocal = 0.01 * base_moment / ctx.unit_cell().omega();
+    double nonlocal = 0.01 * moment / functional_normalization, scale = functional_scale(ctx);
+    double base_nonlocal = 0.01 * base_moment / functional_normalization;
     for (int s = 0; s < in.num_spins; s++) {
         for (int p = 0; p < in.num_points; p++) {
             int j    = p + in.num_points * s;
@@ -968,6 +971,59 @@ int
 test_lapw_coupled_response(int mag, bool distributed)
 {
     auto ctx = context(mag, distributed, false, false, false, 0, 5.0, false, 0, "fermi_dirac");
+    // Geometry derivatives require unchanged point-domain membership throughout the stencil.
+    auto points          = std::make_shared<xc_point_set_t>(*ctx);
+    auto const& original = *ctx->cb().external_xc_points_;
+    for (size_t p = 0; p < original.coordinates.size(); p++) {
+        auto const& xyz = original.coordinates[p];
+        bool near_boundary{false};
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            auto const& atom = ctx->unit_cell().atom(ia);
+            auto r           = r3::vector<double>{xyz[0], xyz[1], xyz[2]} -
+                               ctx->unit_cell().get_cartesian_coordinates(atom.position());
+            auto fractional  = dot(ctx->unit_cell().inverse_lattice_vectors(), r);
+            for (int x = 0; x < 3; x++) {
+                fractional[x] -= std::round(fractional[x]);
+            }
+            double distance = dot(ctx->unit_cell().lattice_vectors(), fractional).length();
+            near_boundary |= std::abs(distance - atom.mt_radius()) < 0.04;
+        }
+        if (!near_boundary) {
+            points->coordinates.push_back(xyz);
+            points->energy_weights.push_back(original.energy_weights[p]);
+            points->descriptor_weights.push_back(original.descriptor_weights[p]);
+        }
+    }
+    if (!points->coordinates.empty()) {
+        points->block_sizes   = {static_cast<int>(points->coordinates.size())};
+        points->block_centres = original.block_centres;
+    }
+    ctx->cb().external_xc_points_            = std::move(points);
+    ctx->cb().external_xc_geometry_          = functional;
+    ctx->cb().external_xc_geometry_response_ = true;
+    auto quadrature_tangent                  = [](auto const& c, auto const& q, auto const& d, auto& out) {
+        r3::matrix<double> lattice;
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                lattice(x, y) = d.lattice[x + 3 * y];
+            }
+        }
+        auto strain  = dot(lattice, c.unit_cell().inverse_lattice_vectors());
+        double trace = strain(0, 0) + strain(1, 1) + strain(2, 2);
+        auto move    = [&](auto const& r) {
+            auto delta = dot(strain, r3::vector<double>{r[0], r[1], r[2]});
+            return std::array<double, 3>{delta[0] + d.atoms[0][0], delta[1] + d.atoms[0][1], delta[2] + d.atoms[0][2]};
+        };
+        for (size_t p = 0; p < q.coordinates.size(); p++) {
+            out.coordinates[p]        = move(q.coordinates[p]);
+            out.energy_weights[p]     = trace * q.energy_weights[p];
+            out.descriptor_weights[p] = trace * q.descriptor_weights[p];
+        }
+        for (size_t b = 0; b < q.block_centres.size(); b++) {
+            out.block_centres[b] = move(q.block_centres[b]);
+        }
+    };
+    ctx->cb().external_xc_quadrature_direction_ = quadrature_tangent;
     K_point_set ks(*ctx);
     ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
     ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
@@ -1021,6 +1077,48 @@ test_lapw_coupled_response(int mag, bool distributed)
     zero.kinetic_density().zero();
     // Differentiate one production SCF map, not a manufactured Hamiltonian.
     // Complete eigenvectors are used only for scratch density matrices; stored orbitals stay fixed.
+    auto map = [&](Density const& input, K_point_set& kpoints) {
+        auto& c = kpoints.ctx();
+        Potential potential(c);
+        potential.generate(input, false, true);
+        Hamiltonian0<double> h0(potential, true);
+        h0.generate_pw_coefs(potential);
+        std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra;
+        using matrix_t = la::dmatrix<std::complex<double>>;
+        for (auto it : kpoints.spl_num_kpoints()) {
+            auto& kp = *kpoints.get<double>(it.i);
+            auto hk  = h0(kp);
+            int n = kp.gklo_basis_size(), bs = c.cyclic_block_size();
+            matrix_t h(n, n, c.blacs_grid(), bs, bs), s(n, n, c.blacs_grid(), bs, bs);
+            spectra.emplace_back();
+            for (int spin = 0; spin < ns; spin++) {
+                hk.set_fv_h_o(spin, h, s);
+                spectra.back()[spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
+                for (int b = 0; b < c.num_bands(); b++) {
+                    kp.band_energy(b, spin, spectra.back()[spin]->energies()[b]);
+                }
+            }
+        }
+        kpoints.sync_band<double, sync_band_t::energy>();
+        kpoints.find_band_occupancies<double>();
+        std::vector<mdarray<std::complex<double>, 3>> matrices;
+        size_t ik{0};
+        for (auto it : kpoints.spl_num_kpoints()) {
+            auto const& kp = *kpoints.get<double>(it.i);
+            int n          = kp.gklo_basis_size();
+            matrices.emplace_back(std::array<index_range, 3>{n, n, ns});
+            for (int spin = 0; spin < ns; spin++) {
+                std::vector<double> f(n, 0);
+                for (int b = 0; b < c.num_bands(); b++) {
+                    f[b] = kp.band_occupancy(b, spin);
+                }
+                auto p = spectra[ik][spin]->density_matrix(f);
+                std::copy_n(p.at(memory_t::host), p.size(), matrices.back().at(memory_t::host) + spin * p.size());
+            }
+            ik++;
+        }
+        return input.lapw_density_matrix_fields(kpoints, matrices);
+    };
     auto sample = [&](double step) {
         Density input(*ctx);
         copy(gs.density(), input);
@@ -1029,45 +1127,7 @@ test_lapw_coupled_response(int mag, bool distributed)
             axpy(step, direction.kinetic_density().component(s), input.kinetic_density().component(s));
         }
         prepare(input);
-        Potential potential(*ctx);
-        potential.generate(input, false, true);
-        Hamiltonian0<double> h0(potential, true);
-        h0.generate_pw_coefs(potential);
-        std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra;
-        using matrix_t = la::dmatrix<std::complex<double>>;
-        for (auto it : ks.spl_num_kpoints()) {
-            auto& kp = *ks.get<double>(it.i);
-            auto hk  = h0(kp);
-            int n = kp.gklo_basis_size(), bs = ctx->cyclic_block_size();
-            matrix_t h(n, n, ctx->blacs_grid(), bs, bs), s(n, n, ctx->blacs_grid(), bs, bs);
-            spectra.emplace_back();
-            for (int spin = 0; spin < ns; spin++) {
-                hk.set_fv_h_o(spin, h, s);
-                spectra.back()[spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
-                for (int b = 0; b < ctx->num_bands(); b++) {
-                    kp.band_energy(b, spin, spectra.back()[spin]->energies()[b]);
-                }
-            }
-        }
-        ks.sync_band<double, sync_band_t::energy>();
-        ks.find_band_occupancies<double>();
-        std::vector<mdarray<std::complex<double>, 3>> matrices;
-        size_t ik{0};
-        for (auto it : ks.spl_num_kpoints()) {
-            auto const& kp = *ks.get<double>(it.i);
-            int n          = kp.gklo_basis_size();
-            matrices.emplace_back(std::array<index_range, 3>{n, n, ns});
-            for (int spin = 0; spin < ns; spin++) {
-                std::vector<double> f(n, 0);
-                for (int b = 0; b < ctx->num_bands(); b++) {
-                    f[b] = kp.band_occupancy(b, spin);
-                }
-                auto p = spectra[ik][spin]->density_matrix(f);
-                std::copy_n(p.at(memory_t::host), p.size(), matrices.back().at(memory_t::host) + spin * p.size());
-            }
-            ik++;
-        }
-        auto result = gs.density().lapw_density_matrix_fields(ks, matrices);
+        auto result = map(input, ks);
         gs.potential().update_atomic_potential();
         ctx->unit_cell().generate_radial_functions(ctx->out());
         ctx->unit_cell().generate_radial_integrals();
@@ -1095,7 +1155,103 @@ test_lapw_coupled_response(int mag, bool distributed)
         zero_error = std::max(zero_error, std::abs(v));
     }
     check("zero coupled response", zero_error, 1e-13);
-    auto zero_solution = response.solve(zero, 1e-8, 1);
+    xc_geometry_direction_t geometry(ctx->unit_cell().num_atoms());
+    zero_error = 0;
+    for (auto v : values(*response.geometry_rhs(geometry))) {
+        zero_error = std::max(zero_error, std::abs(v));
+    }
+    check("zero geometry right-hand side", zero_error, 1e-13);
+    auto probe = context(mag, distributed, false, false, false, 0, 5.0, false, 0, "fermi_dirac");
+    K_point_set probe_ks(*probe);
+    probe_ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
+    probe_ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
+    probe_ks.initialize();
+    Density input(*probe);
+    for (int s = 0; s < ns; s++) {
+        copy(gs.density().component(s), input.component(s));
+        copy(gs.density().kinetic_density().component(s), input.kinetic_density().component(s));
+    }
+    auto lattice    = probe->unit_cell().lattice_vectors();
+    auto quadrature = ctx->cb().external_xc_points_;
+    std::vector<r3::vector<double>> centres;
+    for (int ia = 0; ia < probe->unit_cell().num_atoms(); ia++) {
+        centres.push_back(probe->unit_cell().get_cartesian_coordinates(probe->unit_cell().atom(ia).position()));
+    }
+    for (int part = 0; part < 3; part++) {
+        geometry = xc_geometry_direction_t(ctx->unit_cell().num_atoms());
+        if (part != 1) {
+            geometry.atoms[0] = {0.23, -0.37, 0.19};
+        }
+        r3::matrix<double> strain;
+        if (part != 0) {
+            strain(0, 0) = 0.07;
+            strain(1, 1) = -0.03;
+            strain(2, 2) = 0.02;
+            strain(0, 1) = -0.04;
+            strain(2, 0) = 0.05;
+        }
+        auto dlattice = dot(strain, lattice);
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                geometry.lattice[x + 3 * y] = dlattice(x, y);
+            }
+        }
+        auto analytic_geometry    = values(*response.geometry_rhs(geometry));
+        auto quadrature_direction = gs.potential().external_xc_quadrature_direction(geometry);
+        auto geometry_sample      = [&](double step) {
+            auto shifted = lattice;
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    shifted(x, y) += step * dlattice(x, y);
+                }
+            }
+            probe->unit_cell().set_lattice_vectors(shifted);
+            for (int ia = 0; ia < probe->unit_cell().num_atoms(); ia++) {
+                auto const& d = geometry.atoms[ia];
+                probe->unit_cell().atom(ia).set_position(
+                        dot(inverse(shifted), centres[ia] + r3::vector<double>{d[0], d[1], d[2]} * step));
+            }
+            probe->update();
+            for (auto it : probe_ks.spl_num_kpoints()) {
+                probe_ks.get<double>(it.i)->update();
+            }
+            auto next                = std::make_shared<xc_point_set_t>(*probe);
+            next->coordinates        = quadrature->coordinates;
+            next->energy_weights     = quadrature->energy_weights;
+            next->descriptor_weights = quadrature->descriptor_weights;
+            next->block_sizes        = quadrature->block_sizes;
+            next->block_centres      = quadrature->block_centres;
+            for (size_t p = 0; p < next->coordinates.size(); p++) {
+                for (int x = 0; x < 3; x++) {
+                    next->coordinates[p][x] += step * quadrature_direction.coordinates[p][x];
+                }
+                next->energy_weights[p] += step * quadrature_direction.energy_weights[p];
+                next->descriptor_weights[p] += step * quadrature_direction.descriptor_weights[p];
+            }
+            for (size_t b = 0; b < next->block_centres.size(); b++) {
+                for (int x = 0; x < 3; x++) {
+                    next->block_centres[b][x] += step * quadrature_direction.block_centres[b][x];
+                }
+            }
+            probe->cb().external_xc_points_ = next;
+            return values(*map(input, probe_ks));
+        };
+        // Resolve near-origin radial-derivative cancellation without increasing the FD truncation error.
+        for (double step : {2e-2, 1e-2}) {
+            auto plus = geometry_sample(step), minus = geometry_sample(-step);
+            auto half_plus = geometry_sample(step / 2), half_minus = geometry_sample(-step / 2);
+            for (size_t i = 0; i < analytic_geometry.size(); i++) {
+                plus[i]  = (8 * (half_plus[i] - half_minus[i]) - (plus[i] - minus[i])) / 3;
+                minus[i] = 0;
+            }
+            check("explicit geometry SCF map rho/tau finite difference",
+                  potential_response_error(analytic_geometry, plus, minus, step), 3e-5);
+        }
+    }
+    ctx->cb().external_xc_quadrature_direction_ = nullptr;
+    reject("geometry right-hand side requires a host quadrature tangent", [&] { response.geometry_rhs(geometry); });
+    ctx->cb().external_xc_quadrature_direction_ = quadrature_tangent;
+    auto zero_solution                          = response.solve(zero, 1e-8, 1);
     check("zero right-hand side converges without mixing", zero_solution.residual, 0);
     Density rhs(*ctx);
     copy(direction, rhs);

@@ -6,6 +6,7 @@
 #include "lapw_response.hpp"
 #include "potential/potential.hpp"
 #include "mixer/anderson_stable_mixer.hpp"
+#include "lapw/step_function.hpp"
 
 namespace sirius {
 namespace {
@@ -121,9 +122,26 @@ LAPW_response::apply(Density const& direction__) const
     }
     auto xc      = potential_.lapw_external_xc_response(density_, direction__);
     auto hartree = potential_.hartree_response(direction__.rho());
+    return potential_response(*hartree, xc);
+}
+
+std::unique_ptr<Density>
+LAPW_response::geometry_rhs(xc_geometry_direction_t const& direction__) const
+{
+    auto xc      = potential_.lapw_external_xc_geometry_response(density_, direction__);
+    auto hartree = potential_.hartree_geometry_response(density_.rho(), direction__);
+    return potential_response(*hartree, xc, &direction__);
+}
+
+std::unique_ptr<Density>
+LAPW_response::potential_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__,
+                                  xc_geometry_direction_t const* geometry__) const
+{
+    auto& ctx = ks_.ctx();
+    int invalid{0};
     std::vector<std::vector<double>> scalar;
     std::vector<std::array<std::vector<double>, 2>> core;
-    potential_.lapw_radial_potential_response(*hartree, xc, scalar, core);
+    potential_.lapw_radial_potential_response(hartree__, xc__, scalar, core);
     std::vector<radial_basis_response_t> radial;
     try {
         for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
@@ -137,8 +155,40 @@ LAPW_response::apply(Density const& direction__) const
     if (invalid) {
         RTE_THROW("coupled LAPW radial response failed");
     }
-    auto atoms     = h0_->lapw_radial_basis_response(radial);
-    auto field     = h0_->lapw_field_response(*hartree, xc);
+    auto atoms = h0_->lapw_radial_basis_response(radial);
+    auto field = h0_->lapw_field_response(hartree__, xc__);
+    if (geometry__) {
+        r3::matrix<double> lattice;
+        mdarray<double, 2> atoms({3, ctx.unit_cell().num_atoms()});
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                lattice(x, y) = geometry__->lattice[x + 3 * y];
+            }
+        }
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            for (int x = 0; x < 3; x++) {
+                atoms(x, ia) = geometry__->atoms[ia][x];
+            }
+        }
+        auto strain = dot(lattice, ctx.unit_cell().inverse_lattice_vectors());
+        auto theta  = step_function_geometry_response(ctx.unit_cell(), ctx.gvec(), atoms, strain);
+        Smooth_periodic_function<double> boundary(ctx.spfft<double>(), ctx.gvec_fft_sptr());
+        for (int ig = 0; ig < ctx.gvec().count(); ig++) {
+            boundary.f_pw_local(ig) = theta[ctx.gvec().offset() + ig];
+        }
+        boundary.fft_transform(1);
+        // XC already differentiates its restriction; Hartree still needs the moving mask.
+        for (int ir = 0; ir < ctx.spfft<double>().local_slice_size(); ir++) {
+            boundary.value(ir) *= potential_.hartree_potential().rg().value(ir);
+        }
+        boundary.fft_transform(-1);
+        auto pw = boundary.gather_f_pw();
+        for (int s = 0; s < ctx.num_spins(); s++) {
+            for (int ig = 0; ig < ctx.gvec().num_gvec(); ig++) {
+                field.scalar_pw(ig, s) += pw[ig];
+            }
+        }
+    }
     using matrix_t = la::dmatrix<std::complex<double>>;
     std::vector<std::array<std::unique_ptr<matrix_t>, 2>> dh, ds;
     std::vector<LAPW_density_response::matrix_direction_t> directions;
@@ -151,14 +201,26 @@ LAPW_response::apply(Density const& direction__) const
         directions.emplace_back();
         try {
             matrix_t field_h(n, n, ctx.blacs_grid(), bs, bs);
+            std::unique_ptr<matrix_t> geometry_h, geometry_s;
+            if (geometry__) {
+                geometry_h = std::make_unique<matrix_t>(n, n, ctx.blacs_grid(), bs, bs);
+                geometry_s = std::make_unique<matrix_t>(n, n, ctx.blacs_grid(), bs, bs);
+            }
             for (int s = 0; s < ctx.num_spins(); s++) {
                 dh.back()[s] = std::make_unique<matrix_t>(n, n, ctx.blacs_grid(), bs, bs);
                 ds.back()[s] = std::make_unique<matrix_t>(n, n, ctx.blacs_grid(), bs, bs);
                 hk.set_fv_h_o_radial_response(s, radial, atoms, *dh.back()[s], *ds.back()[s]);
                 hk.set_fv_h_field_response(s, field, field_h);
+                if (geometry__) {
+                    hk.set_fv_h_o_geometry_response(s, *geometry__, *geometry_h, *geometry_s);
+                }
                 for (int j = 0; j < field_h.num_cols_local(); j++) {
                     for (int i = 0; i < field_h.num_rows_local(); i++) {
                         (*dh.back()[s])(i, j) += field_h(i, j);
+                        if (geometry__) {
+                            (*dh.back()[s])(i, j) += (*geometry_h)(i, j);
+                            (*ds.back()[s])(i, j) += (*geometry_s)(i, j);
+                        }
                     }
                 }
                 directions.back().h[s] = dh.back()[s].get();
@@ -176,6 +238,10 @@ LAPW_response::apply(Density const& direction__) const
     auto result = density_.lapw_density_matrix_fields(ks_, dp);
     auto basis  = density_.lapw_density_matrix_radial_response(ks_, matrices_, radial);
     add(1.0, *basis, *result);
+    if (geometry__) {
+        auto moved = density_.lapw_density_matrix_geometry_response(ks_, matrices_, *geometry__);
+        add(1.0, *moved, *result);
+    }
     synchronize(*result);
     return result;
 }
