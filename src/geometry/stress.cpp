@@ -192,6 +192,17 @@ Stress::calc_stress_nonloc_aux()
 r3::matrix<double>
 Stress::calc_stress_total()
 {
+    if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
+        RTE_THROW("meta-GGA cell derivatives are not connected to stress yet");
+    }
+    stress_dftd3_.zero();
+    if (ctx_.cfg().parameters().dftd3_correction()) {
+        stress_dftd3_ = potential_.dftd3_ctx().stress();
+    }
+    stress_dftd4_.zero();
+    if (ctx_.cfg().parameters().dftd4_correction()) {
+        stress_dftd4_ = potential_.dftd4_ctx().stress();
+    }
     if (ctx_.cb().external_xc_ && ctx_.full_potential()) {
         auto geometry = potential_.external_xc_geometry(density_);
         LAPW_response response(kset_, density_, potential_);
@@ -208,13 +219,12 @@ Stress::calc_stress_total()
                 }
                 auto radial =
                         response.radial_geometry_response(direction, ctx_.cb().external_xc_response_tolerance_, 200);
-                stress_total_(mu, nu) = response.energy_geometry_derivative(direction, radial, geometry) / cell.omega();
+                stress_total_(mu, nu) =
+                        response.energy_geometry_derivative(direction, radial, geometry) / cell.omega() +
+                        stress_dftd3_(mu, nu) + stress_dftd4_(mu, nu);
             }
         }
         return stress_total_;
-    }
-    if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
-        RTE_THROW("meta-GGA cell derivatives are not connected to stress yet");
     }
     calc_stress_kin();
     calc_stress_har();
@@ -228,16 +238,6 @@ Stress::calc_stress_total()
     stress_hubbard_.zero();
     if (ctx_.hubbard_correction()) {
         calc_stress_hubbard();
-    }
-
-    stress_dftd3_.zero();
-    if (ctx_.cfg().parameters().dftd3_correction()) {
-        stress_dftd3_ = potential_.dftd3_ctx().stress();
-    }
-
-    stress_dftd4_.zero();
-    if (ctx_.cfg().parameters().dftd4_correction()) {
-        stress_dftd4_ = potential_.dftd4_ctx().stress();
     }
 
     stress_total_.zero();

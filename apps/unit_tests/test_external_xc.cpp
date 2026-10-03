@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include "dft/dft_ground_state.hpp"
+#include "dft/energy.hpp"
 #include "density/paw_xc_reconstruction.hpp"
 #include "hamiltonian/hamiltonian.hpp"
 
@@ -1034,6 +1035,42 @@ test_generic_occupancy(int mag, std::string smearing, double electrons)
 }
 
 int
+test_dispersion_energy()
+{
+    std::map<std::string, double> energies{{"ekin", 11},
+                                           {"exc", 13},
+                                           {"vha", 17},
+                                           {"enuc", 19},
+                                           {"valence_eval_sum", 23},
+                                           {"vxc", 29},
+                                           {"bxc", 31},
+                                           {"PAW_one_elec", 37},
+                                           {"PAW_total_energy", 41},
+                                           {"ewald", 43},
+                                           {"vtau", 47},
+                                           {"dftd3_energy", -0.3},
+                                           {"dftd4_energy", -0.4}};
+    int failures{0};
+    for (bool full_potential : {false, true}) {
+        for (int corrections = 0; corrections < 4; corrections++) {
+            auto config = R"({"parameters":{"electronic_structure_method":"pseudopotential"},
+                             "control":{"processing_unit":"CPU"}})"_json;
+            config["parameters"]["electronic_structure_method"] =
+                    full_potential ? "full_potential_lapwlo" : "pseudopotential";
+            config["parameters"]["dftd3_correction"] = bool(corrections & 1);
+            config["parameters"]["dftd4_correction"] = bool(corrections & 2);
+            Simulation_context ctx(config);
+            ctx.electronic_structure_method(full_potential ? "full_potential_lapwlo" : "pseudopotential");
+            double expected =
+                    (full_potential ? 51.5 : -32.5) - ((corrections & 1) ? 0.3 : 0) - ((corrections & 2) ? 0.4 : 0);
+            double actual = ks_energy(ctx, energies);
+            failures += !std::isfinite(actual) || std::abs(actual - expected) > 1e-13;
+        }
+    }
+    return failures;
+}
+
+int
 main(int argc, char** argv)
 {
     sirius::initialize(true);
@@ -1050,6 +1087,7 @@ main(int argc, char** argv)
         sirius::finalize();
         return std::min(result, 1);
     }
+    result += call_test("dispersion energy accounting", test_dispersion_energy);
     for (int mag : {0, 1}) {
         for (auto smearing : {"gaussian", "fermi_dirac", "cold", "methfessel_paxton"}) {
             for (double electrons : {1.0, 7.0}) {

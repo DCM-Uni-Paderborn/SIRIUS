@@ -337,6 +337,7 @@ Force::calc_forces_total(bool add_scf_corr)
                     forces_total_(x, ia)   = -response->energy_geometry_derivative(direction, radial, xc_geometry);
                     direction.atoms[ia][x] = 0;
                 }
+                forces_total_(x, ia) += forces_dftd3_(x, ia) + forces_dftd4_(x, ia);
             }
         }
     } else {

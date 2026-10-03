@@ -154,14 +154,14 @@ ks_energy(Simulation_context const& ctx, std::map<std::string, double> const& en
             if (ctx.hubbard_correction()) {
                 tot_en += energies.at("hubbard_energy") - energies.at("hubbard_one_el_contribution");
             }
-            if (ctx.cfg().parameters().dftd3_correction()) {
-                tot_en += energies.at("dftd3_energy");
-            }
-            if (ctx.cfg().parameters().dftd4_correction()) {
-                tot_en += energies.at("dftd4_energy");
-            }
             break;
         }
+    }
+    if (ctx.cfg().parameters().dftd3_correction()) {
+        tot_en += energies.at("dftd3_energy");
+    }
+    if (ctx.cfg().parameters().dftd4_correction()) {
+        tot_en += energies.at("dftd4_energy");
     }
 
     return tot_en;
