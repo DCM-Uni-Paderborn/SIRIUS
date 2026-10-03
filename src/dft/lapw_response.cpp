@@ -7,6 +7,7 @@
 #include "potential/potential.hpp"
 #include "mixer/anderson_stable_mixer.hpp"
 #include "lapw/step_function.hpp"
+#include <sstream>
 
 namespace sirius {
 namespace {
@@ -40,7 +41,7 @@ add(double alpha, Density const& x, Density& y)
 }
 
 double
-field_residual(Density const& rhs, Density const& x, Density const& y)
+field_residual(Density const& rhs, Density const& x, Density const& y, std::array<std::array<double, 2>, 4>& norms)
 {
     auto const& ctx = x.ctx();
     double result{0};
@@ -67,7 +68,8 @@ field_residual(Density const& rhs, Density const& x, Density const& y)
                 }
             }
             ctx.comm().allreduce<double, mpi::op_t::max>(norm.data(), norm.size());
-            result = std::max(result, norm[0] / std::max(1e-12, norm[1]));
+            norms[2 * part + s] = norm;
+            result              = std::max(result, norm[0] / std::max(1e-12, norm[1]));
         }
     }
     return result;
@@ -399,11 +401,13 @@ LAPW_response::solve(Density const& rhs__, double tolerance__, int max_iteration
             });
     mixer::Anderson_stable<Density> mixer(history__, beta__);
     mixer.initialize_function<0>(properties, *x, ctx, true);
+    std::array<std::array<double, 2>, 4> norms{};
+    double residual{0};
     for (int iteration = 0; iteration < max_iterations__; iteration++) {
         double entropy{0};
         auto y = apply(*x, &entropy);
         add(1.0, rhs__, *y);
-        double residual = field_residual(rhs__, *x, *y);
+        residual = field_residual(rhs__, *x, *y, norms);
         if (!std::isfinite(residual)) {
             RTE_THROW("nonfinite coupled LAPW response residual");
         }
@@ -415,7 +419,18 @@ LAPW_response::solve(Density const& rhs__, double tolerance__, int max_iteration
         mixer.get_output<0>(*x);
         synchronize(*x);
     }
-    RTE_THROW("coupled LAPW response did not reach the requested residual tolerance");
+    std::ostringstream message;
+    message << "coupled LAPW response residual " << residual << " exceeds tolerance " << tolerance__ << " after "
+            << max_iterations__ << " iterations";
+    for (int part : {0, 1}) {
+        for (int s = 0; s < ctx.num_spins(); s++) {
+            auto const& norm = norms[2 * part + s];
+            message << "\n"
+                    << (part == 0 ? "rho" : "tau") << " component " << s << ": error=" << norm[0]
+                    << ", scale=" << norm[1];
+        }
+    }
+    RTE_THROW(message.str());
     return {};
 }
 

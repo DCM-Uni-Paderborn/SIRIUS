@@ -114,6 +114,7 @@ struct callback_functions_t
     /// External XC evaluation, leaving Poisson and ionic potentials in SIRIUS.
     xc_callback_t external_xc_{nullptr};
     xc_response_callback_t external_xc_response_{nullptr};
+    double external_xc_response_tolerance_{1e-8};
     bool external_xc_geometry_response_{false};
     xc_callback_t external_xc_geometry_{nullptr};
     xc_quadrature_pullback_t external_xc_pullback_{nullptr};

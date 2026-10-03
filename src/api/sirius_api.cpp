@@ -6163,6 +6163,50 @@ sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), 
 
 /*
 @api begin
+sirius_set_xc_response_tolerance:
+  doc: >-
+    Set the relative residual tolerance of the coupled LAPW response solve
+    before context initialization. Default is 1e-8. The tolerance must be finite,
+    positive, less than one and identical on every context rank. Choose it
+    consistently with the numerical precision of the host XC Hessian evaluator.
+    It does not change the SCF or XC evaluation tolerances.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    tolerance:
+      type: double
+      attr: in, required
+      doc: Relative rho/tau response residual tolerance.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_response_tolerance(void* const* handler__, double const* tolerance__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx        = get_sim_ctx(handler__);
+                double tolerance = tolerance__ ? *tolerance__ : 0;
+                auto root        = tolerance;
+                ctx.comm().bcast(&root, 1, 0);
+                int invalid = ctx.initialized() || !std::isfinite(tolerance) || tolerance <= 0 || tolerance >= 1 ||
+                              tolerance != root;
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid) {
+                    RTE_THROW("set a common XC response tolerance between zero and one before initialization");
+                }
+                ctx.cb().external_xc_response_tolerance_ = tolerance;
+            },
+            error_code__);
+}
+
+/*
+@api begin
 sirius_set_xc_point_hessian_callback:
   doc: >-
     Register a joint field and quadrature XC Hessian-vector evaluator after the

@@ -5895,6 +5895,43 @@ call sirius_set_xc_point_response_callback_aux(handler_ptr,fptr,user_data,error_
 end subroutine sirius_set_xc_point_response_callback
 
 !
+!> @brief Set the relative residual tolerance of the coupled LAPW response solve before context initialization. Default is 1e-8. The tolerance must be finite, positive, less than one and identical on every context rank. Choose it consistently with the numerical precision of the host XC Hessian evaluator. It does not change the SCF or XC evaluation tolerances.
+!> @param [in] handler Simulation context handler.
+!> @param [in] tolerance Relative rho/tau response residual tolerance.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_response_tolerance(handler,tolerance,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+real(8), target, intent(in) :: tolerance
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: tolerance_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_response_tolerance_aux(handler,tolerance,error_code)&
+&bind(C, name="sirius_set_xc_response_tolerance")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_PTR), value :: tolerance
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+tolerance_ptr = C_NULL_PTR
+tolerance_ptr = C_LOC(tolerance)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_response_tolerance_aux(handler_ptr,tolerance_ptr,error_code_ptr)
+end subroutine sirius_set_xc_response_tolerance
+
+!
 !> @brief Register a joint field and quadrature XC Hessian-vector evaluator after the point XC callback and before context initialization. Replaces the fixed-geometry response callback without changing its ABI. Its C signature is void response(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, const double* delta_rho, const double* delta_gradient, const double* delta_tau, const double* delta_coordinates, const double* delta_energy_weights, const double* delta_descriptor_weights, const double* delta_block_centres, double* delta_vrho, double* delta_vgradient, double* delta_vtau, double* delta_dcoordinates, double* delta_denergy_weights, double* delta_ddescriptor_weights, double* delta_dblock_centres, int* status). Arrays have the point callback's Fortran shapes. Return the Hessian of the entire discrete energy applied to these independent directions, including mixed field/geometry and nonlocal terms. All output covectors are raw, without field sampling, gradient adjoints, forces or stress factors. The call is collective, including empty ranks. Outputs start at zero. Set status nonzero on failure without unwinding across the C ABI. A null pointer disables the response.
 !> @param [in] handler Simulation context handler.
 !> @param [in] fptr C-interoperable joint XC Hessian-vector evaluator.

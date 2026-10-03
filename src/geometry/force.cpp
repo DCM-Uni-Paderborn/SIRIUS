@@ -332,7 +332,8 @@ Force::calc_forces_total(bool add_scf_corr)
                 if (response) {
                     // Differentiate the discrete free energy, including its self-consistent core and valence fields.
                     direction.atoms[ia][x] = 1;
-                    auto radial            = response->radial_geometry_response(direction, 1e-8, 200);
+                    auto radial = response->radial_geometry_response(direction,
+                                                                     ctx_.cb().external_xc_response_tolerance_, 200);
                     forces_total_(x, ia)   = -response->energy_geometry_derivative(direction, radial, xc_geometry);
                     direction.atoms[ia][x] = 0;
                 }

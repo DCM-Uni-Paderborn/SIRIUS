@@ -266,6 +266,16 @@ program test_external_xc_api
                                         weights, descriptor_weights, blocks, centres)
       call sirius_set_xc_point_response_callback(ctx, C_FUNLOC(evaluate_response), C_LOC(state), error_code=ierr)
       if (ierr /= 0) failures = failures + 1
+      call sirius_set_xc_response_tolerance(ctx, -1.d-6, error_code=ierr)
+      if (ierr == 0) failures = failures + 1
+      call sirius_set_xc_response_tolerance(ctx, 1.d0, error_code=ierr)
+      if (ierr == 0) failures = failures + 1
+      if (ranks > 1) then
+        call sirius_set_xc_response_tolerance(ctx, 1.d-8*(rank+1), error_code=ierr)
+        if (ierr == 0) failures = failures + 1
+      endif
+      call sirius_set_xc_response_tolerance(ctx, 1.d-8, error_code=ierr)
+      if (ierr /= 0) failures = failures + 1
       call sirius_set_xc_point_response_callback(ctx, C_NULL_FUNPTR, C_NULL_PTR, error_code=ierr)
       if (ierr /= 0) failures = failures + 1
       call sirius_set_xc_point_geometry_callbacks(ctx, C_FUNLOC(evaluate_geometry), C_FUNLOC(fixed_quadrature), &
@@ -286,6 +296,8 @@ program test_external_xc_api
       deallocate(coordinates, weights, descriptor_weights, centres, blocks)
     endif
     call sirius_initialize_context(ctx)
+    call sirius_set_xc_response_tolerance(ctx, 1.d-6, error_code=ierr)
+    if (ierr == 0) failures = failures + 1
     call sirius_set_xc_point_response_callback(ctx, C_FUNLOC(evaluate_response), C_LOC(state), error_code=ierr)
     if (ierr == 0) failures = failures + 1
     call sirius_set_xc_callback(ctx, C_NULL_FUNPTR, C_NULL_PTR, error_code=ierr)

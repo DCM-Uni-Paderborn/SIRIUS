@@ -2930,8 +2930,10 @@ sirius_set_xc_point_callback:
     supplied quadrature. CPU scalar/collinear PW and PAW are supported, without
     symmetry reduction. PAW requires explicitly supplied positive core tau.
     Nonrelativistic FP-LAPW fields are also supported. PW and PAW atomic forces
-    and stress additionally require the point geometry callbacks. FP-LAPW forces
-    and stress, and SOC are not supported by this point path.
+    and stress additionally require the point geometry callbacks. Nonrelativistic
+    FP-LAPW forces also require joint Hessian and quadrature-direction callbacks;
+    collinear states must use full variation. FP-LAPW stress and SOC are not
+    supported by this point path.
   arguments:
     handler:
       type: ctx_handler
@@ -3060,8 +3062,10 @@ sirius_set_xc_point_geometry_callbacks:
     Callbacks are collective, including empty ranks. Outputs start at zero.
     Set status nonzero on failure without unwinding across the C ABI.
     Both null pointers disable geometry evaluation. For PW and PAW, these callbacks
-    supply the explicit XC contribution to atomic forces and stress. FP-LAPW forces and stress
-    require additional basis and geometry responses.
+    supply the explicit XC contribution to atomic forces and stress. Nonrelativistic
+    FP-LAPW forces additionally require the joint Hessian and quadrature-direction
+    callbacks for the self-consistent core and valence response. FP-LAPW stress
+    remains unsupported.
   arguments:
     handler:
       type: ctx_handler
@@ -3162,6 +3166,31 @@ sirius_set_xc_point_response_callback:
 */
 void
 sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__);
+
+/*
+sirius_set_xc_response_tolerance:
+  doc: >-
+    Set the relative residual tolerance of the coupled LAPW response solve
+    before context initialization. Default is 1e-8. The tolerance must be finite,
+    positive, less than one and identical on every context rank. Choose it
+    consistently with the numerical precision of the host XC Hessian evaluator.
+    It does not change the SCF or XC evaluation tolerances.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    tolerance:
+      type: double
+      attr: in, required
+      doc: Relative rho/tau response residual tolerance.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+*/
+void
+sirius_set_xc_response_tolerance(void* const* handler__, double const* tolerance__, int* error_code__);
 
 /*
 sirius_set_xc_point_hessian_callback:
