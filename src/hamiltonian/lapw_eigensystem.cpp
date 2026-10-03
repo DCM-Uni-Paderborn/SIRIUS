@@ -6,6 +6,7 @@
 #include "hamiltonian.hpp"
 #include "k_point/k_point.hpp"
 #include "k_point/k_point_set.hpp"
+#include <sstream>
 
 namespace sirius {
 namespace {
@@ -267,6 +268,11 @@ LAPW_density_response::LAPW_density_response(Hamiltonian0<double> const& h0__, K
 {
     auto& ctx = ks_.ctx();
     int ns = ctx.num_spins(), nb = ctx.num_bands();
+    // SCF updates the mixed potential after solving the bands. Resolve that
+    // finite residual to the requested response accuracy, not a fixed roundoff bound.
+    double tolerance =
+            std::max(std::sqrt(std::numeric_limits<double>::epsilon()), ctx.cb().external_xc_response_tolerance_);
+    double spectrum_error{0};
     int invalid = &ctx != &h0__.ctx() || !ctx.full_potential() || ctx.processing_unit() != device_t::CPU ||
                   ctx.cfg().parameters().precision_wf() != "fp64" || ctx.num_mag_dims() == 3 ||
                   ctx.valence_relativity() != relativity_t::none || ctx.so_correction() || ctx.hubbard_correction() ||
@@ -298,10 +304,10 @@ LAPW_density_response::LAPW_density_response(Hamiltonian0<double> const& h0__, K
                     occupations_.back()(b, spin) = f;
                     invalid |= !std::isfinite(energy) || !std::isfinite(f);
                     if (b < n) {
-                        double exact = spectra_.back()[spin]->energies()[b];
-                        invalid |=
-                                std::abs(energy - exact) > std::sqrt(std::numeric_limits<double>::epsilon()) *
-                                                                   std::max({1.0, std::abs(energy), std::abs(exact)});
+                        double exact   = spectra_.back()[spin]->energies()[b];
+                        double error   = std::abs(energy - exact) / std::max({1.0, std::abs(energy), std::abs(exact)});
+                        spectrum_error = std::max(spectrum_error, error);
+                        invalid |= error > tolerance;
                     }
                 }
             }
@@ -310,8 +316,14 @@ LAPW_density_response::LAPW_density_response(Hamiltonian0<double> const& h0__, K
         }
     }
     ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    ctx.comm().allreduce<double, mpi::op_t::max>(&spectrum_error, 1);
+    RTE_OUT(ctx.out(2)) << "LAPW response reference: relative band mismatch " << spectrum_error << ", tolerance "
+                        << tolerance << '\n';
     if (invalid) {
-        RTE_THROW("stored bands do not match the complete frozen LAPW Hamiltonian");
+        std::stringstream message;
+        message << "stored bands do not match the complete frozen LAPW Hamiltonian (relative error " << spectrum_error
+                << ", tolerance " << tolerance << ')';
+        RTE_THROW(message.str());
     }
 }
 

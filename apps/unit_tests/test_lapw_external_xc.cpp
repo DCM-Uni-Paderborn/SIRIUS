@@ -956,6 +956,26 @@ test_lapw_density_response(int mag, bool distributed)
     }
     check.reject("changed reference rejected collectively", [&] { reference.density_matrix_response(directions); });
     sample(0);
+    auto offset_band = [&](double offset) {
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& kp      = *ks.get<double>(it.i);
+            double energy = kp.band_energy(0, 0);
+            kp.band_energy(0, 0, energy + offset * std::max(1.0, std::abs(energy)));
+            break;
+        }
+        ks.sync_band<double, sync_band_t::energy>();
+    };
+    double response_tolerance = ctx->cb().external_xc_response_tolerance_;
+    offset_band(5e-7);
+    check.reject("finite SCF residual exceeds default response accuracy", [&] { LAPW_density_response(h0, ks); });
+    ctx->cb().external_xc_response_tolerance_ = 1e-6;
+    LAPW_density_response finite_scf_reference(h0, ks);
+    sample(0);
+    offset_band(1e-3);
+    check.reject("inconsistent spectrum still rejected at configured response accuracy",
+                 [&] { LAPW_density_response(h0, ks); });
+    sample(0);
+    ctx->cb().external_xc_response_tolerance_ = response_tolerance;
     for (auto& m : matrices) {
         for (int spin = 0; spin < ns; spin++) {
             m.ds[spin]->zero();

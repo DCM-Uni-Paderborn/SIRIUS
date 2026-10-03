@@ -5895,7 +5895,7 @@ call sirius_set_xc_point_response_callback_aux(handler_ptr,fptr,user_data,error_
 end subroutine sirius_set_xc_point_response_callback
 
 !
-!> @brief Set the relative residual tolerance of the coupled LAPW response solve before context initialization. Default is 1e-8. The tolerance must be finite, positive, less than one and identical on every context rank. Choose it consistently with the numerical precision of the host XC Hessian evaluator. It does not change the SCF or XC evaluation tolerances.
+!> @brief Set the relative residual tolerance of the coupled LAPW response solve before context initialization. Default is 1e-8. The tolerance must be finite, positive, less than one and identical on every context rank. Choose it consistently with the numerical precision of the host XC Hessian evaluator. It also bounds relative differences between the stored bands and the frozen response Hamiltonian after the final SCF potential update. It does not change the SCF or XC evaluation tolerances.
 !> @param [in] handler Simulation context handler.
 !> @param [in] tolerance Relative rho/tau response residual tolerance.
 !> @param [out] error_code Error code.
