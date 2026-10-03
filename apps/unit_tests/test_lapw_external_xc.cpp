@@ -3339,6 +3339,213 @@ test_lapw_force_response(int mag, double pw_cutoff, bool core)
 }
 
 int
+test_lapw_cell_response(int mag, bool core, int component)
+{
+    r3::matrix<double> strain;
+    if (component == 0) {
+        strain(0, 0) = 1;
+    } else {
+        strain(0, 1) = strain(1, 0) = 0.5;
+    }
+    auto calculate = [&](double step, bool differentiate) {
+        auto ctx      = context(mag, true, false, core, false, 0, 9.0, false, 0, "fermi_dirac", core);
+        auto lattice  = ctx->unit_cell().lattice_vectors();
+        auto dlattice = dot(strain, lattice);
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                lattice(x, y) += step * dlattice(x, y);
+            }
+        }
+        auto const& original = *ctx->cb().external_xc_points_;
+        std::vector<int> attached;
+        auto points = std::make_shared<xc_point_set_t>(*ctx);
+        for (size_t p = 0; p < original.coordinates.size(); p++) {
+            auto const& xyz = original.coordinates[p];
+            int owner{-1};
+            bool near_boundary{false};
+            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                auto const& atom = ctx->unit_cell().atom(ia);
+                auto centre      = ctx->unit_cell().get_cartesian_coordinates(atom.position());
+                auto r           = r3::vector<double>{xyz[0], xyz[1], xyz[2]} - centre;
+                if (core && r.length() <= atom.mt_radius() + 1e-10) {
+                    owner = ia;
+                }
+                auto fractional = dot(ctx->unit_cell().inverse_lattice_vectors(), r);
+                for (int x = 0; x < 3; x++) {
+                    fractional[x] -= std::round(fractional[x]);
+                }
+                double distance = dot(ctx->unit_cell().lattice_vectors(), fractional).length();
+                near_boundary |= std::abs(distance - atom.mt_radius()) < 0.04;
+            }
+            // Keep domain membership fixed. Resolved MT quadratures retain their local radii.
+            if (near_boundary && owner < 0) {
+                continue;
+            }
+            points->coordinates.push_back(xyz);
+            points->energy_weights.push_back(original.energy_weights[p]);
+            points->descriptor_weights.push_back(original.descriptor_weights[p]);
+            attached.push_back(owner);
+        }
+        int ng             = ctx->gvec().num_gvec();
+        auto base_lattice  = ctx->unit_cell().lattice_vectors();
+        auto base_inverse  = ctx->unit_cell().inverse_lattice_vectors();
+        double base_volume = ctx->unit_cell().omega();
+        std::vector<r3::vector<double>> base_centres;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            base_centres.push_back(ctx->unit_cell().get_cartesian_coordinates(ctx->unit_cell().atom(ia).position()));
+        }
+        K_point_set ks(*ctx);
+        ks.add_kpoint({0.07, -0.03, 0.02}, 1);
+        ks.initialize();
+        ctx->unit_cell().set_lattice_vectors(lattice);
+        ctx->update();
+        ks.update();
+        if (ng != ctx->gvec().num_gvec()) {
+            RTE_THROW("LAPW cell stencil changed the density basis");
+        }
+        auto transform      = dot(lattice, base_inverse);
+        double volume_ratio = ctx->unit_cell().omega() / base_volume;
+        auto moved          = std::make_shared<xc_point_set_t>(*ctx);
+        for (size_t p = 0; p < points->coordinates.size(); p++) {
+            auto const& xyz = points->coordinates[p];
+            auto r          = r3::vector<double>{xyz[0], xyz[1], xyz[2]};
+            if (attached[p] >= 0) {
+                auto const& centre = base_centres[attached[p]];
+                r += dot(transform, centre) - centre;
+            } else {
+                r = dot(transform, r);
+            }
+            moved->coordinates.push_back({r[0], r[1], r[2]});
+            double measure = attached[p] >= 0 ? 1 : volume_ratio;
+            moved->energy_weights.push_back(measure * points->energy_weights[p]);
+            moved->descriptor_weights.push_back(measure * points->descriptor_weights[p]);
+        }
+        if (!moved->coordinates.empty()) {
+            auto centre          = dot(transform, base_centres[0]);
+            moved->block_sizes   = {static_cast<int>(moved->coordinates.size())};
+            moved->block_centres = {{centre[0], centre[1], centre[2]}};
+        }
+        ctx->cb().external_xc_points_               = std::move(moved);
+        ctx->cb().external_xc_geometry_             = functional;
+        ctx->cb().external_xc_geometry_response_    = true;
+        ctx->cb().external_xc_quadrature_direction_ = [attached](auto const& c, auto const& q, auto const& in,
+                                                                 auto& out) {
+            r3::matrix<double> dlattice;
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    dlattice(x, y) = in.lattice[x + 3 * y];
+                }
+            }
+            auto deformation = dot(dlattice, c.unit_cell().inverse_lattice_vectors());
+            double trace     = deformation(0, 0) + deformation(1, 1) + deformation(2, 2);
+            for (size_t p = 0; p < attached.size(); p++) {
+                if (attached[p] >= 0) {
+                    out.coordinates[p] = in.atoms[attached[p]];
+                } else {
+                    auto const& xyz           = q.coordinates[p];
+                    auto delta                = dot(deformation, r3::vector<double>{xyz[0], xyz[1], xyz[2]});
+                    out.coordinates[p]        = {delta[0], delta[1], delta[2]};
+                    out.energy_weights[p]     = trace * q.energy_weights[p];
+                    out.descriptor_weights[p] = trace * q.descriptor_weights[p];
+                }
+            }
+            for (auto& centre : out.block_centres) {
+                centre = in.atoms[0];
+            }
+        };
+        ctx->cb().external_xc_pullback_ = [attached](auto const& c, auto const& q, auto const& in, auto& out) {
+            auto const& inverse = c.unit_cell().inverse_lattice_vectors();
+            for (size_t p = 0; p < attached.size(); p++) {
+                if (attached[p] >= 0) {
+                    for (int x = 0; x < 3; x++) {
+                        out.atoms[attached[p]][x] += in.coordinates[p][x];
+                    }
+                } else {
+                    auto const& xyz = q.coordinates[p];
+                    auto fractional = dot(inverse, r3::vector<double>{xyz[0], xyz[1], xyz[2]});
+                    double measure  = q.energy_weights[p] * in.energy_weights[p] +
+                                      q.descriptor_weights[p] * in.descriptor_weights[p];
+                    for (int y = 0; y < 3; y++) {
+                        for (int x = 0; x < 3; x++) {
+                            out.lattice[x + 3 * y] += in.coordinates[p][x] * fractional[y] + measure * inverse(y, x);
+                        }
+                    }
+                }
+            }
+            for (auto const& centre : in.block_centres) {
+                for (int x = 0; x < 3; x++) {
+                    out.atoms[0][x] += centre[x];
+                }
+            }
+            for (auto& atom : out.atoms) {
+                c.comm().allreduce(atom.data(), 3);
+            }
+            c.comm().allreduce(out.lattice.data(), 9);
+        };
+        DFT_ground_state gs(ks);
+        gs.initial_state();
+        auto found = gs.find(core ? 1e-10 : 1e-11, core ? 1e-11 : 1e-12, 1e-11, 200, false);
+        if (!found.at("converged").get<bool>()) {
+            if (ctx->comm().rank() == 0) {
+                auto energies = found.at("etot_history").get<std::vector<double>>();
+                std::cout << "LAPW cell SCF final energy change=" << energies.back() - energies[energies.size() - 2]
+                          << std::endl;
+            }
+            RTE_THROW("LAPW cell SCF did not converge");
+        }
+        double energy = free_energy(*ctx, ks, gs.density(), gs.potential());
+        double derivative{0};
+        if (differentiate) {
+            xc_geometry_direction_t direction(ctx->unit_cell().num_atoms());
+            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                auto delta          = dot(strain, base_centres[ia]);
+                direction.atoms[ia] = {delta[0], delta[1], delta[2]};
+            }
+            auto dlattice = dot(strain, base_lattice);
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    direction.lattice[x + 3 * y] = dlattice(x, y);
+                }
+            }
+            auto rho_before       = potential_samples(gs.density().rho());
+            auto tau_before       = potential_samples(gs.density().kinetic_density().scalar());
+            auto potential_before = potential_samples(gs.potential().effective_potential());
+            LAPW_response response(ks, gs.density(), gs.potential());
+            auto radial      = response.radial_geometry_response(direction, 1e-8, 200);
+            auto explicit_xc = gs.potential().external_xc_geometry(gs.density());
+            derivative       = response.energy_geometry_derivative(direction, radial, explicit_xc);
+            if (rho_before != potential_samples(gs.density().rho()) ||
+                tau_before != potential_samples(gs.density().kinetic_density().scalar()) ||
+                potential_before != potential_samples(gs.potential().effective_potential()) ||
+                energy != free_energy(*ctx, ks, gs.density(), gs.potential())) {
+                RTE_THROW("LAPW cell response changed the reference state");
+            }
+        }
+        return std::array<double, 2>{energy, derivative};
+    };
+    auto reference = calculate(0, true);
+    std::map<double, double> samples;
+    auto sample = [&](double step) {
+        auto it = samples.find(step);
+        if (it == samples.end()) {
+            it = samples.emplace(step, calculate(step, false)[0]).first;
+        }
+        return it->second;
+    };
+    int failures{0};
+    for (double h : {2e-3, 1e-3}) {
+        double fd    = (8 * (sample(h) - sample(-h)) - (sample(2 * h) - sample(-2 * h))) / (12 * h);
+        double error = std::abs(fd - reference[1]);
+        if (mpi::Communicator::world().rank() == 0) {
+            std::cout << "LAPW cell spin=" << mag << " core=" << core << " component=" << component << " h=" << h
+                      << " analytic=" << reference[1] << " FD=" << fd << " error=" << error << std::endl;
+        }
+        failures += !std::isfinite(error) || error > 2e-6;
+    }
+    return failures;
+}
+
+int
 test_lapw_linearization_response()
 {
     auto ctx = context(0, mpi::Communicator::world().size() > 1, false, false, false, 0, 5.0, false, 1);
@@ -3486,6 +3693,21 @@ main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
+    if (argc > 1 && (std::string(argv[1]) == "cell-response" || std::string(argv[1]) == "core-cell")) {
+        int first = argc > 2 ? std::stoi(argv[2]) : 0;
+        int last  = argc > 2 ? first : 1;
+        if (first < 0 || first > 1) {
+            RTE_THROW("LAPW cell test requires spin mode 0 or 1");
+        }
+        for (int mag = first; mag <= last; mag++) {
+            for (int component : {0, 1}) {
+                result += call_test("external LAPW cell response", test_lapw_cell_response, mag,
+                                    std::string(argv[1]) == "core-cell", component);
+            }
+        }
+        sirius::finalize();
+        return std::min(result, 1);
+    }
     if (argc > 1 && std::string(argv[1]) == "coupled-response") {
         for (int mag : {0, 1}) {
             result += call_test("coupled LAPW response", test_lapw_coupled_response, mag, false);

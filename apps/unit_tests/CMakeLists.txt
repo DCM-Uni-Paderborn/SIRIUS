@@ -88,6 +88,9 @@ set_tests_properties(test_lapw_external_xc PROPERTIES TIMEOUT 120)
 add_test(NAME test_lapw_external_xc_force COMMAND test_lapw_external_xc force-response)
 set_tests_properties(test_lapw_external_xc_force PROPERTIES
   TIMEOUT 600 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+add_test(NAME test_lapw_external_xc_cell COMMAND test_lapw_external_xc cell-response 0)
+set_tests_properties(test_lapw_external_xc_cell PROPERTIES
+  TIMEOUT 300 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 add_test(NAME test_lapw_external_xc_core COMMAND test_lapw_external_xc core)
 set_tests_properties(test_lapw_external_xc_core PROPERTIES
   TIMEOUT 240 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
