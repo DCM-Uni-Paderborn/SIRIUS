@@ -95,7 +95,7 @@ LAPW_response::LAPW_response(K_point_set& ks__, Density const& density__, Potent
 }
 
 std::unique_ptr<Density>
-LAPW_response::apply(Density const& direction__) const
+LAPW_response::apply(Density const& direction__, double* entropy__) const
 {
     auto& ctx   = ks_.ctx();
     int invalid = &direction__.ctx() != &ctx || !direction__.has_kinetic_density();
@@ -122,22 +122,23 @@ LAPW_response::apply(Density const& direction__) const
     }
     auto xc      = potential_.lapw_external_xc_response(density_, direction__);
     auto hartree = potential_.hartree_response(direction__.rho());
-    return potential_response(*hartree, xc);
+    return potential_response(*hartree, xc, nullptr, entropy__);
 }
 
 std::unique_ptr<Density>
-LAPW_response::geometry_rhs(xc_geometry_direction_t const& direction__) const
+LAPW_response::geometry_rhs(xc_geometry_direction_t const& direction__, double* entropy__) const
 {
     auto xc      = potential_.lapw_external_xc_geometry_response(density_, direction__);
     auto hartree = potential_.hartree_geometry_response(density_.rho(), direction__);
-    return potential_response(*hartree, xc, &direction__);
+    return potential_response(*hartree, xc, &direction__, entropy__);
 }
 
 LAPW_response::radial_geometry_response_t
 LAPW_response::radial_geometry_response(xc_geometry_direction_t const& direction__, double tolerance__,
                                         int max_iterations__) const
 {
-    auto rhs    = geometry_rhs(direction__);
+    double explicit_entropy{0};
+    auto rhs    = geometry_rhs(direction__, &explicit_entropy);
     auto solved = solve(*rhs, tolerance__, max_iterations__);
     radial_geometry_response_t result, explicit_response;
     potential_.lapw_radial_potential_response(density_, *solved.fields, result.scalar, result.core);
@@ -152,12 +153,82 @@ LAPW_response::radial_geometry_response(xc_geometry_direction_t const& direction
             }
         }
     }
+    result.fields  = std::move(solved.fields);
+    result.entropy = explicit_entropy + solved.entropy;
+    return result;
+}
+
+double
+LAPW_response::energy_geometry_derivative(xc_geometry_direction_t const& direction__,
+                                          radial_geometry_response_t const& response__) const
+{
+    auto& ctx   = ks_.ctx();
+    int invalid = !response__.fields || !std::isfinite(response__.entropy);
+    if (response__.fields) {
+        invalid |= &response__.fields->ctx() != &ctx || !response__.fields->has_kinetic_density();
+    }
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW energy geometry derivative requires a matching complete SCF field response");
+    }
+    auto const& fields = *response__.fields;
+    auto potential     = potential_.hartree_response(fields.rho());
+    auto geometry      = potential_.hartree_geometry_response(density_.rho(), direction__);
+    axpy(1.0, *geometry, *potential);
+    r3::matrix<double> lattice;
+    mdarray<double, 2> atoms({3, ctx.unit_cell().num_atoms()});
+    for (int y = 0; y < 3; y++) {
+        for (int x = 0; x < 3; x++) {
+            lattice(x, y) = direction__.lattice[x + 3 * y];
+        }
+    }
+    for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+        for (int x = 0; x < 3; x++) {
+            atoms(x, ia) = direction__.atoms[ia][x];
+        }
+    }
+    auto strain  = dot(lattice, ctx.unit_cell().inverse_lattice_vectors());
+    double trace = strain(0, 0) + strain(1, 1) + strain(2, 2);
+    auto theta   = step_function_geometry_response(ctx.unit_cell(), ctx.gvec(), atoms, strain);
+    Smooth_periodic_function<double> measure(ctx.spfft<double>(), ctx.gvec_fft_sptr());
+    for (int ig = 0; ig < ctx.gvec().count(); ig++) {
+        measure.f_pw_local(ig) = theta[ctx.gvec().offset() + ig];
+    }
+    measure.fft_transform(1);
+    for (int ir = 0; ir < ctx.spfft<double>().local_slice_size(); ir++) {
+        measure.value(ir) += trace * ctx.theta(ir);
+    }
+    double result = fields.kinetic_density().scalar().integrate().total +
+                    inner(density_.kinetic_density().scalar().rg(), measure) + response__.entropy;
+    result += 0.5 * (inner(fields.rho(), potential_.hartree_potential()) + inner(density_.rho(), *potential) +
+                     inner(density_.rho().rg(), potential_.hartree_potential().rg(),
+                           [&](int ir) { return measure.value(ir); }));
+    double nuclei{0};
+    for (auto it : ctx.unit_cell().spl_num_atoms()) {
+        nuclei -= 0.5 * ctx.unit_cell().atom(it.i).zn() * y00 * potential->mt()[it.i](0, 0);
+    }
+    ctx.comm().allreduce(&nuclei, 1);
+    result += nuclei;
+    auto xc = potential_.lapw_xc_contractions(fields);
+    result += xc.rho + xc.magnetic + xc.tau;
+    auto explicit_xc = potential_.external_xc_geometry(density_);
+    for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+        for (int x = 0; x < 3; x++) {
+            result += direction__.atoms[ia][x] * explicit_xc.atoms[ia][x];
+        }
+    }
+    for (int i = 0; i < 9; i++) {
+        result += direction__.lattice[i] * explicit_xc.lattice[i];
+    }
+    if (!std::isfinite(result)) {
+        RTE_THROW("nonfinite LAPW free-energy geometry derivative");
+    }
     return result;
 }
 
 std::unique_ptr<Density>
 LAPW_response::potential_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__,
-                                  xc_geometry_direction_t const* geometry__) const
+                                  xc_geometry_direction_t const* geometry__, double* entropy__) const
 {
     auto& ctx = ks_.ctx();
     int invalid{0};
@@ -256,7 +327,7 @@ LAPW_response::potential_response(Periodic_function<double> const& hartree__, la
     if (invalid) {
         RTE_THROW("coupled LAPW Hamiltonian response failed");
     }
-    auto dp     = spectrum_->density_matrix_response(directions);
+    auto dp     = spectrum_->density_matrix_response(directions, entropy__);
     auto result = density_.lapw_density_matrix_fields(ks_, dp);
     auto basis  = density_.lapw_density_matrix_radial_response(ks_, matrices_, radial);
     add(1.0, *basis, *result);
@@ -320,14 +391,15 @@ LAPW_response::solve(Density const& rhs__, double tolerance__, int max_iteration
     mixer::Anderson_stable<Density> mixer(history__, beta__);
     mixer.initialize_function<0>(properties, *x, ctx, true);
     for (int iteration = 0; iteration < max_iterations__; iteration++) {
-        auto y = apply(*x);
+        double entropy{0};
+        auto y = apply(*x, &entropy);
         add(1.0, rhs__, *y);
         double residual = field_residual(rhs__, *x, *y);
         if (!std::isfinite(residual)) {
             RTE_THROW("nonfinite coupled LAPW response residual");
         }
         if (residual <= tolerance__) {
-            return {std::move(x), iteration + 1, residual};
+            return {std::move(x), iteration + 1, residual, entropy};
         }
         mixer.set_input<0>(*y);
         mixer.mix(0);

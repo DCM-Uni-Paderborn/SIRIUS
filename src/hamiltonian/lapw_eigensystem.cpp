@@ -378,11 +378,15 @@ LAPW_density_response::density_matrices() const
 }
 
 std::vector<mdarray<std::complex<double>, 3>>
-LAPW_density_response::density_matrix_response(std::vector<matrix_direction_t> const& directions__) const
+LAPW_density_response::density_matrix_response(std::vector<matrix_direction_t> const& directions__,
+                                               double* entropy__) const
 {
     validate_reference();
-    auto& ctx   = ks_.ctx();
-    int invalid = directions__.size() != spectra_.size();
+    auto& ctx = ks_.ctx();
+    int emin = entropy__ != nullptr, emax = emin;
+    ctx.comm().allreduce<int, mpi::op_t::min>(&emin, 1);
+    ctx.comm().allreduce<int, mpi::op_t::max>(&emax, 1);
+    int invalid = directions__.size() != spectra_.size() || emin != emax;
     for (auto const& d : directions__) {
         for (int s = 0; s < ctx.num_spins(); s++) {
             invalid |= !d.h[s] || !d.s[s];
@@ -434,6 +438,24 @@ LAPW_density_response::density_matrix_response(std::vector<matrix_direction_t> c
     ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
     if (invalid) {
         RTE_THROW("failed to construct the constrained LAPW density response");
+    }
+    if (entropy__) {
+        double value{0};
+        size_t ik{0};
+        for (auto it : ks_.spl_num_kpoints()) {
+            auto const& kp = *ks_.get<double>(it.i);
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                for (int b = 0; b < ctx.num_bands(); b++) {
+                    value -= kp.weight() / kp.comm().size() * kp.band_energy(b, s) * population.occupations[ik](b, s);
+                }
+            }
+            ik++;
+        }
+        ctx.comm().allreduce(&value, 1);
+        if (!std::isfinite(value)) {
+            RTE_THROW("nonfinite occupation entropy response");
+        }
+        *entropy__ = value;
     }
     return result;
 }

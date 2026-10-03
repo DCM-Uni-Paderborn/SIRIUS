@@ -173,8 +173,9 @@ class LAPW_density_response
     density_matrices() const;
 
     /// Full occupied/virtual response, including overlap and global occupation derivatives.
+    /** Optionally return the collectively summed smearing free-energy derivative. */
     std::vector<mdarray<std::complex<double>, 3>>
-    density_matrix_response(std::vector<matrix_direction_t> const& directions__) const;
+    density_matrix_response(std::vector<matrix_direction_t> const& directions__, double* entropy__ = nullptr) const;
 };
 
 /// Represent the k-point independent part of Hamiltonian.

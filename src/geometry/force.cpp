@@ -301,9 +301,6 @@ Force::calc_forces_total(bool add_scf_corr)
 {
     xc_geometry_derivatives_t xc_geometry(ctx_.unit_cell().num_atoms());
     if (ctx_.cb().external_xc_) {
-        if (ctx_.full_potential() && ctx_.unit_cell().num_core_electrons() != 0) {
-            RTE_THROW("external LAPW core-energy derivatives are not connected to forces yet");
-        }
         xc_geometry = potential_.external_xc_geometry(density_);
     }
     if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
@@ -333,10 +330,10 @@ Force::calc_forces_total(bool add_scf_corr)
             for (int x : {0, 1, 2}) {
                 forces_total_(x, ia) = forces_ibs_(x, ia) + forces_hf_(x, ia) + forces_rho_(x, ia) + forces_xc_(x, ia);
                 if (response) {
-                    // The radial basis follows the SCF potential, not a frozen atom potential.
+                    // Differentiate the discrete free energy, including its self-consistent core and valence fields.
                     direction.atoms[ia][x] = 1;
                     auto radial            = response->radial_geometry_response(direction, 1e-8, 200);
-                    forces_total_(x, ia) -= lapw_radial_basis_derivative(radial.scalar, radial.core);
+                    forces_total_(x, ia)   = -response->energy_geometry_derivative(direction, radial);
                     direction.atoms[ia][x] = 0;
                 }
             }

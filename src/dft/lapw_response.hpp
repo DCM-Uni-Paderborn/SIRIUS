@@ -29,7 +29,7 @@ class LAPW_response
 
     std::unique_ptr<Density>
     potential_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__,
-                       xc_geometry_direction_t const* geometry__ = nullptr) const;
+                       xc_geometry_direction_t const* geometry__ = nullptr, double* entropy__ = nullptr) const;
 
   public:
     struct result_t
@@ -37,12 +37,15 @@ class LAPW_response
         std::unique_ptr<Density> fields;
         int iterations;
         double residual;
+        double entropy;
     };
 
     struct radial_geometry_response_t
     {
         std::vector<std::vector<double>> scalar;
         std::vector<std::array<std::vector<double>, 2>> core;
+        std::unique_ptr<Density> fields;
+        double entropy{0};
     };
 
     LAPW_response(K_point_set& ks__, Density const& density__, Potential& potential__);
@@ -50,7 +53,7 @@ class LAPW_response
     /// Induced fields J*x. Does not include an explicit perturbation right-hand side.
     /** Directions use synchronized total/magnetization rho/tau fields. */
     std::unique_ptr<Density>
-    apply(Density const& direction__) const;
+    apply(Density const& direction__, double* entropy__ = nullptr) const;
 
     /// Explicit SCF-map geometry derivative at fixed input rho/tau coefficients.
     /** Includes Poisson/XC sampling, radial functions, PW/LO matrices, occupations
@@ -59,7 +62,7 @@ class LAPW_response
      *  include the induced SCF response.
      */
     std::unique_ptr<Density>
-    geometry_rhs(xc_geometry_direction_t const& direction__) const;
+    geometry_rhs(xc_geometry_direction_t const& direction__, double* entropy__ = nullptr) const;
 
     /// Solve (I-J)*x=rhs by stable Anderson mixing with an independently checked residual.
     /** The residual is the maximum fieldwise infinity norm of rhs+J*x-x,
@@ -70,10 +73,16 @@ class LAPW_response
     solve(Density const& rhs__, double tolerance__, int max_iterations__, int history__ = 8, double beta__ = 0.5) const;
 
     /// Total radial-solver potential derivative, including explicit geometry and induced SCF fields.
-    /** Uses the same checked response solve as solve(); the reference state is unchanged. */
+    /** Also returns the complete physical rho/tau and entropy derivatives.
+     *  Uses the same checked response solve as solve(); the reference state is unchanged. */
     radial_geometry_response_t
     radial_geometry_response(xc_geometry_direction_t const& direction__, double tolerance__,
                              int max_iterations__) const;
+
+    /// Derivative of the discrete free energy using the complete SCF field response.
+    double
+    energy_geometry_derivative(xc_geometry_direction_t const& direction__,
+                               radial_geometry_response_t const& response__) const;
 };
 
 } // namespace sirius
