@@ -12,6 +12,7 @@
 #include "dft/smearing.hpp"
 #include "function3d/xc_point_fields.hpp"
 #include "lapw/step_function.hpp"
+#include <map>
 
 using namespace sirius;
 
@@ -1915,7 +1916,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     auto saved_orbitals = orbital_snapshot();
     auto saved_basis    = basis_snapshot();
     double saved_energy = gs.total_energy(), saved_exc = potential.energy_exc(density);
-    reject("incomplete external LAPW forces remain guarded", [&] { gs.forces().calc_forces_total(); });
+    reject("LAPW forces require complete host geometry callbacks", [&] { gs.forces().calc_forces_total(); });
     reject("incomplete external LAPW stress remains guarded", [&] { gs.stress().calc_stress_total(); });
     auto verify_restored = [&] {
         check("orbital diagnostic restores PW/AW/LO coefficients", orbital_snapshot() == saved_orbitals ? 0 : 1, 0);
@@ -3007,8 +3008,7 @@ test_lapw_force_response(int mag, double pw_cutoff)
         std::unique_ptr<DFT_ground_state> gs;
     };
     std::unique_ptr<state_t> reference;
-    // The displaced SCF supplies the radial potential response. This decomposition
-    // check does not replace the missing analytic response in the production force.
+    // Displaced SCFs independently check the analytic self-consistent basis response.
     auto radial_lagrangian = [&](std::vector<std::vector<double>> const& potential) {
         auto& ctx = *reference->ctx;
         auto& ks  = *reference->ks;
@@ -3039,14 +3039,16 @@ test_lapw_force_response(int mag, double pw_cutoff)
         return value;
     };
     auto calculate = [&](double displacement, bool forces, bool frozen) {
-        auto state                      = std::make_unique<state_t>();
-        state->ctx                      = context(mag, true, false, false, false, displacement, pw_cutoff);
-        auto& ctx                       = state->ctx;
-        ctx->cb().external_xc_geometry_ = functional;
+        auto state                               = std::make_unique<state_t>();
+        state->ctx                               = context(mag, true, false, false, false, displacement, pw_cutoff);
+        auto& ctx                                = state->ctx;
+        ctx->cb().external_xc_geometry_          = functional;
+        ctx->cb().external_xc_geometry_response_ = true;
         // This diagnostic keeps the Cartesian grid, weights and block centres fixed.
-        ctx->cb().external_xc_pullback_ = [](auto const&, auto const&, auto const&, auto&) {};
-        state->ks                       = std::make_unique<K_point_set>(*ctx);
-        auto& ks                        = *state->ks;
+        ctx->cb().external_xc_pullback_             = [](auto const&, auto const&, auto const&, auto&) {};
+        ctx->cb().external_xc_quadrature_direction_ = [](auto const&, auto const&, auto const&, auto&) {};
+        state->ks                                   = std::make_unique<K_point_set>(*ctx);
+        auto& ks                                    = *state->ks;
         ks.add_kpoint({0.07, -0.03, 0.02}, 1);
         ks.initialize();
         state->gs = std::make_unique<DFT_ground_state>(ks);
@@ -3113,17 +3115,86 @@ test_lapw_force_response(int mag, double pw_cutoff)
     int failures{0};
     for (bool frozen : {false, true}) {
         auto centre = calculate(0, true, frozen);
-        for (double h : {2e-4, 1e-4}) {
-            auto plus       = calculate(h, false, frozen);
-            auto direction  = displaced_potential;
-            auto minus      = calculate(-h, false, frozen);
-            double fd       = (plus[0] - minus[0]) / (2 * h);
-            double response = (plus[3] - minus[3]) / (2 * h);
+        std::vector<std::vector<double>> scalar;
+        double coupled_response{0}, total_derivative = centre[1];
+        if (!frozen) {
+            auto& gs        = *reference->gs;
+            auto& potential = gs.potential();
+            auto snapshot   = [&] {
+                std::vector<double> values{gs.total_energy(), potential.energy_exc(gs.density())};
+                for (int s = 0; s < reference->ctx->num_spins(); s++) {
+                    for (auto const* f : {&gs.density().component(s), &gs.density().kinetic_density().component(s)}) {
+                        auto field = potential_samples(*f);
+                        values.insert(values.end(), field.begin(), field.end());
+                    }
+                }
+                for (int ic = 0; ic < reference->ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                    auto const& cls = reference->ctx->unit_cell().atom_symmetry_class(ic);
+                    for (auto rf : cls.atom_type().indexr()) {
+                        for (int ir = 0; ir < cls.atom_type().num_mt_points(); ir++) {
+                            values.push_back(cls.radial_function(ir, rf.idxrf));
+                        }
+                    }
+                }
+                return values;
+            };
+            auto before = snapshot();
+            xc_geometry_direction_t geometry(reference->ctx->unit_cell().num_atoms());
+            geometry.atoms[0] = {0.23, -0.37, 0.19};
+            LAPW_response response(*reference->ks, gs.density(), potential);
+            auto radial       = response.radial_geometry_response(geometry, 1e-8, 200);
+            scalar            = radial.scalar;
+            coupled_response  = gs.forces().lapw_radial_basis_derivative(scalar, radial.core);
+            auto const& total = gs.forces().calc_forces_total();
+            total_derivative  = 0;
+            for (int x = 0; x < 3; x++) {
+                total_derivative -= geometry.atoms[0][x] * total(x, 0);
+            }
+            failures += snapshot() != before;
+            if (reference->ctx->comm().rank() == 0) {
+                std::cout << "LAPW force coupled basis derivative=" << coupled_response
+                          << " total derivative=" << total_derivative << '\n';
+            }
+        }
+        struct sample_t
+        {
+            std::array<double, 4> energies;
+            std::vector<std::vector<double>> radial_potential;
+        };
+        std::map<double, sample_t> samples;
+        // Reuse the overlapping fourth-order stencils rather than repeating displaced SCFs.
+        auto sample = [&](double step) {
+            auto it = samples.find(step);
+            if (it == samples.end()) {
+                auto values = calculate(step, false, frozen);
+                it          = samples.emplace(step, sample_t{values, displaced_potential}).first;
+            }
+            displaced_potential = it->second.radial_potential;
+            return it->second.energies;
+        };
+        // Fourth-order differences resolve the small SCF response without short-step cancellation.
+        for (double h : {2e-3, 1e-3}) {
+            auto plus            = sample(h);
+            auto direction       = displaced_potential;
+            auto minus           = sample(-h);
+            auto inner_minus     = displaced_potential;
+            auto outer_plus      = sample(2 * h);
+            auto outer_direction = displaced_potential;
+            auto outer_minus     = sample(-2 * h);
+            auto differentiate   = [&](int part) {
+                return (8 * (plus[part] - minus[part]) - (outer_plus[part] - outer_minus[part])) / (12 * h);
+            };
+            double fd = differentiate(0), response = differentiate(3);
             double analytic_response{0};
+            double potential_error{0}, potential_peak{0};
             if (!frozen) {
                 for (size_t ic = 0; ic < direction.size(); ic++) {
                     for (size_t ir = 0; ir < direction[ic].size(); ir++) {
-                        direction[ic][ir] = (direction[ic][ir] - displaced_potential[ic][ir]) / (2 * h);
+                        direction[ic][ir] = (8 * (direction[ic][ir] - inner_minus[ic][ir]) -
+                                             (outer_direction[ic][ir] - displaced_potential[ic][ir])) /
+                                            (12 * h);
+                        potential_error   = std::max(potential_error, std::abs(direction[ic][ir] - scalar[ic][ir]));
+                        potential_peak    = std::max(potential_peak, std::abs(scalar[ic][ir]));
                     }
                 }
                 radial_lagrangian(frozen_potential);
@@ -3131,22 +3202,30 @@ test_lapw_force_response(int mag, double pw_cutoff)
             }
             double error          = std::abs(fd - centre[1] - response);
             double analytic_error = std::abs(fd - centre[1] - analytic_response);
+            double coupled_error  = std::abs(fd - centre[1] - coupled_response);
+            double total_error    = std::abs(fd - total_derivative);
             if (mpi::Communicator::world().rank() == 0) {
                 std::cout << "LAPW force decomposition spin=" << mag << " pw cutoff=" << pw_cutoff
                           << " frozen radial basis=" << frozen << " h=" << h << " derivative=" << centre[1]
-                          << " FD=" << fd << " direct FD=" << (plus[2] - minus[2]) / (2 * h)
+                          << " FD=" << fd << " direct FD=" << differentiate(2)
                           << " energy identity=" << centre[0] - centre[2] << " radial response=" << response
                           << " analytic radial response=" << analytic_response << " error=" << error
-                          << " analytic error=" << analytic_error << '\n';
+                          << " analytic error=" << analytic_error << " coupled error=" << coupled_error
+                          << " total error=" << total_error
+                          << " radial potential error=" << potential_error / std::max(1e-12, potential_peak) << '\n';
             }
             failures += !std::isfinite(error) || error > 2e-6;
             failures += !std::isfinite(analytic_error) || analytic_error > 2e-6;
             failures += std::abs(response - analytic_response) > 2e-7;
+            failures += !std::isfinite(coupled_error) || coupled_error > 2e-6;
+            failures += std::abs(response - coupled_response) > 2e-7;
+            failures += !std::isfinite(total_error) || total_error > 2e-6;
+            failures += potential_error / std::max(1e-12, potential_peak) > 3e-5;
             failures += !frozen && std::abs(response) < 1e-5;
-            for (auto const& point : {centre, plus, minus}) {
+            for (auto const& point : {centre, plus, minus, outer_plus, outer_minus}) {
                 failures += !std::isfinite(point[0] - point[2]) || std::abs(point[0] - point[2]) > 2e-7;
             }
-            failures += std::abs(fd - (plus[2] - minus[2]) / (2 * h)) > 2e-7;
+            failures += std::abs(fd - differentiate(2)) > 2e-7;
         }
     }
     return failures;

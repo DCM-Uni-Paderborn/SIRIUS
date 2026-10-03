@@ -23,6 +23,7 @@
 #include "hamiltonian/hamiltonian.hpp"
 #include "symmetry/symmetrize_forces.hpp"
 #include "lapw/step_function.hpp"
+#include "dft/lapw_response.hpp"
 #include <string>
 #include <iomanip>
 #include <vector>
@@ -300,8 +301,8 @@ Force::calc_forces_total(bool add_scf_corr)
 {
     xc_geometry_derivatives_t xc_geometry(ctx_.unit_cell().num_atoms());
     if (ctx_.cb().external_xc_) {
-        if (ctx_.full_potential()) {
-            RTE_THROW("external LAPW XC basis and boundary derivatives are not connected to forces yet");
+        if (ctx_.full_potential() && ctx_.unit_cell().num_core_electrons() != 0) {
+            RTE_THROW("external LAPW core-energy derivatives are not connected to forces yet");
         }
         xc_geometry = potential_.external_xc_geometry(density_);
     }
@@ -323,9 +324,21 @@ Force::calc_forces_total(bool add_scf_corr)
         calc_forces_rho();
         calc_forces_hf();
         calc_forces_ibs();
+        std::unique_ptr<LAPW_response> response;
+        if (ctx_.cb().external_xc_) {
+            response = std::make_unique<LAPW_response>(kset_, density_, potential_);
+        }
+        xc_geometry_direction_t direction(ctx_.unit_cell().num_atoms());
         for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
             for (int x : {0, 1, 2}) {
-                forces_total_(x, ia) = forces_ibs_(x, ia) + forces_hf_(x, ia) + forces_rho_(x, ia);
+                forces_total_(x, ia) = forces_ibs_(x, ia) + forces_hf_(x, ia) + forces_rho_(x, ia) + forces_xc_(x, ia);
+                if (response) {
+                    // The radial basis follows the SCF potential, not a frozen atom potential.
+                    direction.atoms[ia][x] = 1;
+                    auto radial            = response->radial_geometry_response(direction, 1e-8, 200);
+                    forces_total_(x, ia) -= lapw_radial_basis_derivative(radial.scalar, radial.core);
+                    direction.atoms[ia][x] = 0;
+                }
             }
         }
     } else {

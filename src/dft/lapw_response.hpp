@@ -39,6 +39,12 @@ class LAPW_response
         double residual;
     };
 
+    struct radial_geometry_response_t
+    {
+        std::vector<std::vector<double>> scalar;
+        std::vector<std::array<std::vector<double>, 2>> core;
+    };
+
     LAPW_response(K_point_set& ks__, Density const& density__, Potential& potential__);
 
     /// Induced fields J*x. Does not include an explicit perturbation right-hand side.
@@ -62,6 +68,12 @@ class LAPW_response
      */
     result_t
     solve(Density const& rhs__, double tolerance__, int max_iterations__, int history__ = 8, double beta__ = 0.5) const;
+
+    /// Total radial-solver potential derivative, including explicit geometry and induced SCF fields.
+    /** Uses the same checked response solve as solve(); the reference state is unchanged. */
+    radial_geometry_response_t
+    radial_geometry_response(xc_geometry_direction_t const& direction__, double tolerance__,
+                             int max_iterations__) const;
 };
 
 } // namespace sirius

@@ -5706,8 +5706,10 @@ sirius_set_xc_point_callback:
     supplied quadrature. CPU scalar/collinear PW and PAW are supported, without
     symmetry reduction. PAW requires explicitly supplied positive core tau.
     Nonrelativistic FP-LAPW fields are also supported. PW and PAW atomic forces
-    and stress additionally require the point geometry callbacks. FP-LAPW forces
-    and stress, and SOC are not supported by this point path.
+    and stress additionally require the point geometry callbacks. Core-free
+    nonrelativistic FP-LAPW forces also require joint Hessian and quadrature-direction
+    callbacks; collinear states must use full variation. FP-LAPW core forces,
+    stress and SOC are not supported by this point path.
   arguments:
     handler:
       type: ctx_handler
@@ -5903,8 +5905,10 @@ sirius_set_xc_point_geometry_callbacks:
     Callbacks are collective, including empty ranks. Outputs start at zero.
     Set status nonzero on failure without unwinding across the C ABI.
     Both null pointers disable geometry evaluation. For PW and PAW, these callbacks
-    supply the explicit XC contribution to atomic forces and stress. FP-LAPW forces and stress
-    require additional basis and geometry responses.
+    supply the explicit XC contribution to atomic forces and stress. Core-free
+    nonrelativistic FP-LAPW forces additionally require the joint Hessian and
+    quadrature-direction callbacks for the self-consistent radial basis response.
+    FP-LAPW core forces and stress remain unsupported.
   arguments:
     handler:
       type: ctx_handler

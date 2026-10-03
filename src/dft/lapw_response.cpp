@@ -133,6 +133,28 @@ LAPW_response::geometry_rhs(xc_geometry_direction_t const& direction__) const
     return potential_response(*hartree, xc, &direction__);
 }
 
+LAPW_response::radial_geometry_response_t
+LAPW_response::radial_geometry_response(xc_geometry_direction_t const& direction__, double tolerance__,
+                                        int max_iterations__) const
+{
+    auto rhs    = geometry_rhs(direction__);
+    auto solved = solve(*rhs, tolerance__, max_iterations__);
+    radial_geometry_response_t result, explicit_response;
+    potential_.lapw_radial_potential_response(density_, *solved.fields, result.scalar, result.core);
+    auto hartree = potential_.hartree_geometry_response(density_.rho(), direction__);
+    auto xc      = potential_.lapw_external_xc_geometry_response(density_, direction__);
+    potential_.lapw_radial_potential_response(*hartree, xc, explicit_response.scalar, explicit_response.core);
+    for (size_t ic = 0; ic < result.scalar.size(); ic++) {
+        for (size_t ir = 0; ir < result.scalar[ic].size(); ir++) {
+            result.scalar[ic][ir] += explicit_response.scalar[ic][ir];
+            for (int part = 0; part < 2; part++) {
+                result.core[ic][part][ir] += explicit_response.core[ic][part][ir];
+            }
+        }
+    }
+    return result;
+}
+
 std::unique_ptr<Density>
 LAPW_response::potential_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__,
                                   xc_geometry_direction_t const* geometry__) const
