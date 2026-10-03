@@ -138,12 +138,12 @@ LAPW_response::radial_geometry_response(xc_geometry_direction_t const& direction
                                         int max_iterations__) const
 {
     double explicit_entropy{0};
-    auto rhs    = geometry_rhs(direction__, &explicit_entropy);
-    auto solved = solve(*rhs, tolerance__, max_iterations__);
-    radial_geometry_response_t result, explicit_response;
-    potential_.lapw_radial_potential_response(density_, *solved.fields, result.scalar, result.core);
     auto hartree = potential_.hartree_geometry_response(density_.rho(), direction__);
     auto xc      = potential_.lapw_external_xc_geometry_response(density_, direction__);
+    auto rhs     = potential_response(*hartree, xc, &direction__, &explicit_entropy);
+    auto solved  = solve(*rhs, tolerance__, max_iterations__);
+    radial_geometry_response_t result, explicit_response;
+    potential_.lapw_radial_potential_response(density_, *solved.fields, result.scalar, result.core);
     potential_.lapw_radial_potential_response(*hartree, xc, explicit_response.scalar, explicit_response.core);
     for (size_t ic = 0; ic < result.scalar.size(); ic++) {
         for (size_t ir = 0; ir < result.scalar[ic].size(); ir++) {
@@ -160,10 +160,20 @@ LAPW_response::radial_geometry_response(xc_geometry_direction_t const& direction
 
 double
 LAPW_response::energy_geometry_derivative(xc_geometry_direction_t const& direction__,
-                                          radial_geometry_response_t const& response__) const
+                                          radial_geometry_response_t const& response__,
+                                          xc_geometry_derivatives_t const& explicit_xc__) const
 {
     auto& ctx   = ks_.ctx();
-    int invalid = !response__.fields || !std::isfinite(response__.entropy);
+    int invalid = !response__.fields || !std::isfinite(response__.entropy) ||
+                  explicit_xc__.atoms.size() != static_cast<size_t>(ctx.unit_cell().num_atoms());
+    for (auto const& atom : explicit_xc__.atoms) {
+        for (double value : atom) {
+            invalid |= !std::isfinite(value);
+        }
+    }
+    for (double value : explicit_xc__.lattice) {
+        invalid |= !std::isfinite(value);
+    }
     if (response__.fields) {
         invalid |= &response__.fields->ctx() != &ctx || !response__.fields->has_kinetic_density();
     }
@@ -211,14 +221,13 @@ LAPW_response::energy_geometry_derivative(xc_geometry_direction_t const& directi
     result += nuclei;
     auto xc = potential_.lapw_xc_contractions(fields);
     result += xc.rho + xc.magnetic + xc.tau;
-    auto explicit_xc = potential_.external_xc_geometry(density_);
     for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
         for (int x = 0; x < 3; x++) {
-            result += direction__.atoms[ia][x] * explicit_xc.atoms[ia][x];
+            result += direction__.atoms[ia][x] * explicit_xc__.atoms[ia][x];
         }
     }
     for (int i = 0; i < 9; i++) {
-        result += direction__.lattice[i] * explicit_xc.lattice[i];
+        result += direction__.lattice[i] * explicit_xc__.lattice[i];
     }
     if (!std::isfinite(result)) {
         RTE_THROW("nonfinite LAPW free-energy geometry derivative");

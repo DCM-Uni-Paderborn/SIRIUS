@@ -79,10 +79,10 @@ class LAPW_response
     radial_geometry_response(xc_geometry_direction_t const& direction__, double tolerance__,
                              int max_iterations__) const;
 
-    /// Derivative of the discrete free energy using the complete SCF field response.
+    /// Derivative of the discrete free energy using the complete SCF field response and explicit XC geometry covectors.
     double
-    energy_geometry_derivative(xc_geometry_direction_t const& direction__,
-                               radial_geometry_response_t const& response__) const;
+    energy_geometry_derivative(xc_geometry_direction_t const& direction__, radial_geometry_response_t const& response__,
+                               xc_geometry_derivatives_t const& explicit_xc__) const;
 };
 
 } // namespace sirius

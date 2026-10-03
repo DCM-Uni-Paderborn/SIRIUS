@@ -3228,7 +3228,8 @@ test_lapw_force_response(int mag, double pw_cutoff, bool core)
             core_direction             = radial.core;
             entropy_response           = radial.entropy;
             coupled_response           = gs.forces().lapw_radial_basis_derivative(scalar, radial.core);
-            double complete_derivative = response.energy_geometry_derivative(geometry, radial);
+            auto explicit_xc           = potential.external_xc_geometry(gs.density());
+            double complete_derivative = response.energy_geometry_derivative(geometry, radial, explicit_xc);
             if (reference->ctx->comm().rank() == 0) {
                 std::cout << "LAPW complete free-energy geometry derivative=" << complete_derivative
                           << " entropy=" << radial.entropy << std::endl;
