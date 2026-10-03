@@ -1950,7 +1950,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     auto saved_basis    = basis_snapshot();
     double saved_energy = gs.total_energy(), saved_exc = potential.energy_exc(density);
     reject("LAPW forces require complete host geometry callbacks", [&] { gs.forces().calc_forces_total(); });
-    reject("incomplete external LAPW stress remains guarded", [&] { gs.stress().calc_stress_total(); });
+    reject("LAPW stress requires complete host geometry callbacks", [&] { gs.stress().calc_stress_total(); });
     auto verify_restored = [&] {
         check("orbital diagnostic restores PW/AW/LO coefficients", orbital_snapshot() == saved_orbitals ? 0 : 1, 0);
         check("orbital diagnostic holds radial basis fixed", basis_snapshot() == saved_basis ? 0 : 1, 0);
@@ -3339,15 +3339,15 @@ test_lapw_force_response(int mag, double pw_cutoff, bool core)
 }
 
 int
-test_lapw_cell_response(int mag, bool core, int component)
+test_lapw_cell_response(int mag, bool core)
 {
-    r3::matrix<double> strain;
-    if (component == 0) {
-        strain(0, 0) = 1;
-    } else {
-        strain(0, 1) = strain(1, 0) = 0.5;
-    }
-    auto calculate = [&](double step, bool differentiate) {
+    auto calculate = [&](double step, int component, bool differentiate) {
+        r3::matrix<double> strain;
+        if (component == 0) {
+            strain(0, 0) = 1;
+        } else {
+            strain(0, 1) = strain(1, 0) = 0.5;
+        }
         auto ctx      = context(mag, true, false, core, false, 0, 9.0, false, 0, "fermi_dirac", core);
         auto lattice  = ctx->unit_cell().lattice_vectors();
         auto dlattice = dot(strain, lattice);
@@ -3387,7 +3387,6 @@ test_lapw_cell_response(int mag, bool core, int component)
             attached.push_back(owner);
         }
         int ng             = ctx->gvec().num_gvec();
-        auto base_lattice  = ctx->unit_cell().lattice_vectors();
         auto base_inverse  = ctx->unit_cell().inverse_lattice_vectors();
         double base_volume = ctx->unit_cell().omega();
         std::vector<r3::vector<double>> base_centres;
@@ -3494,26 +3493,21 @@ test_lapw_cell_response(int mag, bool core, int component)
             RTE_THROW("LAPW cell SCF did not converge");
         }
         double energy = free_energy(*ctx, ks, gs.density(), gs.potential());
-        double derivative{0};
+        std::array<double, 3> result{energy, 0, 0};
         if (differentiate) {
-            xc_geometry_direction_t direction(ctx->unit_cell().num_atoms());
-            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
-                auto delta          = dot(strain, base_centres[ia]);
-                direction.atoms[ia] = {delta[0], delta[1], delta[2]};
-            }
-            auto dlattice = dot(strain, base_lattice);
-            for (int y = 0; y < 3; y++) {
-                for (int x = 0; x < 3; x++) {
-                    direction.lattice[x + 3 * y] = dlattice(x, y);
-                }
-            }
             auto rho_before       = potential_samples(gs.density().rho());
             auto tau_before       = potential_samples(gs.density().kinetic_density().scalar());
             auto potential_before = potential_samples(gs.potential().effective_potential());
-            LAPW_response response(ks, gs.density(), gs.potential());
-            auto radial      = response.radial_geometry_response(direction, 1e-8, 200);
-            auto explicit_xc = gs.potential().external_xc_geometry(gs.density());
-            derivative       = response.energy_geometry_derivative(direction, radial, explicit_xc);
+            auto stress           = gs.stress().calc_stress_total();
+            result[1]             = ctx->unit_cell().omega() * stress(0, 0);
+            result[2]             = 0.5 * ctx->unit_cell().omega() * (stress(0, 1) + stress(1, 0));
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    if (!std::isfinite(stress(x, y))) {
+                        RTE_THROW("nonfinite LAPW stress tensor");
+                    }
+                }
+            }
             if (rho_before != potential_samples(gs.density().rho()) ||
                 tau_before != potential_samples(gs.density().kinetic_density().scalar()) ||
                 potential_before != potential_samples(gs.potential().effective_potential()) ||
@@ -3521,26 +3515,32 @@ test_lapw_cell_response(int mag, bool core, int component)
                 RTE_THROW("LAPW cell response changed the reference state");
             }
         }
-        return std::array<double, 2>{energy, derivative};
+        return result;
     };
-    auto reference = calculate(0, true);
-    std::map<double, double> samples;
-    auto sample = [&](double step) {
-        auto it = samples.find(step);
+    auto reference = calculate(0, 0, true);
+    std::map<std::pair<int, double>, double> samples;
+    auto sample = [&](double step, int component) {
+        auto key = std::make_pair(component, step);
+        auto it  = samples.find(key);
         if (it == samples.end()) {
-            it = samples.emplace(step, calculate(step, false)[0]).first;
+            it = samples.emplace(key, calculate(step, component, false)[0]).first;
         }
         return it->second;
     };
     int failures{0};
-    for (double h : {2e-3, 1e-3}) {
-        double fd    = (8 * (sample(h) - sample(-h)) - (sample(2 * h) - sample(-2 * h))) / (12 * h);
-        double error = std::abs(fd - reference[1]);
-        if (mpi::Communicator::world().rank() == 0) {
-            std::cout << "LAPW cell spin=" << mag << " core=" << core << " component=" << component << " h=" << h
-                      << " analytic=" << reference[1] << " FD=" << fd << " error=" << error << std::endl;
+    for (int component : {0, 1}) {
+        for (double h : {2e-3, 1e-3}) {
+            double fd    = (8 * (sample(h, component) - sample(-h, component)) -
+                            (sample(2 * h, component) - sample(-2 * h, component))) /
+                           (12 * h);
+            double error = std::abs(fd - reference[component + 1]);
+            if (mpi::Communicator::world().rank() == 0) {
+                std::cout << "LAPW cell spin=" << mag << " core=" << core << " component=" << component << " h=" << h
+                          << " analytic=" << reference[component + 1] << " FD=" << fd << " error=" << error
+                          << std::endl;
+            }
+            failures += !std::isfinite(error) || error > 2e-6;
         }
-        failures += !std::isfinite(error) || error > 2e-6;
     }
     return failures;
 }
@@ -3700,10 +3700,8 @@ main(int argc, char** argv)
             RTE_THROW("LAPW cell test requires spin mode 0 or 1");
         }
         for (int mag = first; mag <= last; mag++) {
-            for (int component : {0, 1}) {
-                result += call_test("external LAPW cell response", test_lapw_cell_response, mag,
-                                    std::string(argv[1]) == "core-cell", component);
-            }
+            result += call_test("external LAPW cell response", test_lapw_cell_response, mag,
+                                std::string(argv[1]) == "core-cell");
         }
         sirius::finalize();
         return std::min(result, 1);

@@ -16,6 +16,7 @@
 #include "k_point/k_point.hpp"
 #include "non_local_functor.hpp"
 #include "dft/energy.hpp"
+#include "dft/lapw_response.hpp"
 #include "symmetry/symmetrize_stress_tensor.hpp"
 #include "stress.hpp"
 
@@ -192,7 +193,25 @@ r3::matrix<double>
 Stress::calc_stress_total()
 {
     if (ctx_.cb().external_xc_ && ctx_.full_potential()) {
-        RTE_THROW("external LAPW XC stress requires basis and boundary derivatives");
+        auto geometry = potential_.external_xc_geometry(density_);
+        LAPW_response response(kset_, density_, potential_);
+        auto const& cell = ctx_.unit_cell();
+        for (int mu = 0; mu < 3; mu++) {
+            for (int nu = 0; nu < 3; nu++) {
+                xc_geometry_direction_t direction(cell.num_atoms());
+                for (int j = 0; j < 3; j++) {
+                    direction.lattice[mu + 3 * j] = cell.lattice_vectors()(nu, j);
+                }
+                for (int ia = 0; ia < cell.num_atoms(); ia++) {
+                    auto r                  = cell.get_cartesian_coordinates(cell.atom(ia).position());
+                    direction.atoms[ia][mu] = r[nu];
+                }
+                auto radial =
+                        response.radial_geometry_response(direction, ctx_.cb().external_xc_response_tolerance_, 200);
+                stress_total_(mu, nu) = response.energy_geometry_derivative(direction, radial, geometry) / cell.omega();
+            }
+        }
+        return stress_total_;
     }
     if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
         RTE_THROW("meta-GGA cell derivatives are not connected to stress yet");
@@ -413,7 +432,7 @@ Stress::calc_stress_xc()
 
     if (ctx_.cb().external_xc_) {
         if (ctx_.full_potential()) {
-            RTE_THROW("external LAPW XC stress requires basis and boundary derivatives");
+            RTE_THROW("external LAPW XC stress is included only in the complete total stress derivative");
         }
         if (ctx_.cfg().parameters().precision_wf() == "fp32") {
 #if defined(SIRIUS_USE_FP32)
