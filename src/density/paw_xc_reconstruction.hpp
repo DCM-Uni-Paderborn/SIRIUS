@@ -10,6 +10,7 @@
 #include "density/density.hpp"
 #include "density/paw_xc_correction.hpp"
 #include "function3d/spheric_function_interpolator.hpp"
+#include "function3d/xc_point_fields.hpp"
 
 namespace sirius {
 
@@ -32,6 +33,7 @@ class PAW_xc_reconstruction
         std::vector<Spheric_function_interpolator> tau;
         std::vector<Spheric_function_interpolator> core;
         std::vector<r3::vector<double>> displacements;
+        std::vector<r3::vector<double>> images;
         std::vector<int> targets;
 
         source_t(Atom_type const& type__, mdarray<std::complex<double>, 3> const& dm__)
@@ -115,6 +117,8 @@ class PAW_xc_reconstruction
                                     RTE_THROW("PAW XC reconstruction: exact nuclei require a cusp-gradient convention");
                                 }
                                 source.displacements.push_back(displacement);
+                                source.images.push_back(fractional +
+                                                        r3::vector<double>({double(x), double(y), double(z)}));
                                 source.targets.push_back(p);
                             }
                         }
@@ -129,6 +133,58 @@ class PAW_xc_reconstruction
         if (failed) {
             RTE_THROW("PAW XC reconstruction failed on a context rank: " + message);
         }
+    }
+
+    /// Differentiate the local reconstruction, including frozen-core fields.
+    /** Density matrices, radial functions and image support membership are held
+     *  fixed. The projector-density response must be added by the host. The
+     *  lattice derivative holds Cartesian source atoms and target points fixed.
+     */
+    xc_geometry_adjoint_t
+    geometry_adjoint(xc_point_fields_t const& derivatives__) const
+    {
+        auto const& r = derivatives__.rho;
+        auto const& g = derivatives__.gradient;
+        auto const& t = derivatives__.tau;
+        check_buffers(r, g, t);
+        int failed{0};
+        for (int s = 0; s < ctx_.num_spins(); s++) {
+            for (int p = 0; p < num_points_; p++) {
+                failed |= !std::isfinite(r(p, s)) || !std::isfinite(t(p, s));
+                for (int x = 0; x < 3; x++) {
+                    failed |= !std::isfinite(g(p, x, s));
+                }
+            }
+        }
+        ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+        if (failed) {
+            RTE_THROW("PAW XC geometry adjoint: nonfinite covectors on a context rank");
+        }
+        xc_geometry_adjoint_t result(num_points_, ctx_.unit_cell().num_atoms());
+        for (size_t i = 0; i < sources_.size(); i++) {
+            auto const& source = sources_[i];
+            int ia             = ctx_.unit_cell().paw_atom_index(paw_atom_index_t::global(static_cast<int>(i)));
+            for (int s = 0; s < ctx_.num_spins(); s++) {
+                for (size_t j = 0; j < source.targets.size(); j++) {
+                    int p = source.targets[j];
+                    std::array<double, 4> dr{r(p, s), g(p, 0, s), g(p, 1, s), g(p, 2, s)};
+                    std::array<double, 4> dt{t(p, s), 0, 0, 0};
+                    auto const& d = source.displacements[j];
+                    auto v        = source.rho[s].position_adjoint(d, dr) + source.tau[s].position_adjoint(d, dt) +
+                             source.core[0].position_adjoint(d, dr) + source.core[1].position_adjoint(d, dt);
+                    result.points[p] += v;
+                    for (int x = 0; x < 3; x++) {
+                        result.atoms(x, ia) -= v[x];
+                        for (int y = 0; y < 3; y++) {
+                            result.lattice(x, y) -= v[x] * source.images[j][y];
+                        }
+                    }
+                }
+            }
+        }
+        ctx_.comm().allreduce(result.atoms.at(memory_t::host), result.atoms.size());
+        ctx_.comm().allreduce(&result.lattice(0, 0), 9);
+        return result;
     }
 
     /// Add the complete source/image sum to smooth rho, grad-rho and tau.

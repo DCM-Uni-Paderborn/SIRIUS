@@ -40,6 +40,62 @@ class Spheric_function_interpolator
     spheric_inner_extension_t inner_;
     std::vector<int> inner_power_;
 
+    struct gradient_coupling_t
+    {
+        int from, to, angular;
+        r3::vector<double> weight;
+    };
+    std::vector<gradient_coupling_t> gradient_couplings_;
+
+    // Transform the spherical-gradient couplings used by gradient(Flm) to real
+    // harmonics and Cartesian components. Retain the extra l shell for a Hessian.
+    void
+    build_gradient_couplings()
+    {
+        double isqrt2 = 1 / std::sqrt(2.0);
+        for (int l = 0; l <= lmax_ + 1; l++) {
+            for (int m = -l; m <= l; m++) {
+                for (int lp : {l - 1, l + 1}) {
+                    if (lp < 0) {
+                        continue;
+                    }
+                    std::vector<r3::vector<double>> weights(2 * lp + 1);
+                    for (int k = -std::abs(m); k <= std::abs(m); k += std::max(1, 2 * std::abs(m))) {
+                        auto input = SHT::ylm_dot_rlm(l, k, m);
+                        for (int mu = -1; mu <= 1; mu++) {
+                            int kp = k + mu;
+                            if (std::abs(kp) > lp) {
+                                continue;
+                            }
+                            double d = lp > l ? std::sqrt(double(l + 1) / (2 * l + 3))
+                                              : -std::sqrt(double(l) / (2 * l - 1));
+                            d *= SHT::clebsch_gordan(l, 1, lp, k, mu, kp);
+                            std::array<std::complex<double>, 3> cart{};
+                            if (mu == 0) {
+                                cart[2] = 1;
+                            } else {
+                                cart[0] = -mu * isqrt2;
+                                cart[1] = std::complex<double>(0, isqrt2);
+                            }
+                            for (int mp = -std::abs(kp); mp <= std::abs(kp); mp += std::max(1, 2 * std::abs(kp))) {
+                                auto factor = d * input * SHT::rlm_dot_ylm(lp, mp, kp);
+                                for (int x = 0; x < 3; x++) {
+                                    weights[mp + lp][x] += std::real(factor * cart[x]);
+                                }
+                            }
+                        }
+                    }
+                    for (int mp = -lp; mp <= lp; mp++) {
+                        auto w = weights[mp + lp];
+                        if (w[0] != 0 || w[1] != 0 || w[2] != 0) {
+                            gradient_couplings_.push_back({sf::lm(l, m), sf::lm(lp, mp), lp > l ? -l : l + 1, w});
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     struct point_t
     {
         int segment;
@@ -74,29 +130,32 @@ class Spheric_function_interpolator
                   (1.0 / r) * position__,
                   std::vector<double>(n),
                   mdarray<double, 2>({n, 3})};
-        sf::spherical_harmonics(lmax_, spherical[1], spherical[2], p.harmonics.data());
+        sf::spherical_harmonics(lmax_, position__, p.harmonics.data());
         sf::dRlm_dr(lmax_, position__, p.gradient);
         return p;
     }
 
     // Weights on spline coefficients, shared by value/gradient evaluation and its exact transpose.
-    std::array<std::array<double, 4>, 2>
+    std::array<std::array<double, 4>, 3>
     radial_weights(point_t const& p__, int lm__) const
     {
         double d = p__.dr;
         if (p__.radius >= grid_.first()) {
-            return {{{1, d, d * d, d * d * d}, {0, 1, 2 * d, 3 * d * d}}};
+            return {{{1, d, d * d, d * d * d}, {0, 1, 2 * d, 3 * d * d}, {0, 0, 2, 6 * d}}};
         }
         double r0 = grid_.first();
         double u = p__.radius / r0, v = u - 1;
         int p     = inner_power_[lm__];
         double up = std::pow(u, p), dup = p == 0 ? 0 : p * std::pow(u, p - 1) / r0;
+        double ddup = p < 2 ? 0 : p * (p - 1) * std::pow(u, p - 2) / (r0 * r0);
         std::array<double, 4> a{1 - p * v + 0.5 * p * (p + 1) * v * v, r0 * (v - p * v * v), r0 * r0 * v * v, 0};
         std::array<double, 4> da{(-p + p * (p + 1) * v) / r0, 1 - 2 * p * v, 2 * r0 * v, 0};
-        std::array<std::array<double, 4>, 2> result{};
+        std::array<double, 4> dda{p * (p + 1) / (r0 * r0), -2.0 * p / r0, 2, 0};
+        std::array<std::array<double, 4>, 3> result{};
         for (int j = 0; j < 4; j++) {
             result[0][j] = up * a[j];
             result[1][j] = dup * a[j] + up * da[j];
+            result[2][j] = ddup * a[j] + 2 * dup * da[j] + up * dda[j];
         }
         return result;
     }
@@ -118,6 +177,7 @@ class Spheric_function_interpolator
                 inner_power_[lm] = std::max(0, inner_power_[lm] - 1);
             }
         }
+        build_gradient_couplings();
     }
 
     /// Return {field, d(field)/dx, d(field)/dy, d(field)/dz}.
@@ -137,6 +197,56 @@ class Spheric_function_interpolator
             for (int x = 0; x < 3; x++) {
                 result[x + 1] += df * p.direction[x] * p.harmonics[lm] + f * p.gradient(lm, x);
             }
+        }
+        return result;
+    }
+
+    /// Cartesian position derivative of a raw value/gradient energy covector.
+    /** Radial samples are held fixed. The gradient response uses the Hessian
+     *  of the same spline and inner continuation, without interpolating a
+     *  separately sampled derivative. Atom translations give the negative
+     *  displacement derivative; periodic-image cell terms belong to the caller.
+     */
+    r3::vector<double>
+    position_adjoint(r3::vector<double> const& position__, std::array<double, 4> const& covector__) const
+    {
+        for (double d : covector__) {
+            if (!std::isfinite(d)) {
+                RTE_THROW("spherical geometry adjoint: nonfinite covector");
+            }
+        }
+        if (covector__[1] == 0 && covector__[2] == 0 && covector__[3] == 0) {
+            auto v = value_gradient(position__);
+            return covector__[0] * r3::vector<double>({v[1], v[2], v[3]});
+        }
+        auto p = point(position__);
+        int n  = static_cast<int>(radial_.size());
+        std::vector<std::array<double, 3>> radial(n);
+        for (int lm = 0; lm < n; lm++) {
+            auto weights = radial_weights(p, lm);
+            for (int a = 0; a < 3; a++) {
+                for (int j = 0; j < 4; j++) {
+                    radial[lm][a] += weights[a][j] * radial_[lm].coeffs()(p.segment, j);
+                }
+            }
+        }
+        std::vector<r3::vector<double>> grad(sf::lmmax(lmax_ + 1)), dgrad(grad.size());
+        for (auto const& c : gradient_couplings_) {
+            if (c.from < n) {
+                auto f = radial[c.from];
+                grad[c.to] += (f[1] + c.angular * f[0] / p.radius) * c.weight;
+                dgrad[c.to] += (f[2] + c.angular * (f[1] - f[0] / p.radius) / p.radius) * c.weight;
+            }
+        }
+        std::vector<double> harmonics(sf::lmmax(lmax_ + 2));
+        sf::spherical_harmonics(lmax_ + 2, position__, harmonics.data());
+        r3::vector<double> result, dg({covector__[1], covector__[2], covector__[3]});
+        for (size_t lm = 0; lm < grad.size(); lm++) {
+            result += (covector__[0] * harmonics[lm]) * grad[lm];
+        }
+        for (auto const& c : gradient_couplings_) {
+            double value = r3::dot(dg, dgrad[c.from] + (c.angular / p.radius) * grad[c.from]);
+            result += (value * harmonics[c.to]) * c.weight;
         }
         return result;
     }

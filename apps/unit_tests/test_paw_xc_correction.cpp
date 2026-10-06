@@ -200,9 +200,11 @@ test_paw_xc_correction(int ns__, bool compact__)
                        r3::vector<double>({-0.0002, 0.0003, -0.0004});
     for (int np : {1, 4}) {
         std::vector<r3::vector<double>> local_points;
+        std::vector<int> ids;
         for (int p = 0; p < np; p++) {
             if (p % ctx.comm().size() == ctx.comm().rank()) {
                 local_points.push_back(global_points[p]);
+                ids.push_back(p);
             }
         }
         int local_size = static_cast<int>(local_points.size());
@@ -258,6 +260,133 @@ test_paw_xc_correction(int ns__, bool compact__)
         }
         check("all-source periodic image reconstruction", error, 2e-12);
 
+        auto periodic_energy = [&](double step, std::vector<mdarray<double, 3>>* matrices,
+                                   xc_geometry_adjoint_t* geometry = nullptr) {
+            set_dm(step);
+            initialize();
+            PAW_xc_reconstruction reconstruction(density, local_points);
+            reconstruction.add_to(rho, grad, tau);
+            double sum{0}, e{0};
+            for (int s = 0; s < ns__; s++) {
+                for (int p = 0; p < local_size; p++) {
+                    double w = 0.2 + 0.1 * ids[p];
+                    sum += w * (rho(p, s) + 0.3 * tau(p, s));
+                    e += w * (0.5 * rho(p, s) * rho(p, s) + 0.2 * tau(p, s) * tau(p, s) + 0.1 * rho(p, s) * tau(p, s));
+                    for (int x = 0; x < 3; x++) {
+                        e += 0.03 * w * grad(p, x, s) * grad(p, x, s);
+                    }
+                }
+            }
+            ctx.comm().allreduce(&sum, 1);
+            ctx.comm().allreduce(&e, 1);
+            if (matrices || geometry) {
+                xc_point_fields_t derivatives(local_size, ns__);
+                auto& drho  = derivatives.rho;
+                auto& dtau  = derivatives.tau;
+                auto& dgrad = derivatives.gradient;
+                for (int s = 0; s < ns__; s++) {
+                    for (int p = 0; p < local_size; p++) {
+                        double w   = 0.2 + 0.1 * ids[p];
+                        drho(p, s) = w * (rho(p, s) + 0.1 * tau(p, s) + 0.16 * sum);
+                        dtau(p, s) = w * (0.4 * tau(p, s) + 0.1 * rho(p, s) + 0.048 * sum);
+                        for (int x = 0; x < 3; x++) {
+                            dgrad(p, x, s) = 0.06 * w * grad(p, x, s);
+                        }
+                    }
+                }
+                if (matrices) {
+                    *matrices = reconstruction.projector_matrices(drho, dgrad, dtau);
+                }
+                if (geometry) {
+                    *geometry = reconstruction.geometry_adjoint(derivatives);
+                }
+            }
+            return e + 0.08 * sum * sum;
+        };
+        std::vector<mdarray<double, 3>> matrices;
+        periodic_energy(0, &matrices);
+        double ad{0};
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            for (int s = 0; s < ns__; s++) {
+                for (int j = 0; j < n; j++) {
+                    for (int i = 0; i < n; i++) {
+                        ad += 2 * 0.8 / (s + 1) * (ia + 1) * std::real(std::conj(dc[i]) * matrices[ia](i, j, s) * c[j]);
+                    }
+                }
+            }
+        }
+        for (double step : {1e-4, 5e-5}) {
+            double fd = (periodic_energy(step, nullptr) - periodic_energy(-step, nullptr)) / (2 * step);
+            check("distributed periodic reconstruction/projector derivative", std::abs(ad - fd), 2e-8);
+        }
+
+        xc_geometry_adjoint_t geometry(local_size, ctx.unit_cell().num_atoms());
+        periodic_energy(0, nullptr, &geometry);
+        auto cell         = ctx.unit_cell().lattice_vectors();
+        auto inverse      = ctx.unit_cell().inverse_lattice_vectors();
+        auto saved_points = local_points;
+        std::vector<r3::vector<double>> atoms;
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            atoms.push_back(r3::dot(cell, ctx.unit_cell().atom(ia).position()));
+        }
+        double point_error{0}, atom_error{0}, cell_error{0};
+        auto fd_error = [](double fd, double ad) { return std::abs(fd - ad) / std::max(1.0, std::abs(ad)); };
+        for (int x = 0; x < 3; x++) {
+            double dp{0}, translation{0};
+            for (int p = 0; p < local_size; p++) {
+                dp += geometry.points[p][x] * (0.13 + 0.02 * ids[p]);
+                translation += geometry.points[p][x];
+            }
+            ctx.comm().allreduce(&dp, 1);
+            ctx.comm().allreduce(&translation, 1);
+            for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                translation += geometry.atoms(x, ia);
+            }
+            check("local geometry translation sum", std::abs(translation), 2e-11);
+            for (double h : {1e-7, 5e-8}) {
+                auto point_energy = [&](double h) {
+                    local_points = saved_points;
+                    for (int p = 0; p < local_size; p++) {
+                        local_points[p][x] += h * (0.13 + 0.02 * ids[p]);
+                    }
+                    return periodic_energy(0, nullptr);
+                };
+                double plus = point_energy(h), minus = point_energy(-h);
+                point_error  = std::max(point_error, fd_error((plus - minus) / (2 * h), dp));
+                local_points = saved_points;
+                for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                    auto atom_energy = [&](double h) {
+                        auto p = atoms[ia];
+                        p[x] += h;
+                        ctx.unit_cell().atom(ia).set_position(r3::dot(inverse, p));
+                        return periodic_energy(0, nullptr);
+                    };
+                    plus       = atom_energy(h);
+                    minus      = atom_energy(-h);
+                    atom_error = std::max(atom_error, fd_error((plus - minus) / (2 * h), geometry.atoms(x, ia)));
+                    ctx.unit_cell().atom(ia).set_position(r3::dot(inverse, atoms[ia]));
+                }
+                for (int y = 0; y < 3; y++) {
+                    auto cell_energy = [&](double h) {
+                        auto trial = cell;
+                        trial(x, y) += h;
+                        ctx.unit_cell().set_lattice_vectors(trial);
+                        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                            ctx.unit_cell().atom(ia).set_position(r3::dot(r3::inverse(trial), atoms[ia]));
+                        }
+                        return periodic_energy(0, nullptr);
+                    };
+                    plus       = cell_energy(h);
+                    minus      = cell_energy(-h);
+                    cell_error = std::max(cell_error, fd_error((plus - minus) / (2 * h), geometry.lattice(x, y)));
+                    cell_energy(0);
+                }
+            }
+        }
+        check("local geometry point FD", point_error, 2e-6);
+        check("local geometry atom FD including frozen core", atom_error, 2e-6);
+        check("local geometry all nine cell components FD", cell_error, 2e-6);
+
         // Moving the target by several cell vectors cannot change its fields.
         set_dm(0);
         initialize();
@@ -307,13 +436,19 @@ test_paw_xc_correction(int ns__, bool compact__)
             smooth_tau.emplace_back(ctx.spfft<double>(), ctx.gvec_fft_sptr());
         }
         double smooth_tau_derivative{0};
-        auto joint_energy = [&](double step, std::vector<mdarray<double, 3>>* matrices, bool spurious_smooth_q) {
+        auto joint_energy = [&](double step, std::vector<mdarray<double, 3>>* matrices, bool spurious_smooth_q,
+                                xc_geometry_adjoint_t* geometry = nullptr) {
             set_dm(step);
             for (int s = 0; s < ns__; s++) {
                 for (int ig = 0; ig < ctx.gvec().count(); ig++) {
                     bool zero_g                  = ctx.gvec().offset() + ig == 0;
                     smooth_rho[s].f_pw_local(ig) = zero_g ? 0.8 : 0;
                     smooth_tau[s].f_pw_local(ig) = zero_g ? 0.4 + step * 0.06 * (s + 1) : 0;
+                    auto g                       = ctx.gvec().gvec(gvec_index_t::local(ig));
+                    if (std::abs(g[0]) == 1 && g[1] == 0 && g[2] == 0) {
+                        smooth_rho[s].f_pw_local(ig) = std::complex<double>(0.02, 0.01 * g[0]) * double(s + 1);
+                        smooth_tau[s].f_pw_local(ig) = std::complex<double>(0.03, -0.02 * g[0]) * double(s + 1);
+                    }
                 }
             }
             PAW_xc_field_map reconstruction(density, points);
@@ -334,7 +469,7 @@ test_paw_xc_correction(int ns__, bool compact__)
             }
             ctx.comm().allreduce(&e, 1);
             ctx.comm().allreduce(&sum, 1);
-            if (matrices) {
+            if (matrices || geometry) {
                 xc_point_fields_t derivatives(np, ns__);
                 for (int s = 0; s < ns__; s++) {
                     for (int p = 0; p < np; p++) {
@@ -345,6 +480,12 @@ test_paw_xc_correction(int ns__, bool compact__)
                             derivatives.gradient(p, x, s) = 0.06 * w * grad(p, x, s);
                         }
                     }
+                }
+                if (geometry) {
+                    *geometry = reconstruction.geometry_adjoint(smooth_rho, smooth_tau, derivatives);
+                }
+                if (!matrices) {
+                    return e + 0.08 * sum * sum;
                 }
                 auto adjoint          = reconstruction.adjoint(derivatives);
                 *matrices             = std::move(adjoint.local_matrices);
@@ -413,6 +554,31 @@ test_paw_xc_correction(int ns__, bool compact__)
             check("uncancelled smooth-Q adjoint is detected", std::abs(spurious_q - fd) > 1e-5 ? 0 : 1, 0);
             check("missing smooth-tau adjoint is detected", std::abs(missing_tau - fd) > 1e-5 ? 0 : 1, 0);
         }
+        xc_geometry_adjoint_t geometry(np, ctx.unit_cell().num_atoms());
+        joint_energy(0, nullptr, false, &geometry);
+        auto original_points = points;
+        double geometry_error{0};
+        for (int x = 0; x < 3; x++) {
+            double analytic{0};
+            for (int p = 0; p < np; p++) {
+                analytic += geometry.points[p][x] * (0.2 + 0.03 * ids[p]);
+            }
+            ctx.comm().allreduce(&analytic, 1);
+            for (double h : {1e-7, 5e-8}) {
+                auto displaced = [&](double h) {
+                    points = original_points;
+                    for (int p = 0; p < np; p++) {
+                        points[p][x] += h * (0.2 + 0.03 * ids[p]);
+                    }
+                    return joint_energy(0, nullptr, false);
+                };
+                double plus = displaced(h), minus = displaced(-h);
+                geometry_error = std::max(geometry_error, std::abs((plus - minus) / (2 * h) - analytic) /
+                                                                  std::max(1.0, std::abs(analytic)));
+            }
+        }
+        points = original_points;
+        check("joint smooth/local geometry point FD", geometry_error, 2e-6);
         PAW_xc_field_map map(density, points);
         xc_point_fields_t bad(np, ns__);
         bad.rho.zero();
@@ -422,14 +588,17 @@ test_paw_xc_correction(int ns__, bool compact__)
             bad.rho(0, 0) = std::numeric_limits<double>::quiet_NaN();
         }
         check.reject("field-map collective nonfinite-covector rejection", [&] { map.adjoint(bad); });
+        check.reject("geometry collective nonfinite-covector rejection",
+                     [&] { map.geometry_adjoint(smooth_rho, smooth_tau, bad); });
         check.reject("field-map collective spin-layout rejection", [&] {
             std::vector<Smooth_periodic_function<double>> empty;
             map.sample(ctx.comm().rank() == 0 ? empty : smooth_rho, smooth_tau);
         });
 
         PAW_xc_field_map empty_map(density, {});
-        auto empty_fields  = empty_map.sample(smooth_rho, smooth_tau);
-        auto empty_adjoint = empty_map.adjoint(empty_fields);
+        auto empty_fields   = empty_map.sample(smooth_rho, smooth_tau);
+        auto empty_adjoint  = empty_map.adjoint(empty_fields);
+        auto empty_geometry = empty_map.geometry_adjoint(smooth_rho, smooth_tau, empty_fields);
         double empty_error{0};
         for (int s = 0; s < ns__; s++) {
             for (int ig = 0; ig < ctx.gvec().count(); ig++) {
@@ -440,6 +609,14 @@ test_paw_xc_correction(int ns__, bool compact__)
         for (auto const& matrix : empty_adjoint.local_matrices) {
             for (size_t i = 0; i < matrix.size(); i++) {
                 empty_error += std::abs(matrix[i]);
+            }
+        }
+        for (size_t i = 0; i < empty_geometry.atoms.size(); i++) {
+            empty_error += std::abs(empty_geometry.atoms[i]);
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                empty_error += std::abs(empty_geometry.lattice(x, y));
             }
         }
         check("globally empty field map has zero adjoint", empty_error, 0);

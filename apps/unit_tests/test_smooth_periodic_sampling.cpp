@@ -137,6 +137,79 @@ test_smooth_periodic_sampling(bool reduced__, bool replicated_fft__)
             double fd = (energy(h, false) - energy(-h, false)) / (2 * h);
             check("nonlocal-energy coefficient FD", std::abs(analytic - fd), 2e-9);
         }
+
+        auto geometry        = map.geometry_adjoint(field, covectors);
+        auto geometry_energy = [&](int x, int y, double step, bool affine) {
+            auto cell = lattice;
+            if (y >= 0) {
+                cell(x, y) += step;
+            }
+            auto wavevector = twopi * r3::dot(r3::transpose(r3::inverse(cell)), r3::vector<double>({1, -1, 0}));
+            double sum{0}, e{0};
+            for (size_t p = 0; p < points.size(); p++) {
+                auto position = points[p];
+                if (y < 0) {
+                    position[x] += step * (0.13 + 0.02 * p + 0.04 * comm.rank());
+                } else if (affine) {
+                    position = r3::dot(cell, r3::dot(r3::inverse(lattice), position));
+                }
+                double phase = r3::dot(wavevector, position);
+                double value = 0.7 + 0.3 * std::cos(phase) + 0.4 * std::sin(phase);
+                auto grad    = (-0.3 * std::sin(phase) + 0.4 * std::cos(phase)) * wavevector;
+                double w     = 0.2 + 0.03 * (p * comm.size() + comm.rank());
+                sum += w * value;
+                e += 0.5 * w * (value * value + r3::dot(grad, grad));
+            }
+            comm.allreduce(&sum, 1);
+            comm.allreduce(&e, 1);
+            return e + 0.13 * sum * sum;
+        };
+        double point_error{0}, cell_error{0}, affine_error{0};
+        for (int x = 0; x < 3; x++) {
+            double derivative{0};
+            for (size_t p = 0; p < points.size(); p++) {
+                derivative += geometry.points[p][x] * (0.13 + 0.02 * p + 0.04 * comm.rank());
+            }
+            comm.allreduce(&derivative, 1);
+            for (double h : {5e-5, 2.5e-5}) {
+                auto fd = [&](int y, bool affine) {
+                    return (geometry_energy(x, y, h, affine) - geometry_energy(x, y, -h, affine)) / (2 * h);
+                };
+                point_error = std::max(point_error, std::abs(derivative - fd(-1, false)));
+                for (int y = 0; y < 3; y++) {
+                    cell_error = std::max(cell_error, std::abs(geometry.lattice(x, y) - fd(y, false)));
+                    double displacement{0};
+                    for (size_t p = 0; p < points.size(); p++) {
+                        displacement += geometry.points[p][x] * r3::dot(r3::inverse(lattice), points[p])[y];
+                    }
+                    comm.allreduce(&displacement, 1);
+                    affine_error =
+                            std::max(affine_error, std::abs(geometry.lattice(x, y) + displacement - fd(y, true)));
+                }
+            }
+        }
+        check("nonlocal-energy point FD", point_error, 2e-9);
+        check("nonlocal-energy fixed-Cartesian cell FD", cell_error, 2e-9);
+        check("nonlocal-energy fixed-fractional cell FD", affine_error, 2e-9);
+
+        auto translated = Smooth_periodic_function_sampler(gv, moved).geometry_adjoint(field, covectors);
+        error           = 0;
+        r3::vector<double> sum;
+        for (size_t p = 0; p < points.size(); p++) {
+            sum += geometry.points[p];
+            for (int x = 0; x < 3; x++) {
+                error = std::max(error, std::abs(geometry.points[p][x] - translated.points[p][x]));
+            }
+        }
+        comm.allreduce(&sum[0], 3);
+        r3::vector<int> image({3, -2, 1});
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                error = std::max(error,
+                                 std::abs(translated.lattice(x, y) - geometry.lattice(x, y) + sum[x] * image[y]));
+            }
+        }
+        check("geometry adjoint under lattice translations", error, 3e-12);
     }
 
     // Dense coefficients and partial tiles must agree with independent direct sums.
@@ -186,6 +259,23 @@ test_smooth_periodic_sampling(bool reduced__, bool replicated_fft__)
             error = std::max(error, std::abs(potential.f_pw_local(ig) - reference[gv.offset() + ig]));
         }
         check("tiled adjoint/direct sum", error, 3e-12);
+        auto geometry = map.geometry_adjoint(direction, covectors);
+        error         = 0;
+        for (size_t p = 0; p < points.size(); p++) {
+            r3::vector<double> reference;
+            for (int ig = 0; ig < gv.num_gvec(); ig++) {
+                auto g        = gv.gvec_cart(gvec_index_t::global(ig));
+                auto z        = c[ig] * std::exp(std::complex<double>(0, r3::dot(g, points[p])));
+                double m      = reduced__ && r3::dot(g, g) != 0 ? 2 : 1;
+                auto const& d = covectors[p];
+                double a      = d[0] * z.imag() + (g[0] * d[1] + g[1] * d[2] + g[2] * d[3]) * z.real();
+                reference -= (m * a) * g;
+            }
+            for (int x = 0; x < 3; x++) {
+                error = std::max(error, std::abs(geometry.points[p][x] - reference[x]));
+            }
+        }
+        check("tiled geometry adjoint/direct sum", error, 3e-12);
     }
 
     // Compare forward and reverse with the existing FFT/gradient implementation.
@@ -232,6 +322,12 @@ test_smooth_periodic_sampling(bool reduced__, bool replicated_fft__)
         covectors[0][1] = std::numeric_limits<double>::quiet_NaN();
     }
     check.reject("collective nonfinite-covector rejection", [&] { fft_map.adjoint(covectors, potential); });
+    check.reject("collective geometry-covector rejection", [&] { fft_map.geometry_adjoint(field, covectors); });
+    if (comm.rank() == 0) {
+        covectors[0][1]     = 0;
+        field.f_pw_local(0) = std::numeric_limits<double>::quiet_NaN();
+    }
+    check.reject("collective geometry-field rejection", [&] { fft_map.geometry_adjoint(field, covectors); });
     return failures;
 }
 

@@ -317,6 +317,13 @@ class Potential : public Field4D
     xc_rg_magnetic(Density const& density__, bool use_lapl, const bool calculate_vdw_stress__);
 
   public:
+    /// Explicit XC geometry response at fixed electronic coefficients and radial fields.
+    /** Includes model coordinates and host quadrature. Basis/projector, MT-boundary
+     *  and orbital-normalization responses must still be supplied by force/stress assembly.
+     */
+    xc_geometry_derivatives_t
+    external_xc_geometry(Density const& density__) const;
+
     /// Constructor
     Potential(Simulation_context& ctx__);
 

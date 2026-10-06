@@ -7,6 +7,7 @@
 #define __XC_POINT_FIELDS_HPP__
 
 #include "core/memory.hpp"
+#include "core/r3/r3.hpp"
 
 namespace sirius {
 
@@ -25,6 +26,26 @@ struct xc_point_fields_t
         , gradient({nr__, 3, ns__})
         , tau({nr__, ns__})
     {
+    }
+};
+
+/// Raw geometry covectors at fixed electronic coefficients and radial fields.
+/** Points are local Cartesian derivatives. Atom derivatives (3,natom) and the
+ *  lattice derivative are globally summed, with Cartesian atom positions held
+ *  fixed for the latter. Lattice vectors are columns. Neither forces nor stress
+ *  signs/normalization are included, nor derivatives of model quadrature weights.
+ */
+struct xc_geometry_adjoint_t
+{
+    std::vector<r3::vector<double>> points;
+    mdarray<double, 2> atoms;
+    r3::matrix<double> lattice;
+
+    xc_geometry_adjoint_t(int npoint__, int natom__)
+        : points(npoint__)
+        , atoms({3, natom__})
+    {
+        atoms.zero();
     }
 };
 

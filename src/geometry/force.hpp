@@ -51,6 +51,8 @@ class Force
 
     mdarray<double, 2> forces_core_;
 
+    mdarray<double, 2> forces_xc_;
+
     mdarray<double, 2> forces_ewald_;
 
     mdarray<double, 2> forces_scf_corr_;

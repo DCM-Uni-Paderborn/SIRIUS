@@ -57,6 +57,34 @@ struct xc_callback_input_t
     xc_point_set_t const* points{nullptr};
 };
 
+/// Local raw derivatives with respect to the independent quadrature inputs.
+struct xc_point_derivatives_t
+{
+    std::vector<std::array<double, 3>> coordinates, block_centres;
+    std::vector<double> energy_weights, descriptor_weights;
+
+    explicit xc_point_derivatives_t(xc_point_set_t const& points__)
+        : coordinates(points__.coordinates.size())
+        , block_centres(points__.block_centres.size())
+        , energy_weights(points__.energy_weights.size())
+        , descriptor_weights(points__.descriptor_weights.size())
+    {
+    }
+};
+
+/// Globally summed energy derivatives, not force or stress components.
+/** Cell columns vary at fixed Cartesian atoms. No sign or volume factor applies. */
+struct xc_geometry_derivatives_t
+{
+    std::vector<std::array<double, 3>> atoms;
+    std::array<double, 9> lattice{};
+
+    explicit xc_geometry_derivatives_t(int num_atoms__)
+        : atoms(num_atoms__)
+    {
+    }
+};
+
 /// Total XC energy and primitive-field derivatives.
 /** energy is the same globally reduced energy on every context rank.
  *  For the FFT callback, derivatives are divided by the grid quadrature weight.
@@ -75,11 +103,17 @@ struct xc_callback_output_t
     double* vrho;
     double* vgradient;
     double* vtau;
+    /// Non-null only for the geometry callback. Fields and weights are independent inputs.
+    xc_point_derivatives_t* geometry{nullptr};
 };
 
 /// Called collectively on the context communicator, including empty local work.
 /** Register before constructing Density/Potential and keep it fixed during SCF. */
 using xc_callback_t = std::function<void(Simulation_context const&, xc_callback_input_t const&, xc_callback_output_t&)>;
+
+/// Pull back local point covectors, including field sampling, to replicated atom/cell derivatives.
+using xc_quadrature_pullback_t = std::function<void(Simulation_context const&, xc_point_set_t const&,
+                                                    xc_point_derivatives_t const&, xc_geometry_derivatives_t&)>;
 
 void
 validate_external_xc_context(Simulation_context const& ctx__);

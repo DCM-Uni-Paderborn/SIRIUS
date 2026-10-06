@@ -344,6 +344,35 @@ phase_Rlm_QE(Atom_type const& type__, int xi__)
     return (type__.indexb(xi__).m < 0 && (-type__.indexb(xi__).m) % 2 == 0) ? -1 : 1;
 }
 
+static std::shared_ptr<sirius::xc_point_set_t>
+copy_xc_point_set(Simulation_context const& ctx, int const* num_points, int const* num_blocks,
+                  double const* coordinates, double const* energy_weights, double const* descriptor_weights,
+                  int const* block_sizes, double const* block_centres)
+{
+    int nr      = num_points ? *num_points : -1;
+    int nb      = num_blocks ? *num_blocks : -1;
+    int invalid = nr < 0 || nb < 0 || (nr > 0 && (!coordinates || !energy_weights || !descriptor_weights)) ||
+                  (nb > 0 && (!block_sizes || !block_centres));
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("invalid external point XC array arguments on a context rank");
+    }
+    auto points = std::make_shared<sirius::xc_point_set_t>(ctx);
+    for (int p = 0; p < nr; p++) {
+        size_t offset = 3 * static_cast<size_t>(p);
+        points->coordinates.push_back({coordinates[offset], coordinates[offset + 1], coordinates[offset + 2]});
+        points->energy_weights.push_back(energy_weights[p]);
+        points->descriptor_weights.push_back(descriptor_weights[p]);
+    }
+    for (int b = 0; b < nb; b++) {
+        size_t offset = 3 * static_cast<size_t>(b);
+        points->block_sizes.push_back(block_sizes[b]);
+        points->block_centres.push_back({block_centres[offset], block_centres[offset + 1], block_centres[offset + 2]});
+    }
+    points->validate(ctx);
+    return points;
+}
+
 extern "C" {
 
 /*
@@ -5574,6 +5603,8 @@ sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data
                 if (ctx.initialized()) {
                     RTE_THROW("register external XC before initializing the context");
                 }
+                ctx.cb().external_xc_geometry_ = nullptr;
+                ctx.cb().external_xc_pullback_ = nullptr;
                 if (!fptr__) {
                     ctx.cb().external_xc_ = nullptr;
                     ctx.cb().external_xc_points_.reset();
@@ -5640,8 +5671,9 @@ sirius_set_xc_point_callback:
     supplied quadrature. CPU scalar/collinear PW, PAW and nonrelativistic
     FP-LAPW are supported without symmetry reduction. PAW requires explicit
     core kinetic-density data. FP-LAPW requires fp64 nonrelativistic valence
-    orbitals and nonrelativistic core states. Forces, stress and SOC are not
-    supported by this point path.
+    orbitals and nonrelativistic core states. PW and PAW atomic forces and
+    stress additionally require the point geometry callbacks. FP-LAPW forces
+    and stress, and SOC are not supported by this point path.
   arguments:
     handler:
       type: ctx_handler
@@ -5702,34 +5734,16 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                     RTE_THROW("register external point XC before initializing the context");
                 }
                 if (!fptr__) {
-                    ctx.cb().external_xc_ = nullptr;
+                    ctx.cb().external_xc_geometry_ = nullptr;
+                    ctx.cb().external_xc_pullback_ = nullptr;
+                    ctx.cb().external_xc_          = nullptr;
                     ctx.cb().external_xc_points_.reset();
                     return;
                 }
-                int nr      = num_points__ ? *num_points__ : -1;
-                int nb      = num_blocks__ ? *num_blocks__ : -1;
-                int invalid = nr < 0 || nb < 0 ||
-                              (nr > 0 && (!coordinates__ || !energy_weights__ || !descriptor_weights__)) ||
-                              (nb > 0 && (!block_sizes__ || !block_centres__));
-                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
-                if (invalid) {
-                    RTE_THROW("invalid external point XC array arguments on a context rank");
-                }
-                auto points = std::make_shared<sirius::xc_point_set_t>(ctx);
-                for (int p = 0; p < nr; p++) {
-                    size_t offset = 3 * static_cast<size_t>(p);
-                    points->coordinates.push_back(
-                            {coordinates__[offset], coordinates__[offset + 1], coordinates__[offset + 2]});
-                    points->energy_weights.push_back(energy_weights__[p]);
-                    points->descriptor_weights.push_back(descriptor_weights__[p]);
-                }
-                for (int b = 0; b < nb; b++) {
-                    size_t offset = 3 * static_cast<size_t>(b);
-                    points->block_sizes.push_back(block_sizes__[b]);
-                    points->block_centres.push_back(
-                            {block_centres__[offset], block_centres__[offset + 1], block_centres__[offset + 2]});
-                }
-                points->validate(ctx);
+                auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
+                                                descriptor_weights__, block_sizes__, block_centres__);
+                ctx.cb().external_xc_geometry_ = nullptr;
+                ctx.cb().external_xc_pullback_ = nullptr;
                 using callback_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
                                             int const*, double const*, double const*, double const*, double const*,
                                             double*, double*, double*, double*, int*);
@@ -5751,6 +5765,249 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                         RTE_THROW("external point XC callback returned status " + std::to_string(status));
                     }
                 };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_update_xc_point_set:
+  doc: >-
+    Replace the copied quadrature of an initialized external point XC context
+    without changing its field or geometry callbacks or their user data.
+    Call collectively between SCF calculations, after setting the new lattice
+    and atom positions and before updating the ground state. This call does not
+    update the density, potential or orbitals. Local point and block counts may
+    change, including redistribution to previously empty ranks. The array
+    conventions are those of sirius_set_xc_point_callback. An invalid replacement
+    leaves the previous quadrature and callbacks unchanged.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Initialized simulation context handler.
+    num_points:
+      type: int
+      attr: in, required
+      doc: Number of local point rows.
+    num_blocks:
+      type: int
+      attr: in, required
+      doc: Number of complete local atom blocks.
+    coordinates:
+      type: double
+      attr: in, required, dimension(3,num_points)
+      doc: Cartesian target coordinates.
+    energy_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Energy quadrature and partition weights.
+    descriptor_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Independent descriptor quadrature weights.
+    block_sizes:
+      type: int
+      attr: in, required, dimension(num_blocks)
+      doc: Positive consecutive row counts summing to num_points.
+    block_centres:
+      type: double
+      attr: in, required, dimension(3,num_blocks)
+      doc: Cartesian centres of the atom blocks.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_update_xc_point_set(void* const* handler__, int const* num_points__, int const* num_blocks__,
+                           double const* coordinates__, double const* energy_weights__,
+                           double const* descriptor_weights__, int const* block_sizes__, double const* block_centres__,
+                           int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx   = get_sim_ctx(handler__);
+                int invalid = !ctx.initialized() || !ctx.cb().external_xc_ || !ctx.cb().external_xc_points_;
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid) {
+                    RTE_THROW("updating XC points requires an initialized external point XC context");
+                }
+                auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
+                                                descriptor_weights__, block_sizes__, block_centres__);
+                ctx.cb().external_xc_points_ = std::move(points);
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_point_geometry_callbacks:
+  doc: >-
+    Register optional geometry callbacks after the point XC evaluator and before
+    context initialization. The field callback has the same C arguments as the
+    point XC callback, with four additional double pointers before status.
+    These return raw coordinate (3,nr), energy-weight (nr), descriptor-weight
+    (nr) and block-centre (3,nb) derivatives at fixed physical fields.
+    The pullback callback has C signature
+    void pullback(void* user_data, int nr, int nb, int natom, int fcomm,
+    const int* block_sizes, const double* dcoordinates, const double* denergy_weights,
+    const double* ddescriptor_weights, const double* dblock_centres,
+    double* datoms, double* dlattice, int* status).
+    SIRIUS adds field-sampling derivatives to dcoordinates before the pullback.
+    The host returns globally summed Cartesian atom (3,natom) and cell (3,3)
+    derivatives, identical on every rank. Lattice vectors are columns and the
+    cell derivative holds Cartesian atoms fixed. Apply no force sign or volume
+    normalization. SIRIUS adds explicit atom-local and Fourier cell responses.
+    Callbacks are collective, including empty ranks. Outputs start at zero.
+    Set status nonzero on failure without unwinding across the C ABI.
+    Both null pointers disable geometry evaluation. For PW and PAW, these callbacks
+    supply the explicit XC contribution to atomic forces and stress. FP-LAPW forces and stress
+    require additional basis and geometry responses.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    field_fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable field and geometry evaluator.
+    pullback_fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable quadrature pullback.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_point_geometry_callbacks(void* const* handler__, void (*field_fptr__)(), void (*pullback_fptr__)(),
+                                       void* user_data__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx   = get_sim_ctx(handler__);
+                int invalid = ctx.initialized() || bool(field_fptr__) != bool(pullback_fptr__) ||
+                              (field_fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int enabled_min = bool(field_fptr__), enabled_max = enabled_min;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || enabled_min != enabled_max) {
+                    RTE_THROW("register both XC geometry callbacks collectively after point XC and before "
+                              "initialization");
+                }
+                if (!field_fptr__) {
+                    ctx.cb().external_xc_geometry_ = nullptr;
+                    ctx.cb().external_xc_pullback_ = nullptr;
+                    return;
+                }
+                using field_t    = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
+                                         int const*, double const*, double const*, double const*, double const*,
+                                         double*, double*, double*, double*, double*, double*, double*, double*, int*);
+                using pullback_t = void (*)(void*, int, int, int, int, int const*, double const*, double const*,
+                                            double const*, double const*, double*, double*, int*);
+                auto field       = reinterpret_cast<field_t>(field_fptr__);
+                auto pullback    = reinterpret_cast<pullback_t>(pullback_fptr__);
+                ctx.cb().external_xc_geometry_ = [field, user_data__](auto const& c, auto const& in, auto& out) {
+                    if (!in.points || !out.geometry) {
+                        RTE_THROW("the XC geometry callback requires explicit point inputs and geometry outputs");
+                    }
+                    auto const& p = *in.points;
+                    auto& d       = *out.geometry;
+                    int status{0};
+                    field(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
+                          MPI_Comm_c2f(c.comm().native()),
+                          p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
+                          p.descriptor_weights.data(), p.block_sizes.data(),
+                          p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
+                          in.tau, &out.energy, out.vrho, out.vgradient, out.vtau,
+                          d.coordinates.empty() ? nullptr : d.coordinates.front().data(), d.energy_weights.data(),
+                          d.descriptor_weights.data(),
+                          d.block_centres.empty() ? nullptr : d.block_centres.front().data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC geometry callback returned status " + std::to_string(status));
+                    }
+                };
+                ctx.cb().external_xc_pullback_ = [pullback, user_data__](auto const& c, auto const& p, auto const& d,
+                                                                         auto& out) {
+                    int status{0};
+                    pullback(user_data__, static_cast<int>(p.coordinates.size()),
+                             static_cast<int>(p.block_sizes.size()), c.unit_cell().num_atoms(),
+                             MPI_Comm_c2f(c.comm().native()), p.block_sizes.data(),
+                             d.coordinates.empty() ? nullptr : d.coordinates.front().data(), d.energy_weights.data(),
+                             d.descriptor_weights.data(),
+                             d.block_centres.empty() ? nullptr : d.block_centres.front().data(),
+                             out.atoms.empty() ? nullptr : out.atoms.front().data(), out.lattice.data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC quadrature pullback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_get_xc_geometry_derivatives:
+  doc: >-
+    Evaluate explicit XC atom and cell energy derivatives for the current fields.
+    Requires point geometry callbacks. Electronic coefficients, physical radial
+    fields and point-domain membership are fixed. Complete forces and stress also
+    require orbital, basis, projector and MT-boundary responses as appropriate.
+    Outputs are globally summed on every rank. No force sign or volume factor is
+    applied. Cell columns vary at fixed Cartesian atoms.
+  arguments:
+    gs_handler:
+      type: gs_handler
+      attr: in, required
+      doc: Ground-state handler.
+    num_atoms:
+      type: int
+      attr: in, required
+      doc: Number of atoms in the context.
+    atoms:
+      type: double
+      attr: out, required, dimension(3,num_atoms)
+      doc: Cartesian atom energy derivatives.
+    lattice:
+      type: double
+      attr: out, required, dimension(3,3)
+      doc: Cell energy derivatives with lattice vectors in columns.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_get_xc_geometry_derivatives(void* const* gs_handler__, int const* num_atoms__, double* atoms__,
+                                   double* lattice__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& gs    = get_gs(gs_handler__);
+                int invalid = !num_atoms__ || !atoms__ || !lattice__;
+                if (num_atoms__) {
+                    invalid |= *num_atoms__ != gs.ctx().unit_cell().num_atoms();
+                }
+                gs.ctx().comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid) {
+                    RTE_THROW("invalid XC geometry output buffers on a context rank");
+                }
+                auto result = gs.potential().external_xc_geometry(gs.density());
+                for (int ia = 0; ia < *num_atoms__; ia++) {
+                    std::copy(result.atoms[ia].begin(), result.atoms[ia].end(), atoms__ + 3 * ia);
+                }
+                std::copy(result.lattice.begin(), result.lattice.end(), lattice__);
             },
             error_code__);
 }

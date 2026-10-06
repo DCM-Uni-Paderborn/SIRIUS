@@ -71,19 +71,24 @@ test_spheric_interpolation()
         polynomial(sf::lm(1, 1), ir)  = -0.2 * r / pnorm;
         polynomial(sf::lm(1, -1), ir) = 0.3 * r / pnorm;
         polynomial(sf::lm(1, 0), ir)  = 0.4 * r / pnorm;
+        polynomial(sf::lm(2, 1), ir)  = -0.17 * r * r / std::sqrt(15 / fourpi);
     }
     Spheric_function_interpolator polynomial_sample(polynomial);
     double exact_error{0};
     for (auto const& p : points) {
         auto actual     = polynomial_sample.value_gradient(p);
-        double expected = 1 + 0.7 * std::pow(p.length(), 2) + 0.2 * p[0] - 0.3 * p[1] + 0.4 * p[2];
+        double expected = 1 + 0.7 * std::pow(p.length(), 2) + 0.2 * p[0] - 0.3 * p[1] + 0.4 * p[2] + 0.17 * p[0] * p[2];
         exact_error     = std::max(exact_error, std::abs(actual[0] - expected));
+        std::array<double, 4> covector{0.4, -0.2, 0.5, 0.7};
+        auto position_derivative = polynomial_sample.position_adjoint(p, covector);
         for (int a = 0; a < 3; a++) {
-            double d    = 1.4 * p[a] + std::array<double, 3>{0.2, -0.3, 0.4}[a];
+            double d    = 1.4 * p[a] + std::array<double, 3>{0.2 + 0.17 * p[2], -0.3, 0.4 + 0.17 * p[0]}[a];
             exact_error = std::max(exact_error, std::abs(actual[a + 1] - d));
+            double dp   = covector[0] * d + 1.4 * covector[a + 1] + (a == 1 ? 0 : 0.17 * covector[3 - a]);
+            exact_error = std::max(exact_error, std::abs(position_derivative[a] - dp));
         }
     }
-    check("Cartesian polynomial values/gradients including endpoints", exact_error, 2e-12);
+    check("Cartesian polynomial values/gradients/geometry adjoint including endpoints", exact_error, 2e-12);
     for (double step : {1e-4, 5e-5}) {
         double error{0};
         for (size_t i = 0; i + 2 < points.size(); i++) {
@@ -249,7 +254,27 @@ test_inner_extension(spheric_inner_extension_t mode)
     int failures = !std::isfinite(error) || error > 2e-10 || !std::isfinite(adjoint) || adjoint > 2e-11;
 
     // Value gradients must also be the spatial derivatives when crossing the join at r_first.
-    double gradient_error{0}, curvature_error{0};
+    double gradient_error{0}, curvature_error{0}, hessian_error{0};
+    for (auto const& position : points) {
+        std::array<double, 4> covector{0.7, 0.2, -0.1, 0.3};
+        auto analytic = sampler.position_adjoint(position, covector);
+        for (double fraction : {1e-4, 5e-5}) {
+            double step = fraction * position.length();
+            for (int a = 0; a < 3; a++) {
+                auto plus = position, minus = position;
+                plus[a] += step;
+                minus[a] -= step;
+                auto vp = sampler.value_gradient(plus), vm = sampler.value_gradient(minus);
+                double fd{0};
+                for (int j = 0; j < 4; j++) {
+                    fd += covector[j] * (vp[j] - vm[j]) / (2 * step);
+                }
+                hessian_error = std::max(hessian_error, std::abs(fd - analytic[a]) / std::max(1.0, analytic.length()));
+            }
+        }
+    }
+    std::cout << "inner geometry adjoint FD: " << hessian_error << '\n';
+    failures += !std::isfinite(hessian_error) || hessian_error > 2e-6;
     for (double fraction : {0.5, 1.0}) {
         auto position = (grid.first() * fraction / std::sqrt(14.0)) * r3::vector<double>({1, -2, 3});
         auto analytic = sampler.value_gradient(position);
@@ -273,6 +298,59 @@ test_inner_extension(spheric_inner_extension_t mode)
     failures += !std::isfinite(gradient_error) || gradient_error > 2e-7;
     failures += !std::isfinite(curvature_error) || curvature_error > 2e-4;
     return failures;
+}
+
+int
+test_spheric_geometry(int lmax)
+{
+    std::vector<double> x{0.02, 0.09, 0.2, 0.45, 0.75, 1.1, 1.8, 2.4, 3.0};
+    Radial_grid_ext<double> grid(static_cast<int>(x.size()), x.data());
+    Flm field(sf::lmmax(lmax), grid);
+    for (int lm = 0; lm < field.angular_domain_size(); lm++) {
+        for (int ir = 0; ir < grid.num_points(); ir++) {
+            field(lm, ir) = std::sin(0.7 * lm + grid[ir]) / (lm + 1);
+        }
+    }
+    Spheric_function_interpolator sampler(field);
+    std::vector<r3::vector<double>> points{{0.4, 0.3, 0.2},  {0, 0, 0.75},         {0, 0, -1.1},          {0.45, 0, 0},
+                                           {0.3, -0.5, 0.7}, {1e-10, -2e-10, 1.1}, {-1e-10, 2e-10, -0.75}};
+    double error{0}, symmetry_error{0}, gradient_error{0};
+    for (auto const& p : points) {
+        std::array<double, 4> covector{0.3, 0.2, -0.4, 0.5};
+        auto actual = sampler.position_adjoint(p, covector);
+        auto first  = sampler.position_adjoint(p, {1, 0, 0, 0});
+        auto values = sampler.value_gradient(p);
+        r3::matrix<double> hessian;
+        for (int a = 0; a < 3; a++) {
+            gradient_error = std::max(gradient_error, std::abs(first[a] - values[a + 1]));
+            std::array<double, 4> unit{};
+            unit[a + 1] = 1;
+            auto row    = sampler.position_adjoint(p, unit);
+            for (int b = 0; b < 3; b++) {
+                hessian(a, b) = row[b];
+            }
+            for (double step : {1e-6, 5e-7}) {
+                auto plus = p, minus = p;
+                plus[a] += step;
+                minus[a] -= step;
+                auto vp = sampler.value_gradient(plus), vm = sampler.value_gradient(minus);
+                double fd{0};
+                for (int j = 0; j < 4; j++) {
+                    fd += covector[j] * (vp[j] - vm[j]) / (2 * step);
+                }
+                error = std::max(error, std::abs(fd - actual[a]));
+            }
+        }
+        for (int a = 0; a < 3; a++) {
+            for (int b = 0; b < 3; b++) {
+                symmetry_error = std::max(symmetry_error, std::abs(hessian(a, b) - hessian(b, a)));
+            }
+        }
+    }
+    std::cout << "spherical geometry lmax=" << lmax << " FD/gradient/symmetry: " << error << ' ' << gradient_error
+              << ' ' << symmetry_error << '\n';
+    return !std::isfinite(error) || error > 2e-6 || !std::isfinite(gradient_error) || gradient_error > 2e-12 ||
+           !std::isfinite(symmetry_error) || symmetry_error > 2e-11;
 }
 
 int
@@ -323,6 +401,9 @@ main(int argc, char** argv)
         result += call_test("complex spline transpose", test_spline_transpose<std::complex<double>>, n);
     }
     result += call_test("spherical interpolation", test_spheric_interpolation);
+    for (int lmax : {0, 3, 8}) {
+        result += call_test("spherical geometry", test_spheric_geometry, lmax);
+    }
     result += call_test("inner charge continuation", test_inner_extension, spheric_inner_extension_t::charge);
     result += call_test("inner kinetic continuation", test_inner_extension, spheric_inner_extension_t::kinetic);
     result += call_test("cusp kinetic dipole", test_cusp_dipole);
