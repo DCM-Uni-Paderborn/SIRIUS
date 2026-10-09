@@ -16,6 +16,7 @@
 
 #include "k_point.hpp"
 #include <array>
+#include <limits>
 
 namespace sirius {
 
@@ -59,7 +60,8 @@ class K_point_set
     /** For normal cases two values are equal. For the fixed collinear magnetic calulcation
      *  two values are different such that difference of occupancies corresponds to the fixed
      *  magnetisation. */
-    std::array<double, 2> energy_fermi_;
+    std::array<double, 2> energy_fermi_{std::numeric_limits<double>::quiet_NaN(),
+                                        std::numeric_limits<double>::quiet_NaN()};
 
     /// Band gap found by find_band_occupancies().
     double band_gap_{0};
@@ -138,6 +140,25 @@ class K_point_set
     template <typename T>
     double
     find_band_occupancies();
+
+    struct occupation_response_t
+    {
+        std::array<double, 2> fermi;
+        /// Derivatives df/de of the current occupation function.
+        std::vector<mdarray<double, 2>> slopes;
+        std::vector<mdarray<double, 2>> occupations;
+    };
+
+    /// Fixed-charge occupation response, including a fixed collinear spin moment.
+    /** Energy directions have shape {num_bands, num_spins}, in local k-point
+     *  order and replicated within each k-point communicator. Uses the current
+     *  fp64 band energies, occupations and smearing convention. All calls are
+     *  collective on the context communicator. The ground state is unchanged.
+     *  A vanishing occupation slope leaves the corresponding chemical-potential
+     *  direction undetermined; zero is returned without changing occupations.
+     */
+    occupation_response_t
+    band_occupation_response(std::vector<mdarray<double, 2>> const& energy_directions__) const;
 
     /// Print basic info to the standard output.
     void

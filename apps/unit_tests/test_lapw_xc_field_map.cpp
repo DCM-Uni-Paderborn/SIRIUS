@@ -43,17 +43,31 @@ fourier_coefficient(r3::vector<int> g, int s, bool tau, bool direction)
 }
 
 int
-test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data)
+test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data,
+                      lapw_xc_field_adjoint_t interstitial_data)
 {
     auto const& comm = ctx.comm();
     int failures{0};
     Test_check check(failures, comm, "LAPW Hamiltonian");
-    Potential base(ctx), full(ctx);
-    for (auto* p : {&base, &full}) {
+    for (auto& atom : interstitial_data.local) {
+        for (auto& part : atom) {
+            for (auto& field : part) {
+                field.zero();
+            }
+        }
+    }
+    for (auto& atom : interstitial_data.core) {
+        for (auto& field : atom) {
+            std::fill(field.begin(), field.end(), 0);
+        }
+    }
+    Potential base(ctx), full(ctx), interstitial(ctx);
+    for (auto* p : {&base, &full, &interstitial}) {
         p->zero();
         p->fft_transform(-1);
     }
     full.set_lapw_xc_derivatives(std::move(full_data));
+    interstitial.set_lapw_xc_derivatives(std::move(interstitial_data));
     Density density(ctx);
     check.reject("no incomplete XC total energy", [&] { full.energy_exc(density); });
     check.reject("no incomplete rho contraction", [&] { full.energy_vxc(density); });
@@ -77,6 +91,7 @@ test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data
     };
     Hamiltonian0<double> h0(base, true, false);
     Hamiltonian0<double> h1(full, true, false);
+    Hamiltonian0<double> hi(interstitial, true, false);
     double error{0};
     for (int ig = 0; ig < ctx.gvec().num_gvec(); ig++) {
         for (int s = 0; s < (second ? 1 : ctx.num_spins()); s++) {
@@ -113,14 +128,15 @@ test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data
     K_point_set ks(ctx);
     ks.add_kpoint({0.13, -0.17, 0.07}, 1);
     ks.initialize();
-    double full_matrix_error{0}, full_apply_error{0};
+    double local_error{0}, matrix_error{0}, full_matrix_error{0}, full_apply_error{0}, boundary_error{0};
     for (auto it : ks.spl_num_kpoints()) {
         auto kp = ks.get<double>(it.i);
         auto k0 = h0(*kp);
+        auto k1 = hi(*kp);
         auto k2 = h1(*kp);
         int n = kp->gklo_basis_size(), bs = ctx.cyclic_block_size();
-        la::dmatrix<std::complex<double>> m0(n, n, ctx.blacs_grid(), bs, bs);
-        la::dmatrix<std::complex<double>> o0(n, n, ctx.blacs_grid(), bs, bs);
+        la::dmatrix<std::complex<double>> m0(n, n, ctx.blacs_grid(), bs, bs), m1(n, n, ctx.blacs_grid(), bs, bs);
+        la::dmatrix<std::complex<double>> o0(n, n, ctx.blacs_grid(), bs, bs), o1(n, n, ctx.blacs_grid(), bs, bs);
         la::dmatrix<std::complex<double>> m2(n, n, ctx.blacs_grid(), bs, bs), o2(n, n, ctx.blacs_grid(), bs, bs);
         std::vector<mdarray<std::complex<double>, 2>> mt_basis;
         std::vector<int> num_lo, lo_offset;
@@ -130,6 +146,33 @@ test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data
             int naw = atom.type().mt_aw_basis_size(), nmt = atom.type().mt_basis_size();
             mdarray<std::complex<double>, 2> alm({kp->gkvec().count(), naw});
             kp->alm_coeffs_loc().generate<false>(atom, alm);
+            auto centre   = r3::dot(ctx.unit_cell().lattice_vectors(), atom.position());
+            double radius = atom.type().mt_radius();
+            for (int ig = 0; ig < kp->gkvec().count(); ig++) {
+                auto q      = kp->gkvec().gkvec_cart(gvec_index_t::local(ig));
+                auto angles = r3::spherical_coordinates(q);
+                std::vector<std::complex<double>> ylm(sf::lmmax(atom.type().lmax_apw()));
+                sf::spherical_harmonics(atom.type().lmax_apw(), angles[1], angles[2], ylm.data());
+                for (int l = 0; l <= atom.type().lmax_apw(); l++) {
+                    double bessel     = gsl_sf_bessel_jl(l, angles[0] * radius);
+                    double derivative = l / radius * bessel - angles[0] * gsl_sf_bessel_jl(l + 1, angles[0] * radius);
+                    for (int m = -l; m <= l; m++) {
+                        auto factor = fourpi / std::sqrt(ctx.unit_cell().omega()) *
+                                      std::polar(1.0, r3::dot(q, centre)) * std::pow(std::complex<double>(0, 1), l) *
+                                      std::conj(ylm[sf::lm(l, m)]);
+                        for (int deriv = 0; deriv <= 1; deriv++) {
+                            std::complex<double> value{0};
+                            for (int order = 0; order < static_cast<int>(atom.type().aw_descriptor(l).size());
+                                 order++) {
+                                value += atom.symmetry_class().aw_surface_deriv(l, order, deriv) *
+                                         alm(ig, atom.type().indexb_by_l_m_order(l, m, order));
+                            }
+                            boundary_error =
+                                    std::max(boundary_error, std::abs(value - factor * (deriv ? derivative : bessel)));
+                        }
+                    }
+                }
+            }
             mt_basis.push_back(mdarray<std::complex<double>, 2>({nmt, n}));
             auto& a = mt_basis.back();
             a.zero();
@@ -149,6 +192,7 @@ test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data
         scalar_delta.zero();
         for (int s = 0; s < (second ? 1 : ctx.num_spins()); s++) {
             k0.set_fv_h_o(s, m0, o0);
+            k1.set_fv_h_o(s, m1, o1);
             k2.set_fv_h_o(s, m2, o2);
             std::vector<mdarray<std::complex<double>, 2>> local_matrices;
             for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
@@ -174,6 +218,8 @@ test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data
                         expected =
                                 component(vrho, g, s, !second) + 0.5 * r3::dot(qi, qj) * component(vtau, g, s, !second);
                     }
+                    matrix_error = std::max(
+                            {matrix_error, std::abs(m1(i, j) - m0(i, j) - expected), std::abs(o1(i, j) - o0(i, j))});
                     // Independently transform each atomic matrix into the full PW/LO basis.
                     for (size_t ia = 0; ia < mt_basis.size(); ia++) {
                         auto const& a = mt_basis[ia];
@@ -233,9 +279,44 @@ test_lapw_hamiltonian(Simulation_context& ctx, lapw_xc_field_adjoint_t full_data
                 }
             }
         }
+        wf::Wave_functions<double> phi(kp->gkvec_sptr(), wf::num_mag_dims(0), wf::num_bands(1), memory_t::host);
+        wf::Wave_functions<double> a(kp->gkvec_sptr(), wf::num_mag_dims(0), wf::num_bands(1), memory_t::host);
+        wf::Wave_functions<double> b(kp->gkvec_sptr(), wf::num_mag_dims(0), wf::num_bands(1), memory_t::host);
+        wf::Wave_functions<double> za(kp->gkvec_sptr(), wf::num_mag_dims(0), wf::num_bands(1), memory_t::host);
+        wf::Wave_functions<double> zb(kp->gkvec_sptr(), wf::num_mag_dims(0), wf::num_bands(1), memory_t::host);
+        auto c = [&](int ig) { return orbital(ig, 0, 0, false); };
+        for (int ig = 0; ig < kp->gkvec().count(); ig++) {
+            phi.pw_coeffs(ig, wf::spin_index(0), wf::band_index(0)) = c(kp->gkvec().offset() + ig);
+        }
+        h0.local_op().apply_fplapw(kp->spfft_transform(), kp->gkvec_fft_sptr(), wf::band_range(0, 1), phi, &a, nullptr,
+                                   ctx.num_spins() == 2 ? &za : nullptr, nullptr);
+        hi.local_op().apply_fplapw(kp->spfft_transform(), kp->gkvec_fft_sptr(), wf::band_range(0, 1), phi, &b, nullptr,
+                                   ctx.num_spins() == 2 ? &zb : nullptr, nullptr);
+        for (int s = 0; s < ctx.num_spins(); s++) {
+            auto const& wa = s == 0 ? a : za;
+            auto const& wb = s == 0 ? b : zb;
+            for (int ig = 0; ig < kp->gkvec().count(); ig++) {
+                auto gi = kp->gkvec().gvec(gvec_index_t::local(ig));
+                auto qi = kp->gkvec().gkvec_cart(gvec_index_t::local(ig));
+                std::complex<double> expected{0};
+                for (int jg = 0; jg < kp->gkvec().num_gvec(); jg++) {
+                    auto gj = kp->gkvec().gvec(gvec_index_t::global(jg));
+                    auto qj = kp->gkvec().gkvec_cart(gvec_index_t::global(jg));
+                    int g   = ctx.gvec().index_g12(gi, gj);
+                    expected += (component(vrho, g, s, false) + 0.5 * r3::dot(qi, qj) * component(vtau, g, s, false)) *
+                                c(jg);
+                }
+                local_error = std::max(local_error,
+                                       std::abs(wb.pw_coeffs(ig, wf::spin_index(0), wf::band_index(0)) -
+                                                wa.pw_coeffs(ig, wf::spin_index(0), wf::band_index(0)) - expected));
+            }
+        }
     }
+    check("exact LAPW assembly, shifted k and unchanged overlap", matrix_error, 3e-12);
+    check("matrix-free scalar/magnetic rho and tau", local_error, 3e-12);
     check("complete PW/AW/LO assembly", full_matrix_error, 3e-12);
     check("complete matrix-free PW/AW/LO application", full_apply_error, 3e-12);
+    check("LAPW boundary value and radial slope", boundary_error, 3e-12);
 
     // Change a basis function after XC evaluation. Cached matrices would now be stale.
     auto& atom = ctx.unit_cell().atom(0);
@@ -470,6 +551,24 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
         }
     }
     check("piecewise values, gradients, core and periodic images", error, 3e-11);
+
+    std::vector<r3::vector<double>> surface_points{all_points[3], all_points[3],
+                                                   all_points[3] + r3::dot(lattice, r3::vector<double>(2, -1, 1))};
+    for (int p : {1, 2}) {
+        surface_points[p][2] = std::nextafter(surface_points[p][2], std::numeric_limits<double>::infinity());
+    }
+    auto surface = LAPW_xc_field_map(density, surface_points).sample(rho, tau);
+    error        = 0;
+    for (int s = 0; s < ctx.num_spins(); s++) {
+        for (int p : {1, 2}) {
+            error = std::max({error, std::abs(surface.rho(p, s) - surface.rho(0, s)),
+                              std::abs(surface.tau(p, s) - surface.tau(0, s))});
+            for (int x = 0; x < 3; x++) {
+                error = std::max(error, std::abs(surface.gradient(p, x, s) - surface.gradient(0, x, s)));
+            }
+        }
+    }
+    check("surface ownership survives coordinate and periodic-image roundoff", error, 3e-11);
 
     // Independent orbital values test the complex Gaunt contraction and DM convention.
     error = 0;
@@ -725,9 +824,103 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
         check("MT/interstitial geometry point FD", point_error, 2e-7);
         check("geometry atom FD including physical core fields", atom_error, 2e-7);
         check("geometry all nine fixed-Cartesian cell components FD", cell_error, 2e-7);
+
+        std::vector<r3::vector<double>> point_directions;
+        mdarray<double, 2> atom_directions({3, ctx.unit_cell().num_atoms()});
+        r3::matrix<double> lattice_direction;
+        for (size_t p = 0; p < ids.size(); p++) {
+            point_directions.emplace_back(0.13 + 0.02 * ids[p], -0.04, 0.07);
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                atom_directions(x, ia) = 0.03 * std::sin(x + ia + 0.7);
+            }
+            for (int y = 0; y < 3; y++) {
+                lattice_direction(x, y) = 0.02 * std::cos(x + 2 * y + 0.4);
+            }
+        }
+        auto response = geometry_map.geometry_response(rho, tau, point_directions, atom_directions, lattice_direction);
+        auto reverse_response =
+                geometry_map.geometry_adjoint_response(covectors, point_directions, atom_directions, lattice_direction);
+        double forward{0}, backward{0};
+        for (size_t i = 0; i < response.rho.size(); i++) {
+            forward += response.rho[i] * covectors.rho[i] + response.tau[i] * covectors.tau[i];
+        }
+        for (size_t i = 0; i < response.gradient.size(); i++) {
+            forward += response.gradient[i] * covectors.gradient[i];
+        }
+        for (size_t p = 0; p < ids.size(); p++) {
+            backward += r3::dot(geometry.points[p], point_directions[p]);
+        }
+        comm.allreduce(&forward, 1);
+        comm.allreduce(&backward, 1);
+        for (size_t i = 0; i < atom_directions.size(); i++) {
+            backward += geometry.atoms[i] * atom_directions[i];
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                backward += geometry.lattice(x, y) * lattice_direction(x, y);
+            }
+        }
+        check("geometry forward/adjoint duality", fd_error(forward, backward), 2e-10);
+        for (double h : {1e-5, 5e-6}) {
+            auto shifted = [&](double step) {
+                auto trial_cell   = cell;
+                auto trial_points = geometry_points;
+                for (int x = 0; x < 3; x++) {
+                    for (int y = 0; y < 3; y++) {
+                        trial_cell(x, y) += step * lattice_direction(x, y);
+                    }
+                }
+                set_cell(trial_cell);
+                for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                    auto atom = atoms[ia];
+                    for (int x = 0; x < 3; x++) {
+                        atom[x] += step * atom_directions(x, ia);
+                    }
+                    ctx.unit_cell().atom(ia).set_position(r3::dot(r3::inverse(trial_cell), atom));
+                }
+                for (size_t p = 0; p < ids.size(); p++) {
+                    trial_points[p] += step * point_directions[p];
+                }
+                LAPW_xc_field_map trial(density, trial_points);
+                auto result = std::make_pair(trial.sample(rho, tau), trial.adjoint(covectors));
+                set_cell(cell);
+                return result;
+            };
+            auto plus = shifted(h), minus = shifted(-h);
+            double response_error{0};
+            auto compare = [&](auto const& d, auto const& p, auto const& m) {
+                double peak{0}, error{0};
+                for (size_t i = 0; i < d.size(); i++) {
+                    peak  = std::max(peak, std::abs(d[i]));
+                    error = std::max(error, std::abs(d[i] - (p[i] - m[i]) / (2 * h)));
+                }
+                response_error = std::max(response_error, error / std::max(1.0, peak));
+            };
+            compare(response.rho, plus.first.rho, minus.first.rho);
+            compare(response.tau, plus.first.tau, minus.first.tau);
+            compare(response.gradient, plus.first.gradient, minus.first.gradient);
+            for (int s = 0; s < ctx.num_spins(); s++) {
+                compare(reverse_response.rho[s].f_pw_local(), plus.second.rho[s].f_pw_local(),
+                        minus.second.rho[s].f_pw_local());
+                compare(reverse_response.tau[s].f_pw_local(), plus.second.tau[s].f_pw_local(),
+                        minus.second.tau[s].f_pw_local());
+            }
+            for (size_t ia = 0; ia < reverse_response.local.size(); ia++) {
+                for (int part = 0; part < 2; part++) {
+                    for (int s = 0; s < ctx.num_spins(); s++) {
+                        compare(reverse_response.local[ia][part][s], plus.second.local[ia][part][s],
+                                minus.second.local[ia][part][s]);
+                    }
+                    compare(reverse_response.core[ia][part], plus.second.core[ia][part], minus.second.core[ia][part]);
+                }
+            }
+            check("joint field-sampling/transpose geometry response FD", response_error, 2e-7);
+        }
     }
 
-    failures += test_lapw_hamiltonian(ctx, map.adjoint(derivatives));
+    failures += test_lapw_hamiltonian(ctx, map.adjoint(derivatives), map.adjoint(derivatives));
 
     // The physical fields, not the current density matrix, define the energy
     // contraction. Compare the production contraction to the original point sum.
@@ -1170,6 +1363,24 @@ test_lapw_map(int num_mag_dims, bool replicated_fft, bool second_variation)
     check.reject("collective wrong-spin rejection", [&] { map.sample(comm.rank() == 0 ? empty : rho, tau); });
     check.reject("geometry collective wrong-spin rejection",
                  [&] { map.geometry_adjoint(comm.rank() == 0 ? empty : rho, tau, derivatives); });
+    std::vector<r3::vector<double>> zero_points(points.size());
+    mdarray<double, 2> zero_atoms({3, ctx.unit_cell().num_atoms()});
+    zero_atoms.zero();
+    r3::matrix<double> zero_lattice;
+    auto bad_directions = zero_points;
+    if (comm.rank() == 0) {
+        bad_directions.emplace_back();
+    }
+    check.reject("geometry response collective wrong-buffer rejection",
+                 [&] { map.geometry_response(rho, tau, bad_directions, zero_atoms, zero_lattice); });
+    check.reject("geometry transpose response collective wrong-buffer rejection",
+                 [&] { map.geometry_adjoint_response(derivatives, bad_directions, zero_atoms, zero_lattice); });
+    if (comm.size() > 1) {
+        zero_atoms(0, 0) = comm.rank() == 0 ? 1 : 0;
+        check.reject("geometry response inconsistent atom-direction rejection",
+                     [&] { map.geometry_response(rho, tau, zero_points, zero_atoms, zero_lattice); });
+        zero_atoms.zero();
+    }
     xc_point_fields_t bad(points.size() + (comm.rank() == 0 ? 1 : 0), ctx.num_spins());
     bad.rho.zero();
     bad.tau.zero();

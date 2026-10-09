@@ -40,6 +40,14 @@ struct radial_solver_result_t
     std::array<double, 3> uderiv;
 };
 
+/// A radial solution and its directional derivative at fixed linearisation energy.
+struct radial_solver_response_t
+{
+    radial_solver_result_t value;
+    std::vector<double> p, rdudr;
+    std::array<double, 3> uderiv;
+};
+
 namespace radial_solver_local {
 
 constexpr double alpha = 1.0 / speed_of_light;
@@ -335,12 +343,25 @@ class Radial_solver
     double epsabs_{1e-3};
     double epsrel_{1e-3};
 
+    struct potential_response_t
+    {
+        Spline<double> potential, source;
+        std::vector<double> p, dpdr, q, dqdr;
+
+        potential_response_t(Radial_grid<double> const& grid__, std::vector<double> const& direction__)
+            : potential(grid__, direction__)
+            , source(grid__)
+        {
+        }
+    };
+
     /// Integrate system of two first-order differential equations forward starting from the origin.
     template <relativity_t rel>
     int
     integrate_forward_gsl(double enu__, int l__, int k__, Spline<double>& chi_p__, Spline<double>& chi_q__,
                           std::vector<double>& p__, std::vector<double>& dpdr__, std::vector<double>& q__,
-                          std::vector<double>& dqdr__, bool bound_state__) const
+                          std::vector<double>& dqdr__, bool bound_state__,
+                          potential_response_t* response__ = nullptr) const
     {
         struct params
         {
@@ -353,6 +374,7 @@ class Radial_solver
             Spline<double> const* ve;
             Spline<double> const* chi_p;
             Spline<double> const* chi_q;
+            potential_response_t const* response;
         };
 
         auto func = [](double x, double const* y, double* f, void* params__) -> int {
@@ -403,6 +425,11 @@ class Radial_solver
                     f[1] = -alpha * (p->enu - V) * y[0] + y[1] * p->kappa / x;
                     break;
                 }
+            }
+            if (p->response) {
+                double a = V - p->enu + p->l * (p->l + 1) / (2 * x * x);
+                f[2]     = 2 * y[3] + y[2] / x;
+                f[3] = a * y[2] - y[3] / x + p->response->potential(p->ir, dx) * y[0] + p->response->source(p->ir, dx);
             }
             return GSL_SUCCESS;
         };
@@ -491,18 +518,27 @@ class Radial_solver
 
         p__ = std::vector<double>(radial_grid_.num_points());
         q__ = std::vector<double>(radial_grid_.num_points());
+        if (response__) {
+            if (rel != relativity_t::none || bound_state__) {
+                RTE_THROW("radial potential response requires nonrelativistic forward integration");
+            }
+            for (auto* v : {&response__->p, &response__->dpdr, &response__->q, &response__->dqdr}) {
+                v->assign(radial_grid_.num_points(), 0);
+            }
+        }
 
         int last_point{radial_grid_.num_points() - 1};
 
         auto integrate_forward = [&](int last_point) -> std::vector<int> {
             params p;
-            p.enu   = enu__;
-            p.l     = l__;
-            p.kappa = 0;
-            p.zn    = zn_;
-            p.ve    = &ve_;
-            p.chi_p = &chi_p__;
-            p.chi_q = &chi_q__;
+            p.enu      = enu__;
+            p.l        = l__;
+            p.kappa    = 0;
+            p.zn       = zn_;
+            p.ve       = &ve_;
+            p.chi_p    = &chi_p__;
+            p.chi_q    = &chi_q__;
+            p.response = response__;
             if (rel == relativity_t::dirac) {
                 if (k__ == l__) {
                     p.kappa = k__;
@@ -517,7 +553,7 @@ class Radial_solver
 
             /* initial conditions */
             double x = radial_grid_[0];
-            double y[2];
+            double y[4]{};
             switch (rel) {
                 case relativity_t::none: {
                     if (l__ == 0) {
@@ -551,12 +587,13 @@ class Radial_solver
             p__[0] = y[0];
             q__[0] = y[1];
 
-            gsl_odeiv2_system sys = {func, jac, 2, &p};
+            size_t dimension      = response__ ? 4 : 2;
+            gsl_odeiv2_system sys = {func, response__ ? nullptr : +jac, dimension, &p};
 
             const gsl_odeiv2_step_type* T = gsl_odeiv2_step_rk8pd;
-            gsl_odeiv2_step* s            = gsl_odeiv2_step_alloc(T, 2);
+            gsl_odeiv2_step* s            = gsl_odeiv2_step_alloc(T, dimension);
             gsl_odeiv2_control* c         = gsl_odeiv2_control_y_new(epsabs_, epsrel_);
-            gsl_odeiv2_evolve* e          = gsl_odeiv2_evolve_alloc(2);
+            gsl_odeiv2_evolve* e          = gsl_odeiv2_evolve_alloc(dimension);
 
             std::vector<int> ridx;
 
@@ -588,6 +625,10 @@ class Radial_solver
 
                 p__[p.ir + 1] = y[0];
                 q__[p.ir + 1] = y[1];
+                if (response__) {
+                    response__->p[p.ir + 1] = y[2];
+                    response__->q[p.ir + 1] = y[3];
+                }
 
                 double const max_val{1e6};
 
@@ -596,12 +637,24 @@ class Radial_solver
                     for (int j = 0; j <= p.ir + 1; j++) {
                         p__[j] /= max_val;
                         q__[j] /= max_val;
+                        if (response__) {
+                            response__->p[j] /= max_val;
+                            response__->q[j] /= max_val;
+                        }
                     }
                     y[0] /= max_val;
                     y[1] /= max_val;
 
                     chi_p__.scale(1.0 / max_val);
                     chi_q__.scale(1.0 / max_val);
+                    if (response__) {
+                        y[2] /= max_val;
+                        y[3] /= max_val;
+                        response__->source.scale(1.0 / max_val);
+                    }
+                    // Cached ODE derivatives refer to the pre-rescaling state.
+                    gsl_odeiv2_evolve_reset(e);
+                    gsl_odeiv2_step_reset(s);
                 }
             }
             gsl_odeiv2_evolve_free(e);
@@ -670,6 +723,12 @@ class Radial_solver
                     break;
                 }
             }
+            if (response__) {
+                response__->dpdr[i] = 2 * response__->q[i] + response__->p[i] * radial_grid_.x_inv(i);
+                response__->dqdr[i] = (V - enu__ + ll_half / std::pow(radial_grid_[i], 2)) * response__->p[i] -
+                                      response__->q[i] * radial_grid_.x_inv(i) + response__->potential(i) * p__[i] +
+                                      response__->source(i);
+            }
         }
 
         /* normalize */
@@ -678,7 +737,20 @@ class Radial_solver
             s(i) = std::pow(p__[i], 2);
         }
         auto norm = 1.0 / std::sqrt(s.interpolate().integrate(0));
+        double norm_response{0};
+        if (response__) {
+            for (int i = 0; i < radial_grid_.num_points(); i++) {
+                s(i) = p__[i] * response__->p[i];
+            }
+            norm_response = norm * norm * s.interpolate().integrate(0);
+        }
         for (int i = 0; i < radial_grid_.num_points(); i++) {
+            if (response__) {
+                response__->p[i]    = norm * (response__->p[i] - norm_response * p__[i]);
+                response__->q[i]    = norm * (response__->q[i] - norm_response * q__[i]);
+                response__->dpdr[i] = norm * (response__->dpdr[i] - norm_response * dpdr__[i]);
+                response__->dqdr[i] = norm * (response__->dqdr[i] - norm_response * dqdr__[i]);
+            }
             p__[i] *= norm;
             q__[i] *= norm;
             dpdr__[i] *= norm;
@@ -704,6 +776,7 @@ class Radial_solver
         ve_.interpolate();
     }
 
+  private:
     /// Integrates the radial equation for a given energy and finds the m-th energy derivative of the radial solution.
     /** \param [in] rel Type of relativity
      *  \param [in] dme Order of energy derivative.
@@ -730,7 +803,7 @@ class Radial_solver
      *  \f]
      */
     auto
-    solve(relativity_t rel__, int dme__, int l__, double enu__) const
+    solve_impl(relativity_t rel__, int dme__, int l__, double enu__, potential_response_t* response__ = nullptr) const
     {
         int nr = num_points();
         std::vector<std::vector<double>> p;
@@ -752,6 +825,12 @@ class Radial_solver
             dqdr.push_back(std::vector<double>(nr));
 
             if (j) {
+                if (response__) {
+                    for (int i = 0; i < nr; i++) {
+                        response__->source(i) = -j * response__->p[i];
+                    }
+                    response__->source.interpolate();
+                }
                 if (rel__ == relativity_t::none || rel__ == relativity_t::zora) {
                     for (int i = 0; i < nr; i++) {
                         chi_q(i) = -j * p[j - 1][i];
@@ -841,7 +920,7 @@ class Radial_solver
             switch (rel__) {
                 case relativity_t::none: {
                     nn = integrate_forward_gsl<relativity_t::none>(enu__, l__, 0, chi_p, chi_q, p[j], dpdr[j], q[j],
-                                                                   dqdr[j], false);
+                                                                   dqdr[j], false, response__);
                     break;
                 }
                 case relativity_t::koelling_harmon: {
@@ -864,10 +943,16 @@ class Radial_solver
                 }
             }
         }
-        /* save the results */
+        return make_result(nn, p.back(), dpdr.back());
+    }
+
+    radial_solver_result_t
+    make_result(int nodes__, std::vector<double> const& p__, std::vector<double> const& dpdr__) const
+    {
+        int nr = num_points();
         std::vector<double> rdudr(nr);
         for (int i = 0; i < nr; i++) {
-            rdudr[i] = dpdr.back()[i] - p.back()[i] * radial_grid_.x_inv(i);
+            rdudr[i] = dpdr__[i] - p__[i] * radial_grid_.x_inv(i);
         }
 
         double R = radial_grid_.last();
@@ -875,14 +960,37 @@ class Radial_solver
         /* 1st radial derivative of u(r) */
         std::array<double, 3> uderiv;
         /* p(r) = u(r)*r -> u(r) = p(r) / r */
-        uderiv[0] = p.back().back() / R;
-        uderiv[1] = (dpdr.back().back() - p.back().back() / R) / R;
+        uderiv[0] = p__.back() / R;
+        uderiv[1] = (dpdr__.back() - p__.back() / R) / R;
         /* 2nd radial derivative of u(r) */
-        Spline<double> sdpdr(radial_grid_, dpdr.back());
+        Spline<double> sdpdr(radial_grid_, dpdr__);
         sdpdr.interpolate();
-        uderiv[2] = (sdpdr.deriv(1, nr - 1) - 2 * dpdr.back().back() / R + 2 * p.back().back() / std::pow(R, 2)) / R;
+        uderiv[2] = (sdpdr.deriv(1, nr - 1) - 2 * dpdr__.back() / R + 2 * p__.back() / std::pow(R, 2)) / R;
 
-        return radial_solver_result_t{nn, p.back(), rdudr, uderiv};
+        return radial_solver_result_t{nodes__, p__, rdudr, uderiv};
+    }
+
+  public:
+    /// Normalized radial solution and its requested energy derivative.
+    auto
+    solve(relativity_t rel__, int dme__, int l__, double enu__) const
+    {
+        return solve_impl(rel__, dme__, l__, enu__);
+    }
+
+    /// Differentiate the nonrelativistic solution, including its normalization and energy-derivative source.
+    auto
+    solve_potential_response(int dme__, int l__, double enu__, std::vector<double> const& direction__) const
+    {
+        if (dme__ < 0 || l__ < 0 || !std::isfinite(enu__) || direction__.size() != static_cast<size_t>(num_points()) ||
+            std::any_of(direction__.begin(), direction__.end(), [](double x) { return !std::isfinite(x); })) {
+            RTE_THROW("invalid radial potential response direction or quantum numbers");
+        }
+        potential_response_t response(radial_grid_, direction__);
+        auto value   = solve_impl(relativity_t::none, dme__, l__, enu__, &response);
+        auto tangent = make_result(0, response.p, response.dpdr);
+        return radial_solver_response_t{std::move(value), std::move(tangent.p), std::move(tangent.rdudr),
+                                        tangent.uderiv};
     }
 
     inline double
@@ -1225,6 +1333,12 @@ struct enu_search_t
 enu_search_t
 find_enu(relativity_t rel__, int zn__, int n__, int l__, Radial_grid<double> const& radial_grid__,
          std::vector<double> const& v__, enu_search_t const& enu__);
+
+/// Differentiate the nonrelativistic boundary conditions defining a stored linearisation energy.
+double
+linearization_energy_response(int zn__, int l__, Radial_grid<double> const& grid__,
+                              std::vector<double> const& potential__, enu_search_t const& enu__,
+                              std::vector<double> const& direction__);
 
 }; // namespace sirius
 

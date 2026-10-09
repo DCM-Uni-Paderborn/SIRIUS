@@ -107,15 +107,19 @@ class Spheric_function_interpolator
     };
 
     point_t
-    point(r3::vector<double> position__) const
+    point(r3::vector<double> position__, bool gradient__ = true) const
     {
         for (int x = 0; x < 3; x++) {
             if (!std::isfinite(position__[x])) {
                 RTE_THROW("spherical interpolation: nonfinite coordinate");
             }
         }
-        auto spherical = r3::spherical_coordinates(position__);
-        double r       = spherical[0];
+        auto spherical   = r3::spherical_coordinates(position__);
+        double r         = spherical[0];
+        double tolerance = 32 * std::numeric_limits<double>::epsilon() * std::max(1.0, grid_.last());
+        if (r > grid_.last() && r - grid_.last() <= tolerance) {
+            r = grid_.last();
+        }
         if ((r < grid_.first() && inner_ == spheric_inner_extension_t::none) || r > grid_.last() || r < 1e-12) {
             RTE_THROW("spherical interpolation: point outside radial support or at the nucleus");
         }
@@ -129,9 +133,11 @@ class Spheric_function_interpolator
                   r,
                   (1.0 / r) * position__,
                   std::vector<double>(n),
-                  mdarray<double, 2>({n, 3})};
+                  mdarray<double, 2>({gradient__ ? n : 0, 3})};
         sf::spherical_harmonics(lmax_, position__, p.harmonics.data());
-        sf::dRlm_dr(lmax_, position__, p.gradient);
+        if (gradient__) {
+            sf::dRlm_dr(lmax_, position__, p.gradient);
+        }
         return p;
     }
 
@@ -160,6 +166,21 @@ class Spheric_function_interpolator
         return result;
     }
 
+    Flm
+    transpose_coefficients(mdarray<double, 3>& coeffs__) const
+    {
+        int n = static_cast<int>(radial_.size()), nr = grid_.num_points();
+        Flm result(n, grid_);
+        for (int lm = 0; lm < n; lm++) {
+            mdarray<double, 2> component({nr, 4}, &coeffs__(0, 0, lm));
+            auto values = radial_[lm].interpolation_adjoint(component);
+            for (int ir = 0; ir < nr; ir++) {
+                result(lm, ir) = values[ir];
+            }
+        }
+        return result;
+    }
+
   public:
     explicit Spheric_function_interpolator(Flm const& field__,
                                            spheric_inner_extension_t inner__ = spheric_inner_extension_t::none)
@@ -180,6 +201,23 @@ class Spheric_function_interpolator
         build_gradient_couplings();
     }
 
+    /// Sample the field without computing unused spatial derivatives.
+    double
+    value(r3::vector<double> const& position__) const
+    {
+        auto p = point(position__, false);
+        double result{0};
+        for (int lm = 0; lm < static_cast<int>(radial_.size()); lm++) {
+            auto weights = radial_weights(p, lm);
+            double f{0};
+            for (int j = 0; j < 4; j++) {
+                f += weights[0][j] * radial_[lm].coeffs()(p.segment, j);
+            }
+            result += f * p.harmonics[lm];
+        }
+        return result;
+    }
+
     /// Return {field, d(field)/dx, d(field)/dy, d(field)/dz}.
     std::array<double, 4>
     value_gradient(r3::vector<double> const& position__) const
@@ -197,6 +235,24 @@ class Spheric_function_interpolator
             for (int x = 0; x < 3; x++) {
                 result[x + 1] += df * p.direction[x] * p.harmonics[lm] + f * p.gradient(lm, x);
             }
+        }
+        return result;
+    }
+
+    /// Position direction of the same value/gradient map as position_adjoint.
+    std::array<double, 4>
+    position_response(r3::vector<double> const& position__, r3::vector<double> const& direction__) const
+    {
+        for (int x = 0; x < 3; x++) {
+            if (!std::isfinite(direction__[x])) {
+                RTE_THROW("spherical geometry response: nonfinite direction");
+            }
+        }
+        std::array<double, 4> result{};
+        for (int k = 0; k < 4; k++) {
+            std::array<double, 4> unit{};
+            unit[k]   = 1;
+            result[k] = r3::dot(direction__, position_adjoint(position__, unit));
         }
         return result;
     }
@@ -284,15 +340,74 @@ class Spheric_function_interpolator
                 }
             }
         }
-        Flm result(n, grid_);
-        for (int lm = 0; lm < n; lm++) {
-            mdarray<double, 2> component({nr, 4}, &coeffs(0, 0, lm));
-            auto values = radial_[lm].interpolation_adjoint(component);
-            for (int ir = 0; ir < nr; ir++) {
-                result(lm, ir) = values[ir];
+        return transpose_coefficients(coeffs);
+    }
+
+    /// Position derivative of the radial-sample adjoint, at fixed raw covectors and grid.
+    Flm
+    geometry_adjoint_response(std::vector<r3::vector<double>> const& positions__,
+                              std::vector<std::array<double, 4>> const& dvalues__,
+                              std::vector<r3::vector<double>> const& directions__) const
+    {
+        if (positions__.size() != dvalues__.size() || positions__.size() != directions__.size()) {
+            RTE_THROW("spherical adjoint response: incompatible point directions");
+        }
+        int n = static_cast<int>(radial_.size()), nr = grid_.num_points();
+        mdarray<double, 3> coeffs({nr, 4, n});
+        coeffs.zero();
+        std::vector<std::pair<gradient_coupling_t const*, gradient_coupling_t const*>> couplings;
+        for (auto const& a : gradient_couplings_) {
+            if (a.from < n && a.angular != 0) {
+                for (auto const& b : gradient_couplings_) {
+                    if (b.from == a.to && b.angular != 1) {
+                        couplings.emplace_back(&a, &b);
+                    }
+                }
             }
         }
-        return result;
+        for (size_t i = 0; i < positions__.size(); i++) {
+            auto p        = point(positions__[i]);
+            auto const& v = directions__[i];
+            for (double d : dvalues__[i]) {
+                if (!std::isfinite(d)) {
+                    RTE_THROW("spherical adjoint response: nonfinite covector");
+                }
+            }
+            for (int x = 0; x < 3; x++) {
+                if (!std::isfinite(v[x])) {
+                    RTE_THROW("spherical adjoint response: nonfinite direction");
+                }
+            }
+            double dr = r3::dot(p.direction, v);
+            auto dn   = (1.0 / p.radius) * (v - dr * p.direction);
+            std::vector<double> harmonics(sf::lmmax(lmax_ + 2));
+            sf::spherical_harmonics(lmax_ + 2, positions__[i], harmonics.data());
+            std::vector<r3::vector<double>> dgradient(n);
+            // Apply the two angular-gradient couplings to each original harmonic.
+            for (auto const& [a, b] : couplings) {
+                double w = a->angular * (b->angular - 1.0) * harmonics[b->to] / (p.radius * p.radius);
+                dgradient[a->from] += (w * r3::dot(b->weight, v)) * a->weight;
+            }
+            for (int lm = 0; lm < n; lm++) {
+                double dy{0}, f = dvalues__[i][0] * p.harmonics[lm], df{0};
+                for (int x = 0; x < 3; x++) {
+                    dy += p.gradient(lm, x) * v[x];
+                    f += dvalues__[i][x + 1] * p.gradient(lm, x);
+                    df += dvalues__[i][x + 1] * p.direction[x] * p.harmonics[lm];
+                }
+                double delta_f = dvalues__[i][0] * dy, delta_df{0};
+                for (int x = 0; x < 3; x++) {
+                    delta_f += dvalues__[i][x + 1] * dgradient[lm][x];
+                    delta_df += dvalues__[i][x + 1] * (dn[x] * p.harmonics[lm] + p.direction[x] * dy);
+                }
+                auto weights = radial_weights(p, lm);
+                for (int j = 0; j < 4; j++) {
+                    coeffs(p.segment, j, lm) += dr * (weights[1][j] * f + weights[2][j] * df) +
+                                                weights[0][j] * delta_f + weights[1][j] * delta_df;
+                }
+            }
+        }
+        return transpose_coefficients(coeffs);
     }
 };
 

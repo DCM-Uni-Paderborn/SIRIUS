@@ -68,6 +68,32 @@ class Smooth_periodic_function_sampler
         }
     }
 
+    void
+    check_geometry_direction(std::vector<r3::vector<double>> const& points__, r3::matrix<double> const& lattice__) const
+    {
+        bool failed = points__.size() != fractional_points_.size();
+        for (auto const& p : points__) {
+            for (int x = 0; x < 3; x++) {
+                failed |= !std::isfinite(p[x]);
+            }
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                failed |= !std::isfinite(lattice__(x, y));
+            }
+        }
+        check(failed, "Fourier geometry response: incompatible or nonfinite direction");
+        auto lo = lattice__, hi = lattice__;
+        gvec_.comm().allreduce<double, mpi::op_t::min>(&lo(0, 0), 9);
+        gvec_.comm().allreduce<double, mpi::op_t::max>(&hi(0, 0), 9);
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                failed |= lo(x, y) != hi(x, y);
+            }
+        }
+        check(failed, "Fourier geometry response: lattice direction differs between ranks");
+    }
+
   public:
     Smooth_periodic_function_sampler(fft::Gvec const& gvec__, std::vector<r3::vector<double>> const& points__)
         : gvec_(gvec__)
@@ -107,6 +133,7 @@ class Smooth_periodic_function_sampler
     std::vector<std::array<double, 4>>
     sample(Smooth_periodic_function<double> const& field__) const
     {
+        PROFILE("sirius::Smooth_periodic_function_sampler::sample");
         bool failed = &field__.gvec() != &gvec_;
         for (auto c : field__.f_pw_local()) {
             failed |= !std::isfinite(c.real()) || !std::isfinite(c.imag());
@@ -129,6 +156,47 @@ class Smooth_periodic_function_sampler
                     result[first + p][0] += multiplicity * z.real();
                     for (int x = 0; x < 3; x++) {
                         result[first + p][x + 1] -= multiplicity * cart[x] * z.imag();
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /// Geometry direction at fixed Fourier coefficients, with Cartesian point directions.
+    std::vector<std::array<double, 4>>
+    geometry_response(Smooth_periodic_function<double> const& field__,
+                      std::vector<r3::vector<double>> const& point_directions__,
+                      r3::matrix<double> const& lattice_direction__) const
+    {
+        check_geometry_direction(point_directions__, lattice_direction__);
+        bool failed = &field__.gvec() != &gvec_;
+        for (auto c : field__.f_pw_local()) {
+            failed |= !std::isfinite(c.real()) || !std::isfinite(c.imag());
+        }
+        check(failed, "Fourier geometry response: incompatible field or nonfinite coefficients");
+        std::vector<std::complex<double>> coefficients(gvec_.num_gvec());
+        gvec_.comm().allgather(field__.f_pw_local().at(memory_t::host), coefficients.data(), gvec_.count(),
+                               gvec_.offset());
+        auto inverse_transpose = r3::transpose(r3::inverse(gvec_.unit_cell_lattice_vectors()));
+        std::vector<std::array<double, 4>> result(fractional_points_.size());
+        #pragma omp parallel for schedule(static)
+        for (size_t first = 0; first < fractional_points_.size(); first += point_tile) {
+            int count  = static_cast<int>(std::min(point_tile, fractional_points_.size() - first));
+            auto phase = phases(first, count);
+            for (int ig = 0; ig < gvec_.num_gvec(); ig++) {
+                auto const& g    = phase_indices_[ig];
+                auto const& cart = cartesian_g_[ig];
+                auto dg          = -1.0 * r3::dot(inverse_transpose, r3::dot(r3::transpose(lattice_direction__), cart));
+                double multiplicity = gvec_.reduced() && r3::dot(cart, cart) != 0 ? 2 : 1;
+                for (int p = 0; p < count; p++) {
+                    auto z            = coefficients[ig] * phase(p, g[0]) * phase(p, g[1]) * phase(p, g[2]);
+                    auto displacement = point_directions__[first + p] -
+                                        r3::dot(lattice_direction__, unwrapped_fractional_points_[first + p]);
+                    double dphase = r3::dot(cart, displacement);
+                    result[first + p][0] -= multiplicity * z.imag() * dphase;
+                    for (int x = 0; x < 3; x++) {
+                        result[first + p][x + 1] -= multiplicity * (dg[x] * z.imag() + cart[x] * z.real() * dphase);
                     }
                 }
             }
@@ -210,6 +278,7 @@ class Smooth_periodic_function_sampler
     void
     adjoint(std::vector<std::array<double, 4>> const& covectors__, Smooth_periodic_function<double>& potential__) const
     {
+        PROFILE("sirius::Smooth_periodic_function_sampler::adjoint");
         bool failed = covectors__.size() != fractional_points_.size() || &potential__.gvec() != &gvec_;
         for (auto const& d : covectors__) {
             for (double v : d) {
@@ -232,6 +301,60 @@ class Smooth_periodic_function_sampler
                         auto const& d   = covectors__[first + p];
                         double gradient = cart[0] * d[1] + cart[1] * d[2] + cart[2] * d[3];
                         value += std::complex<double>(d[0], -gradient) *
+                                 std::conj(phase(p, g[0]) * phase(p, g[1]) * phase(p, g[2]));
+                    }
+                    coefficients[ig] = value;
+                }
+            }
+            for (int ig = begin; ig < end; ig++) {
+                coefficients[ig] /= gvec_.omega();
+            }
+        }
+        gvec_.comm().allreduce(coefficients.data(), coefficients.size());
+        for (int ig = 0; ig < gvec_.count(); ig++) {
+            potential__.f_pw_local(ig) = coefficients[gvec_.offset() + ig];
+        }
+    }
+
+    /// Geometry derivative of the adjoint, including its inverse-volume normalization.
+    void
+    geometry_adjoint_response(std::vector<std::array<double, 4>> const& covectors__,
+                              std::vector<r3::vector<double>> const& point_directions__,
+                              r3::matrix<double> const& lattice_direction__,
+                              Smooth_periodic_function<double>& potential__) const
+    {
+        check_geometry_direction(point_directions__, lattice_direction__);
+        bool failed = covectors__.size() != fractional_points_.size() || &potential__.gvec() != &gvec_;
+        for (auto const& d : covectors__) {
+            for (double v : d) {
+                failed |= !std::isfinite(v);
+            }
+        }
+        check(failed, "Fourier adjoint response: incompatible buffers or nonfinite covectors");
+        auto inverse       = r3::inverse(gvec_.unit_cell_lattice_vectors());
+        auto deformation   = r3::dot(inverse, lattice_direction__);
+        double dlog_volume = deformation(0, 0) + deformation(1, 1) + deformation(2, 2);
+        std::vector<std::complex<double>> coefficients(gvec_.num_gvec());
+        #pragma omp parallel for schedule(static)
+        for (int begin = 0; begin < gvec_.num_gvec(); begin += gvec_tile) {
+            int end = std::min(begin + gvec_tile, gvec_.num_gvec());
+            for (size_t first = 0; first < fractional_points_.size(); first += point_tile) {
+                int count  = static_cast<int>(std::min(point_tile, fractional_points_.size() - first));
+                auto phase = phases(first, count);
+                for (int ig = begin; ig < end; ig++) {
+                    auto const& g    = phase_indices_[ig];
+                    auto const& cart = cartesian_g_[ig];
+                    auto dg = -1.0 * r3::dot(r3::transpose(inverse), r3::dot(r3::transpose(lattice_direction__), cart));
+                    auto value = coefficients[ig];
+                    for (int p = 0; p < count; p++) {
+                        auto const& d = covectors__[first + p];
+                        r3::vector<double> gradient({d[1], d[2], d[3]});
+                        auto displacement = point_directions__[first + p] -
+                                            r3::dot(lattice_direction__, unwrapped_fractional_points_[first + p]);
+                        double dphase = r3::dot(cart, displacement);
+                        auto raw      = std::complex<double>(d[0], -r3::dot(cart, gradient));
+                        value += (raw * std::complex<double>(-dlog_volume, -dphase) -
+                                  std::complex<double>(0, r3::dot(dg, gradient))) *
                                  std::conj(phase(p, g[0]) * phase(p, g[1]) * phase(p, g[2]));
                     }
                     coefficients[ig] = value;

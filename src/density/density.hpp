@@ -335,6 +335,11 @@ class Density : public Field4D
     void
     generate_pseudo_core_fields();
 
+    std::unique_ptr<Density>
+    lapw_density_matrix_fields_impl(K_point_set& ks__, std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                    std::vector<radial_basis_response_t> const* radial__,
+                                    xc_geometry_direction_t const* geometry__) const;
+
   public:
     /// External XC enables tau automatically; it can also be requested for orbital-field diagnostics.
     Density(Simulation_context& ctx__, bool kinetic_density__ = false);
@@ -473,6 +478,66 @@ class Density : public Field4D
      */
     std::vector<Flm>
     generate_mt_valence_kinetic_density(int ia__) const;
+
+    /// Replicated, unsymmetrized MT {rho, tau} variations per atom and spin.
+    /** Holds PW/LO coefficients and occupations fixed. Includes AW matching, radial functions
+     *  and the variational spin-unpolarized core response.
+     *  The interstitial response is zero. Geometry, radial grids and the free-atom reference stay fixed.
+     *  This is the basis contribution to a density response, not the self-consistent orbital response.
+     */
+    std::vector<std::array<std::vector<Flm>, 2>>
+    lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis_response_t> const& response__) const;
+
+    /// Unsymmetrized physical rho/tau response from matched LAPW orbital directions.
+    /** Directions use the ground-state PW/AW/LO layout, in local k-point order.
+     *  Geometry stays fixed. Optional radial responses add the
+     *  basis/matching and core contributions at fixed independent PW/LO coefficients.
+     *  Orbital directions must already use the unperturbed AW matching transformation.
+     *  Optional occupation directions have shape {num_bands, num_spins}, in local
+     *  k-point order, and include responses of currently unoccupied bands.
+     *  The returned signed fields are linear-response data, not an SCF density;
+     *  neither the input wave functions nor the ground-state fields are changed.
+     */
+    std::unique_ptr<Density>
+    lapw_orbital_fields_response(K_point_set& ks__, std::vector<wf::Wave_functions<double>*> const& directions__,
+                                 std::vector<radial_basis_response_t> const& radial__           = {},
+                                 std::vector<mdarray<double, 2>> const& occupation_directions__ = {}) const;
+
+    /// Unsymmetrized valence rho/tau from signed coefficient density matrices.
+    /** Matrices use the complete independent PW/LO ket/bra order, have shape
+     *  {gklo_basis_size, gklo_basis_size, num_spins}, and are replicated within
+     *  each k-point communicator in local k-point order. K-point weights are
+     *  applied here. The geometry, radial functions and AW matching remain fixed;
+     *  core fields and radial/matching responses must be supplied separately.
+     *  The ground-state fields and orbitals are not changed.
+     */
+    std::unique_ptr<Density>
+    lapw_density_matrix_fields(K_point_set& ks__,
+                               std::vector<mdarray<std::complex<double>, 3>> const& matrices__) const;
+
+    /// Radial/matching and core contribution at fixed independent PW/LO density matrices.
+    /** Returns only the field-map derivative, not the unperturbed fields. Geometry,
+     *  radial grids and coefficient matrices remain fixed. Matrix layout follows
+     *  lapw_density_matrix_fields; radial directions use atom-class order.
+     */
+    std::unique_ptr<Density>
+    lapw_density_matrix_radial_response(K_point_set& ks__,
+                                        std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                        std::vector<radial_basis_response_t> const& radial__) const;
+
+    /// Geometry contribution at fixed independent PW/LO density matrices and radial functions.
+    /** Returns only the field-map derivative. Includes cell normalization, the
+     *  reciprocal kinetic metric and AW matching. FFT fields use fixed fractional
+     *  coordinates; MT fields use fixed atom-local Cartesian coordinates and radii.
+     *  Moving sampling points, the interstitial mask and radial/core relaxation are
+     *  separate contributions. Directions are replicated over the context communicator
+     *  and contain independent Cartesian atom displacements and lattice-column changes.
+     *  Matrix layout follows lapw_density_matrix_fields. Ground-state data remain unchanged.
+     */
+    std::unique_ptr<Density>
+    lapw_density_matrix_geometry_response(K_point_set& ks__,
+                                          std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                          xc_geometry_direction_t const& direction__) const;
 
     /// PAW partial-wave valence tau from the current projector density matrix.
     /** Element 0 contains AE fields and element 1 pseudo fields, with the same

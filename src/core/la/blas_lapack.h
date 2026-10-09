@@ -513,6 +513,9 @@ void FORTRAN(sgesv)(ftn_int*            N,
                     ftn_int*            LDB,
                     ftn_int*            INFO);
 
+void FORTRAN(dgbsv)(ftn_int* N, ftn_int* KL, ftn_int* KU, ftn_int* NRHS, ftn_double* AB,
+                    ftn_int* LDAB, ftn_int* IPIV, ftn_double* B, ftn_int* LDB, ftn_int* INFO);
+
 void FORTRAN(dgesv)(ftn_int*            N,
                     ftn_int*            NRHS,
                     ftn_double*         A,
@@ -638,6 +641,14 @@ void FORTRAN(ssygvx)(ftn_int*            ITYPE,
                      ftn_len             JOBZ_len,
                      ftn_len             RANGE_len,
                      ftn_len             UPLO_len);
+
+void FORTRAN(dsbgvx)(ftn_char JOBZ, ftn_char RANGE, ftn_char UPLO, ftn_int* N,
+                     ftn_int* KA, ftn_int* KB, ftn_double* AB, ftn_int* LDAB,
+                     ftn_double* BB, ftn_int* LDBB, ftn_double* Q, ftn_int* LDQ,
+                     ftn_double* VL, ftn_double* VU, ftn_int* IL, ftn_int* IU,
+                     ftn_double* ABSTOL, ftn_int* M, ftn_double* W, ftn_double* Z,
+                     ftn_int* LDZ, ftn_double* WORK, ftn_int* IWORK, ftn_int* IFAIL,
+                     ftn_int* INFO, ftn_len JOBZ_len, ftn_len RANGE_len, ftn_len UPLO_len);
 
 void FORTRAN(dsygvx)(ftn_int*            ITYPE,
                      ftn_char            JOBZ,

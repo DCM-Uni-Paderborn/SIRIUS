@@ -56,12 +56,19 @@ class Spheric_kinetic_density_operator
     }
 
     double
-    radial_product(int i__, int j__, int L__, int ir__) const
+    radial_product(int i__, int j__, int L__, int ir__,
+                   Spheric_kinetic_density_operator const* response__ = nullptr) const
     {
         auto const& a = indexb_[i__];
         auto const& b = indexb_[j__];
         int l1 = a.am.l(), l2 = b.am.l();
         double angular = 0.5 * (l1 * (l1 + 1) + l2 * (l2 + 1) - L__ * (L__ + 1));
+        if (response__) {
+            return 0.5 * (derivative_(ir__, a.idxrf) * response__->derivative_(ir__, b.idxrf) +
+                          response__->derivative_(ir__, a.idxrf) * derivative_(ir__, b.idxrf) +
+                          angular * (angular_radial_(ir__, a.idxrf) * response__->angular_radial_(ir__, b.idxrf) +
+                                     response__->angular_radial_(ir__, a.idxrf) * angular_radial_(ir__, b.idxrf)));
+        }
         return 0.5 * (derivative_(ir__, a.idxrf) * derivative_(ir__, b.idxrf) +
                       angular * angular_radial_(ir__, a.idxrf) * angular_radial_(ir__, b.idxrf));
     }
@@ -160,11 +167,17 @@ class Spheric_kinetic_density_operator
     }
 
     /// Accumulate one spin component, with occupations already in the density matrix.
+    /** An optional radial response accumulates the variation at fixed density matrix instead. */
     void
     add_density(mdarray<std::complex<double>, 2> const& dm__,
-                Spheric_function<function_domain_t::spectral, double>& tau__) const
+                Spheric_function<function_domain_t::spectral, double>& tau__,
+                Spheric_kinetic_density_operator const* response__ = nullptr) const
     {
         check_field(tau__);
+        if (response__ && (&response__->indexb_ != &indexb_ || response__->grid_.hash() != grid_.hash() ||
+                           response__->lmmax_ != lmmax_)) {
+            RTE_THROW("atom-local kinetic density: incompatible radial response");
+        }
         if (dm__.size(0) != indexb_.size() || dm__.size(1) != indexb_.size()) {
             RTE_THROW("atom-local kinetic density: incompatible density matrix");
         }
@@ -173,7 +186,7 @@ class Spheric_kinetic_density_operator
                 for (auto const& g : gaunt_.gaunt_vector(indexb_[i].lm, indexb_[j].lm)) {
                     double w = (i == j ? 1 : 2) * std::real(dm__(i, j) * g.coef);
                     for (int ir = 0; ir < grid_.num_points(); ir++) {
-                        tau__(g.lm3, ir) += w * radial_product(i, j, g.l3, ir);
+                        tau__(g.lm3, ir) += w * radial_product(i, j, g.l3, ir, response__);
                     }
                 }
             }
@@ -211,18 +224,25 @@ class Spheric_kinetic_density_operator
     /** Use for derivatives returned by an atom-grid interpolation transpose.
      *  Unlike matrix_elements(), d_tau__ already contains the complete discrete
      *  energy weights. No radial integration, r^2 or occupation factor is added.
+     *  An optional response operator supplies changes of the radial functions and
+     *  their derivatives, returning the matrix variation at fixed covector.
      */
     mdarray<T, 2>
-    matrix_elements_from_derivatives(Spheric_function<function_domain_t::spectral, double> const& d_tau__) const
+    matrix_elements_from_derivatives(Spheric_function<function_domain_t::spectral, double> const& d_tau__,
+                                     Spheric_kinetic_density_operator const* response__ = nullptr) const
     {
         check_field(d_tau__);
+        if (response__ && (&response__->indexb_ != &indexb_ || response__->grid_.hash() != grid_.hash() ||
+                           response__->lmmax_ != lmmax_)) {
+            RTE_THROW("atom-local kinetic density: incompatible radial response");
+        }
         mdarray<T, 2> result({indexb_.size(), indexb_.size()});
         result.zero();
         for (int j = 0; j < indexb_.size(); j++) {
             for (int i = 0; i <= j; i++) {
                 for (auto const& g : gaunt_.gaunt_vector(indexb_[i].lm, indexb_[j].lm)) {
                     for (int ir = 0; ir < grid_.num_points(); ir++) {
-                        result(i, j) += d_tau__(g.lm3, ir) * g.coef * radial_product(i, j, g.l3, ir);
+                        result(i, j) += d_tau__(g.lm3, ir) * g.coef * radial_product(i, j, g.l3, ir, response__);
                     }
                 }
                 result(j, i) = sirius::conj(result(i, j));

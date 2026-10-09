@@ -14,6 +14,33 @@ module external_xc_test
     real(C_DOUBLE) :: centre(3) = [1.6d0, 2.7d0, 4.d0]
   end type
 contains
+  subroutine evaluate_response(user_data, nr, ns, nb, comm, coordinates, weights, descriptor_weights, &
+                               block_sizes, centres, rho, gradient, tau, delta_rho, delta_gradient, delta_tau, &
+                               drho, dgradient, dtau, status) bind(C)
+    type(C_PTR), value :: user_data
+    integer(C_INT), value :: nr, ns, nb, comm
+    integer(C_INT), intent(in) :: block_sizes(nb)
+    real(C_DOUBLE), intent(in) :: coordinates(3,nr), weights(nr), descriptor_weights(nr), centres(3,nb)
+    real(C_DOUBLE), intent(in) :: rho(nr,ns), gradient(nr,3,ns), tau(nr,ns), &
+                                delta_rho(nr,ns), delta_gradient(nr,3,ns), delta_tau(nr,ns)
+    real(C_DOUBLE), intent(out) :: drho(nr,ns), dgradient(nr,3,ns), dtau(nr,ns)
+    integer(C_INT), intent(out) :: status
+    integer :: s, ierr
+    real(C_DOUBLE) :: moment
+    moment = 0
+    do s = 1, ns
+      moment = moment + sum(descriptor_weights*delta_tau(:,s))
+    enddo
+    call MPI_ALLREDUCE(MPI_IN_PLACE, moment, 1, MPI_DOUBLE_PRECISION, MPI_SUM, comm, ierr)
+    do s = 1, ns
+      drho(:,s) = weights * (1.4d0*delta_rho(:,s) + 0.2d0*delta_tau(:,s))
+      dtau(:,s) = weights * (0.6d0*delta_tau(:,s) + 0.2d0*delta_rho(:,s)) + &
+                  0.4d0*descriptor_weights*moment/720.d0
+      dgradient(:,:,s) = 0.2d0*spread(weights,2,3)*delta_gradient(:,:,s)
+    enddo
+    status = 0
+  end subroutine
+
   subroutine evaluate_xc(user_data, nr, ns, dims, z_offset, context_comm, fft_comm, &
                          lattice, weight, rho, gradient, tau, energy, vrho, vgradient, vtau, status) bind(C)
     type(C_PTR), value :: user_data
@@ -237,6 +264,20 @@ program test_external_xc_api
       if (rank == 0) weights(1) = 0
       call sirius_set_xc_point_callback(ctx, C_FUNLOC(evaluate_points), C_LOC(state), nr, nb, coordinates, &
                                         weights, descriptor_weights, blocks, centres)
+      call sirius_set_xc_point_response_callback(ctx, C_FUNLOC(evaluate_response), C_LOC(state), error_code=ierr)
+      if (ierr /= 0) failures = failures + 1
+      call sirius_set_xc_response_tolerance(ctx, -1.d-6, error_code=ierr)
+      if (ierr == 0) failures = failures + 1
+      call sirius_set_xc_response_tolerance(ctx, 1.d0, error_code=ierr)
+      if (ierr == 0) failures = failures + 1
+      if (ranks > 1) then
+        call sirius_set_xc_response_tolerance(ctx, 1.d-8*(rank+1), error_code=ierr)
+        if (ierr == 0) failures = failures + 1
+      endif
+      call sirius_set_xc_response_tolerance(ctx, 1.d-8, error_code=ierr)
+      if (ierr /= 0) failures = failures + 1
+      call sirius_set_xc_point_response_callback(ctx, C_NULL_FUNPTR, C_NULL_PTR, error_code=ierr)
+      if (ierr /= 0) failures = failures + 1
       call sirius_set_xc_point_geometry_callbacks(ctx, C_FUNLOC(evaluate_geometry), C_FUNLOC(fixed_quadrature), &
                                                   C_LOC(state), error_code=ierr)
       if (ierr /= 0) failures = failures + 1
@@ -255,6 +296,10 @@ program test_external_xc_api
       deallocate(coordinates, weights, descriptor_weights, centres, blocks)
     endif
     call sirius_initialize_context(ctx)
+    call sirius_set_xc_response_tolerance(ctx, 1.d-6, error_code=ierr)
+    if (ierr == 0) failures = failures + 1
+    call sirius_set_xc_point_response_callback(ctx, C_FUNLOC(evaluate_response), C_LOC(state), error_code=ierr)
+    if (ierr == 0) failures = failures + 1
     call sirius_set_xc_callback(ctx, C_NULL_FUNPTR, C_NULL_PTR, error_code=ierr)
     if (ierr == 0) failures = failures + 1
     call sirius_set_xc_point_geometry_callbacks(ctx, C_NULL_FUNPTR, C_NULL_FUNPTR, C_NULL_PTR, error_code=ierr)

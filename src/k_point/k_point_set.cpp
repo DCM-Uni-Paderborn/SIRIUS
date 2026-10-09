@@ -575,6 +575,134 @@ K_point_set::find_band_occupancies()
     return ne_diff;
 }
 
+K_point_set::occupation_response_t
+K_point_set::band_occupation_response(std::vector<mdarray<double, 2>> const& energy_directions__) const
+{
+    int ns = ctx_.num_spins(), nb = ctx_.num_bands();
+    double ne       = ctx_.unit_cell().num_valence_electrons() - ctx_.cfg().parameters().extra_charge();
+    bool fixed_spin = ns == 2 && std::abs(ctx_.cfg().parameters().fixed_mag()) > 1e-10;
+    bool filled     = ns == 1 && std::abs(nb * ctx_.max_occupancy() - ne) < 1e-10;
+    std::array<double, 2> target{ne, ne};
+    double capacity = nb * ctx_.max_occupancy() * (fixed_spin ? 1 : ns);
+    if (fixed_spin) {
+        target = {(ne + ctx_.cfg().parameters().fixed_mag()) / 2, (ne - ctx_.cfg().parameters().fixed_mag()) / 2};
+    }
+    int invalid = !initialized_ || ctx_.num_mag_dims() == 3 || ctx_.cfg().parameters().precision_wf() != "fp64" ||
+                  static_cast<bool>(ctx_.band_occ_callback()) || !std::isfinite(ne) || ne < 0 ||
+                  (!filled && ne > nb * ns * ctx_.max_occupancy()) ||
+                  energy_directions__.size() != spl_num_kpoints_.local_size() ||
+                  (!filled && (!std::isfinite(ctx_.smearing_width()) || ctx_.smearing_width() <= 0));
+    if (fixed_spin) {
+        for (double count : target) {
+            invalid |= !std::isfinite(count) || count < 0 || count > capacity;
+        }
+    } else if (ns == 2) {
+        invalid |= energy_fermi_[0] != energy_fermi_[1];
+    }
+    for (int s = 0; s < ns; s++) {
+        invalid |= !std::isfinite(energy_fermi_[s]);
+    }
+    if (!invalid) {
+        size_t ik{0};
+        for (auto it : spl_num_kpoints_) {
+            auto const& d  = energy_directions__[ik++];
+            auto const& kp = *get<double>(it.i);
+            if (d.size(0) != nb || d.size(1) != ns || !d.on_host()) {
+                invalid = 1;
+                continue;
+            }
+            invalid |= !std::isfinite(kp.weight()) || kp.weight() < 0;
+            for (int s = 0; s < ns; s++) {
+                for (int b = 0; b < nb; b++) {
+                    invalid |= !std::isfinite(d(b, s)) || !std::isfinite(kp.band_energy(b, s)) ||
+                               !std::isfinite(kp.band_occupancy(b, s));
+                }
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("occupation response requires initialized scalar/collinear fp64 bands and finite energy directions");
+    }
+    auto f  = smearing::occupancy(ctx_.smearing(), ctx_.smearing_width());
+    auto df = smearing::delta(ctx_.smearing(), ctx_.smearing_width());
+    occupation_response_t result;
+    result.fermi.fill(0);
+    std::array<double, 8> sums{};
+    size_t ik{0};
+    for (auto it : spl_num_kpoints_) {
+        auto const& d  = energy_directions__[ik++];
+        auto const& kp = *get<double>(it.i);
+        std::vector<double> reference(d.at(memory_t::host), d.at(memory_t::host) + d.size());
+        kp.comm().bcast(reference.data(), reference.size(), 0);
+        for (size_t i = 0; i < d.size(); i++) {
+            invalid |= std::abs(d[i] - reference[i]) > 1e-12 * std::max(1.0, std::abs(reference[i]));
+        }
+        result.slopes.emplace_back(std::array<index_range, 2>{nb, ns});
+        auto& slopes  = result.slopes.back();
+        double weight = kp.weight() / kp.comm().size();
+        for (int s = 0; s < ns; s++) {
+            int channel   = fixed_spin ? s : 0;
+            bool constant = filled || target[channel] == 0 || target[channel] == capacity;
+            for (int b = 0; b < nb; b++) {
+                double x = energy_fermi_[s] - kp.band_energy(b, s);
+                double expected =
+                        constant ? (target[channel] == 0 ? 0 : ctx_.max_occupancy()) : ctx_.max_occupancy() * f(x);
+                slopes(b, s) = constant ? 0 : -ctx_.max_occupancy() * df(x);
+                invalid |= !std::isfinite(slopes(b, s)) ||
+                           std::abs(expected - kp.band_occupancy(b, s)) > 1e-11 * ctx_.max_occupancy();
+                sums[channel] += weight * slopes(b, s);
+                sums[2 + channel] += weight * slopes(b, s) * d(b, s);
+                sums[4 + channel] += weight * std::abs(slopes(b, s));
+                sums[6 + channel] += weight * kp.band_occupancy(b, s);
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("occupation response requires consistent band populations and k-point replicas");
+    }
+    ctx_.comm().allreduce(sums.data(), sums.size());
+    for (int channel = 0; channel < (fixed_spin ? 2 : 1); channel++) {
+        for (int row : {0, 2, 4, 6}) {
+            invalid |= !std::isfinite(sums[row + channel]);
+        }
+        if (sums[4 + channel] != 0) {
+            invalid |= std::abs(sums[channel]) <= 64 * std::numeric_limits<double>::epsilon() * sums[4 + channel];
+            result.fermi[channel] = sums[2 + channel] / sums[channel];
+            invalid |= !std::isfinite(result.fermi[channel]);
+        }
+    }
+    double tolerance = 1e-10 * std::max(1.0, ne);
+    invalid |= std::abs(sums[6] + sums[7] - ne) > tolerance;
+    if (fixed_spin) {
+        invalid |= std::abs(sums[6] - sums[7] - ctx_.cfg().parameters().fixed_mag()) > tolerance;
+    }
+    if (invalid) {
+        RTE_THROW("singular or nonfinite chemical-potential response for the prescribed band populations");
+    }
+    if (!fixed_spin) {
+        result.fermi[1] = result.fermi[0];
+    }
+    ik = 0;
+    for (auto const& d : energy_directions__) {
+        auto const& slopes = result.slopes[ik++];
+        result.occupations.emplace_back(std::array<index_range, 2>{nb, ns});
+        auto& response = result.occupations.back();
+        for (int s = 0; s < ns; s++) {
+            for (int b = 0; b < nb; b++) {
+                response(b, s) = slopes(b, s) * (d(b, s) - result.fermi[s]);
+                invalid |= !std::isfinite(response(b, s));
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("nonfinite occupation response");
+    }
+    return result;
+}
+
 template double
 K_point_set::find_band_occupancies<double>();
 #if defined(SIRIUS_USE_FP32)

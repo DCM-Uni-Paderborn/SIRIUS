@@ -77,6 +77,9 @@ class Potential : public Field4D
     void
     xc_lapw_meta(Density const& density__);
 
+    std::vector<std::array<std::vector<double>, 2>>
+    project_core_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const;
+
     /// Local part of pseudopotential.
     std::unique_ptr<Smooth_periodic_function<double>> local_potential_;
 
@@ -207,12 +210,17 @@ class Potential : public Field4D
 
     /// Compute MT part of the potential and MT multipole moments
     mdarray<std::complex<double>, 2>
-    poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__) const;
+    poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__,
+                Spheric_function_set<double, atom_index_t>& vha_mt__, bool include_nuclei__) const;
+
+    void
+    poisson_solve(Periodic_function<double> const& rho__, Periodic_function<double>& vha__,
+                  bool include_nuclei__) const;
 
     /// Add contribution from the pseudocharge to the plane-wave expansion
     void
-    poisson_add_pseudo_pw(mdarray<std::complex<double>, 2>& qmt__, mdarray<std::complex<double>, 2>& qit__,
-                          std::complex<double>* rho_pw__);
+    poisson_add_pseudo_pw(mdarray<std::complex<double>, 2> const& qmt__, mdarray<std::complex<double>, 2> const& qit__,
+                          std::complex<double>* rho_pw__) const;
 
     /// Generate local part of pseudo potential.
     /** Total local potential is a lattice sum:
@@ -317,6 +325,64 @@ class Potential : public Field4D
     xc_rg_magnetic(Density const& density__, bool use_lapl, const bool calculate_vdw_stress__);
 
   public:
+    /// Apply the external Hessian to independent point fields and optional quadrature directions.
+    /** Returns raw covectors, not the derivative of the field-sampling adjoint. */
+    void
+    external_xc_point_response(xc_callback_input_t const& input__, xc_callback_direction_t const& direction__,
+                               xc_callback_response_t& output__) const;
+
+    /// Finite-difference check of all seven independent point-input Hessian blocks.
+    std::array<double, 2>
+    check_external_xc_point_hessian(Density const& density__, double step__) const;
+
+    /// Fixed-geometry LAPW XC covector response to physical rho/tau field variations.
+    /** Applies the external XC Hessian and the discrete field-map adjoint.
+     *  The direction uses total/magnetization fields like Density, including
+     *  any core response. Neither density nor potential state is modified.
+     */
+    lapw_xc_field_adjoint_t
+    lapw_external_xc_response(Density const& density__, Density const& density_response__) const;
+
+    /// Host quadrature tangent for independent, replicated Cartesian atom/cell directions.
+    xc_point_derivatives_t
+    external_xc_quadrature_direction(xc_geometry_direction_t const& direction__) const;
+
+    /// XC geometry contribution using the registered host quadrature tangent.
+    /** Physical fields and radial rules remain fixed; not a complete host geometry RHS. */
+    lapw_xc_field_adjoint_t
+    lapw_external_xc_geometry_response(Density const& density__, xc_geometry_direction_t const& direction__) const;
+
+    /// Geometry-induced XC covector response with the physical fields held fixed.
+    /** Combines the model Hessian with forward sampling and its differentiated
+     *  transpose. Point/weight/block directions and replicated Cartesian atom/cell
+     *  directions are independent. Radial grids, MT radii and domain membership
+     *  are fixed. The model must expose explicit geometry dependence through its
+     *  point inputs, not hidden context terms. Nuclear, basis and boundary
+     *  responses belong to the host solve.
+     */
+    lapw_xc_field_adjoint_t
+    lapw_external_xc_geometry_response(Density const& density__, xc_point_derivatives_t const& quadrature_direction__,
+                                       mdarray<double, 2> const& atom_directions__,
+                                       r3::matrix<double> const& lattice_direction__) const;
+
+    /// Radial-solver potential directions induced by physical rho/tau variations.
+    /** Returns the spherical Hartree response and raw core XC covector response
+     *  in atom-class order, using the same projection as update_atomic_potential().
+     *  Geometry and nuclear potentials are fixed. This applies the response kernel,
+     *  but does not solve the self-consistent orbital/radial response equations.
+     */
+    void
+    lapw_radial_potential_response(Density const& density__, Density const& density_response__,
+                                   std::vector<std::vector<double>>& scalar__,
+                                   std::vector<std::array<std::vector<double>, 2>>& xc__) const;
+
+    /// Reuse already computed Hartree/XC directions in the coupled LAPW response.
+    void
+    lapw_radial_potential_response(Periodic_function<double> const& hartree__,
+                                   lapw_xc_field_adjoint_t const& derivatives__,
+                                   std::vector<std::vector<double>>& scalar__,
+                                   std::vector<std::array<std::vector<double>, 2>>& xc__) const;
+
     /// Explicit XC geometry response at fixed electronic coefficients and radial fields.
     /** Includes model coordinates and host quadrature. Basis/projector, MT-boundary
      *  and orbital-normalization responses must still be supplied by force/stress assembly.
@@ -335,7 +401,7 @@ class Potential : public Field4D
     template <bool free_atom, typename T>
     std::vector<T>
     poisson_vmt(Atom const& atom__, Spheric_function<function_domain_t::spectral, T> const& rho_mt__,
-                Spheric_function<function_domain_t::spectral, T>& vha_mt__) const
+                Spheric_function<function_domain_t::spectral, T>& vha_mt__, bool include_nuclei__ = true) const
     {
         const bool use_r_prefact{false};
 
@@ -406,7 +472,7 @@ class Potential : public Field4D
                 }
             }
         }
-        if (!free_atom) {
+        if (!free_atom && include_nuclei__) {
             /* contribution from nuclear potential -z*(1/r - 1/R) */
             for (int ir = 0; ir < nmtp; ir++) {
 #ifdef __VHA_AUX
@@ -418,7 +484,9 @@ class Potential : public Field4D
             }
         }
         /* nuclear multipole moment */
-        qmt[0] -= atom__.zn() * y00;
+        if (include_nuclei__) {
+            qmt[0] -= atom__.zn() * y00;
+        }
 
         return qmt;
     }
@@ -558,6 +626,27 @@ class Potential : public Field4D
      */
     void
     poisson(Periodic_function<double> const& rho);
+
+    /// Hartree potential response to a spin-summed density variation at fixed geometry.
+    /** Uses the production Poisson operator and its zero-G gauge, without nuclear terms.
+     *  The input supplies Fourier coefficients and, for LAPW, physical MT density samples
+     *  on the owning ranks. The result has distributed MT storage and both Fourier and
+     *  real-space grid values. No density, potential, or energy state is changed.
+     *  PAW callers must include the smooth augmentation-charge response in the input
+     *  and handle atom-local PAW corrections separately.
+     */
+    std::unique_ptr<Periodic_function<double>>
+    hartree_response(Periodic_function<double> const& density_response__) const;
+
+    /// LAPW Poisson-operator geometry derivative at fixed Fourier and atom-local density coefficients.
+    /** Includes reciprocal metric, moving multipoles and sphere boundary values, with fixed MT radii.
+     *  Atom displacements are Cartesian and independent of lattice-column changes. Directions and the
+     *  nuclear-term flag are context-replicated. Uses CPU fields and preserves potential/energy state.
+     *  Add hartree_response for the separate density variation; the zero-G gauge is unchanged.
+     */
+    std::unique_ptr<Periodic_function<double>>
+    hartree_geometry_response(Periodic_function<double> const& density__, xc_geometry_direction_t const& direction__,
+                              bool include_nuclei__ = true) const;
 
     /// Generate XC potential and energy density
     /** In case of spin-unpolarized GGA the XC potential has the following expression:
@@ -815,6 +904,10 @@ class Potential : public Field4D
     {
         return bool(kinetic_potential_);
     }
+
+    /// Collectively validate the discrete LAPW XC field layout without staging it.
+    void
+    validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const;
 
     /// Stage discrete LAPW XC derivatives for a fixed-potential Hamiltonian build.
     /** Supplying the corresponding functional energy also enables energy contractions.

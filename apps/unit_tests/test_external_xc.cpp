@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include "dft/dft_ground_state.hpp"
+#include "dft/energy.hpp"
 #include "density/paw_xc_reconstruction.hpp"
 #include "hamiltonian/hamiltonian.hpp"
 
@@ -236,7 +237,12 @@ test_point_geometry(Simulation_context& ctx, Density const& density, Potential& 
         c.comm().allreduce(out.lattice.data(), 9);
     };
     int failures{0};
-    Test_check check(failures, ctx.comm());
+    auto check = [&](char const* name, double error, double tolerance) {
+        if (ctx.comm().rank() == 0) {
+            std::cout << name << ": " << error << '\n';
+        }
+        failures += !std::isfinite(error) || error > tolerance;
+    };
     auto rho_hash       = density.rho().rg().hash_f_pw();
     auto potential_hash = potential.effective_potential().rg().hash_f_pw();
     auto derivative     = potential.external_xc_geometry(density);
@@ -290,7 +296,16 @@ test_point_geometry(Simulation_context& ctx, Density const& density, Potential& 
     ctx.unit_cell().atom(0).set_position(fractional);
     ctx.gvec_sptr()->lattice_vectors(reciprocal);
     ctx.cb().external_xc_points_ = original;
-    auto geometry_callback       = ctx.cb().external_xc_geometry_;
+    auto reject                  = [&](char const* name) {
+        bool rejected{false};
+        try {
+            potential.external_xc_geometry(density);
+        } catch (std::exception const&) {
+            rejected = true;
+        }
+        check(name, rejected ? 0 : 1, 0);
+    };
+    auto geometry_callback = ctx.cb().external_xc_geometry_;
     for (bool nonfinite : {false, true}) {
         ctx.cb().external_xc_geometry_ = [&](auto const& c, auto const& in, auto& out) {
             geometry_callback(c, in, out);
@@ -302,8 +317,7 @@ test_point_geometry(Simulation_context& ctx, Density const& density, Potential& 
                 }
             }
         };
-        check.reject("collective invalid geometry callback rejection",
-                     [&] { potential.external_xc_geometry(density); });
+        reject("collective invalid geometry callback rejection");
     }
     ctx.cb().external_xc_geometry_ = geometry_callback;
     auto pullback                  = ctx.cb().external_xc_pullback_;
@@ -313,14 +327,13 @@ test_point_geometry(Simulation_context& ctx, Density const& density, Potential& 
             out.atoms.pop_back();
         }
     };
-    check.reject("collective invalid quadrature pullback rejection", [&] { potential.external_xc_geometry(density); });
+    reject("collective invalid quadrature pullback rejection");
     if (ctx.comm().size() > 1) {
         ctx.cb().external_xc_pullback_ = [&](auto const& c, auto const& q, auto const& d, auto& out) {
             pullback(c, q, d, out);
             out.lattice[0] += c.comm().rank();
         };
-        check.reject("collective unreduced quadrature pullback rejection",
-                     [&] { potential.external_xc_geometry(density); });
+        reject("collective unreduced quadrature pullback rejection");
     }
     ctx.cb().external_xc_geometry_ = nullptr;
     ctx.cb().external_xc_pullback_ = nullptr;
@@ -425,6 +438,24 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
                      "gamma=" + std::to_string(gamma) + " mag=" + std::to_string(mag) +
                              " parallel FFT=" + std::to_string(parallel_fft) + " points=" + std::to_string(points) +
                              " PAW=" + std::to_string(paw));
+    {
+        double saved_energy = potential.energy_vha();
+        auto response       = potential.hartree_response(density.rho());
+        double error{0};
+        for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+            double g      = ctx->gvec().gvec_len(gvec_index_t::local(ig));
+            auto expected = g == 0 ? std::complex<double>{0} : fourpi * density.rho().rg().f_pw_local(ig) / (g * g);
+            error         = std::max(error, std::abs(response->rg().f_pw_local(ig) - expected));
+            error         = std::max(
+                    error, std::abs(response->rg().f_pw_local(ig) - potential.hartree_potential().rg().f_pw_local(ig)));
+        }
+        for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+            error = std::max(error, std::abs(response->rg().value(ir) - potential.hartree_potential().rg().value(ir)));
+        }
+        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+        check("smooth Hartree response and zero-G gauge", error, 2e-13);
+        check("Hartree response preserves energy", std::abs(potential.energy_vha() - saved_energy), 0);
+    }
     if (paw) {
         auto const& coordinates = ctx->cb().external_xc_points_->coordinates;
         int np                  = static_cast<int>(coordinates.size());
@@ -912,28 +943,59 @@ test_occupancy(int mag, std::string smearing, double electrons, double moment = 
 }
 
 int
+test_dispersion_energy()
+{
+    std::map<std::string, double> energies{{"ekin", 11},
+                                           {"exc", 13},
+                                           {"vha", 17},
+                                           {"enuc", 19},
+                                           {"valence_eval_sum", 23},
+                                           {"vxc", 29},
+                                           {"bxc", 31},
+                                           {"PAW_one_elec", 37},
+                                           {"PAW_total_energy", 41},
+                                           {"ewald", 43},
+                                           {"vtau", 47},
+                                           {"dftd3_energy", -0.3},
+                                           {"dftd4_energy", -0.4}};
+    int failures{0};
+    for (bool full_potential : {false, true}) {
+        for (int corrections = 0; corrections < 4; corrections++) {
+            auto config = R"({"parameters":{"electronic_structure_method":"pseudopotential"},
+                             "control":{"processing_unit":"CPU"}})"_json;
+            config["parameters"]["electronic_structure_method"] =
+                    full_potential ? "full_potential_lapwlo" : "pseudopotential";
+            config["parameters"]["dftd3_correction"] = bool(corrections & 1);
+            config["parameters"]["dftd4_correction"] = bool(corrections & 2);
+            Simulation_context ctx(config);
+            ctx.electronic_structure_method(full_potential ? "full_potential_lapwlo" : "pseudopotential");
+            double expected =
+                    (full_potential ? 51.5 : -32.5) - ((corrections & 1) ? 0.3 : 0) - ((corrections & 2) ? 0.4 : 0);
+            double actual = ks_energy(ctx, energies);
+            failures += !std::isfinite(actual) || std::abs(actual - expected) > 1e-13;
+        }
+    }
+    return failures;
+}
+
+int
 main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
-    auto geometry = [&](bool strain) {
-        result += call_test(strain ? "external PW stress" : "external PW forces", test_external_geometry, false, 0,
-                            strain, strain);
-        result += call_test(strain ? "external PAW stress" : "external PAW forces", test_external_geometry, true, 1,
-                            strain, false);
-    };
-    if (argc == 2 &&
-        (std::string(argv[1]) == "forces" || std::string(argv[1]) == "stress" || std::string(argv[1]) == "geometry")) {
-        auto mode = std::string(argv[1]);
-        if (mode != "stress") {
-            geometry(false);
-        }
-        if (mode != "forces") {
-            geometry(true);
-        }
+    if (argc == 2 && std::string(argv[1]) == "forces") {
+        result += call_test("external PW forces", test_external_geometry, false, 0, false, false);
+        result += call_test("external PAW forces", test_external_geometry, true, 1, false, false);
         sirius::finalize();
         return std::min(result, 1);
     }
+    if (argc == 2 && std::string(argv[1]) == "stress") {
+        result += call_test("external PW stress", test_external_geometry, false, 0, true, true);
+        result += call_test("external PAW stress", test_external_geometry, true, 1, true, false);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    result += call_test("dispersion energy accounting", test_dispersion_energy);
     for (auto smearing : {"gaussian", "fermi_dirac", "cold", "methfessel_paxton"}) {
         result += call_test("low-filling occupations", test_occupancy, 0, smearing, 1.0, 0.0);
         result += call_test("high-filling spin occupations", test_occupancy, 1, smearing, 7.0, 0.0);
@@ -965,6 +1027,10 @@ main(int argc, char** argv)
     for (bool exact : {false, true}) {
         result += call_test("PAW SCF energy accounting", test_external_scf, exact, true, true);
     }
+    result += call_test("external PW forces", test_external_geometry, false, 0, false, false);
+    result += call_test("external PAW forces", test_external_geometry, true, 1, false, false);
+    result += call_test("external PW stress", test_external_geometry, false, 0, true, true);
+    result += call_test("external PAW stress", test_external_geometry, true, 1, true, false);
     for (double moment : {2.0, -2.0, 1.2}) {
         result += call_test("fixed-spin occupations", test_occupancy, 1, "gaussian", 2.0, moment);
     }

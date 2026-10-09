@@ -78,13 +78,23 @@ set_tests_properties(test_external_xc_geometry PROPERTIES
 add_test(NAME test_lapw_external_xc_core COMMAND test_lapw_external_xc core)
 set_tests_properties(test_lapw_external_xc_core PROPERTIES
   TIMEOUT 240 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+set_tests_properties(test_lapw_external_xc PROPERTIES TIMEOUT 120)
+add_test(NAME test_lapw_external_xc_force COMMAND test_lapw_external_xc force-response)
+set_tests_properties(test_lapw_external_xc_force PROPERTIES
+  TIMEOUT 600 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+add_test(NAME test_lapw_external_xc_cell COMMAND test_lapw_external_xc cell-response 0)
+set_tests_properties(test_lapw_external_xc_cell PROPERTIES
+  TIMEOUT 300 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 if(MPIEXEC_EXECUTABLE)
   add_mpi_unit_test(test_external_xc_geometry_mpi test_external_xc 180 geometry)
+  add_mpi_unit_test(test_lapw_external_xc_core_cell_mpi test_lapw_external_xc 600 core-cell 1)
+  add_mpi_unit_test(test_lapw_external_xc_core_force_mpi test_lapw_external_xc 600 core-force 9.0 1)
   add_mpi_unit_test(test_lapw_external_xc_core_mpi test_lapw_external_xc 240 core)
   add_mpi_unit_test(test_paw_xc_correction_h_setup_mpi test_paw_xc_correction 60 "${h_paw_setup}")
   foreach(name test_kinetic_density test_smooth_periodic_sampling test_paw_xc_correction test_lapw_xc_field_map test_lapw_external_xc test_core_kinetic_density test_external_xc)
     add_mpi_unit_test(${name}_mpi ${name} 60)
   endforeach()
+  set_tests_properties(test_lapw_external_xc_mpi PROPERTIES TIMEOUT 120)
 endif()
 
 if(SIRIUS_CREATE_FORTRAN_BINDINGS)

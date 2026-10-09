@@ -29,6 +29,27 @@ class Atom;
 class Simulation_context;
 class Potential;
 class Unit_cell;
+class K_point_set;
+struct radial_basis_response_t;
+struct lapw_xc_field_adjoint_t;
+struct xc_geometry_direction_t;
+template <typename T>
+class Periodic_function;
+
+/// Hartree and XC matrix response at fixed geometry and radial basis.
+struct lapw_hamiltonian_response_t
+{
+    Simulation_context const* context{nullptr};
+    mdarray<std::complex<double>, 2> scalar_pw, kinetic_pw;
+    std::vector<mdarray<std::complex<double>, 3>> local;
+};
+
+/// Atom-local radial-basis derivatives and the unperturbed overlap, in AW/LO order.
+struct lapw_atom_basis_response_t
+{
+    mdarray<std::complex<double>, 3> h;
+    mdarray<double, 2> o, overlap;
+};
 template <typename T>
 class Local_operator;
 template <typename T>
@@ -54,6 +75,108 @@ class Gaunt_coefficients;
 /* forward declaration */
 template <typename T>
 class Hamiltonian_k;
+template <typename T>
+class Hamiltonian0;
+
+/// Complete frozen-basis LAPW spectrum and its generalized density-matrix response.
+/** Uses every PW/LO eigenvector, not only the stored bands. Occupations and their
+ *  energy derivatives are supplied explicitly for this spectrum. All calls are
+ *  collective on the k-point communicator and leave the ground state unchanged.
+ */
+class LAPW_eigensystem
+{
+  private:
+    Simulation_context& ctx_;
+    K_point<double>& kp_;
+    mdarray<std::complex<double>, 2> vectors_, overlap_;
+    std::vector<double> energies_;
+
+    void
+    validate_matrix(la::dmatrix<std::complex<double>> const& matrix__) const;
+
+    void
+    validate_occupations(std::vector<double> const& occupations__) const;
+
+  public:
+    struct perturbation_t
+    {
+        LAPW_eigensystem const* reference{nullptr};
+        mdarray<std::complex<double>, 2> h, s;
+        std::vector<double> energies;
+    };
+
+    LAPW_eigensystem(Hamiltonian_k<double> const& hk__, la::dmatrix<std::complex<double>> const& h__,
+                     la::dmatrix<std::complex<double>> const& s__);
+    LAPW_eigensystem(LAPW_eigensystem const&) = delete;
+    LAPW_eigensystem&
+    operator=(LAPW_eigensystem const&) = delete;
+
+    auto const&
+    energies() const
+    {
+        return energies_;
+    }
+
+    auto const&
+    overlap() const
+    {
+        return overlap_;
+    }
+
+    /// Transform dH/dS and compute energy directions without changing the eigenvectors.
+    perturbation_t
+    perturbation(la::dmatrix<std::complex<double>> const& h__, la::dmatrix<std::complex<double>> const& s__) const;
+
+    /// Coefficient density matrix C f C^H in independent PW/LO order.
+    mdarray<std::complex<double>, 2>
+    density_matrix(std::vector<double> const& occupations__) const;
+
+    /// Includes the generalized-overlap response and the degenerate spectral limit.
+    /** Slopes are df/de, not df/dmu. mu_response__ is shared by the relevant
+     *  charge/spin population and must be determined across k-points by the caller.
+     */
+    mdarray<std::complex<double>, 2>
+    density_matrix_response(perturbation_t const& direction__, std::vector<double> const& occupations__,
+                            std::vector<double> const& slopes__, double mu_response__ = 0) const;
+};
+
+/// Frozen LAPW density response with charge/spin constraints shared across k-points.
+/** Caches the complete spectra once. The stored bands must describe the same
+ *  Hamiltonian and remain unchanged during response calls. Returned matrices use
+ *  independent PW/LO order and can be mapped to rho/tau with
+ *  Density::lapw_density_matrix_fields. Radial-basis and geometry derivatives of
+ *  that field map are separate contributions. All calls are context-collective.
+ */
+class LAPW_density_response
+{
+  private:
+    K_point_set& ks_;
+    std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra_;
+    std::vector<mdarray<double, 2>> bands_, occupations_;
+    std::array<double, 2> fermi_;
+    double width_, moment_, charge_;
+    int smearing_;
+
+    void
+    validate_reference() const;
+
+  public:
+    struct matrix_direction_t
+    {
+        std::array<la::dmatrix<std::complex<double>> const*, 2> h{}, s{};
+    };
+
+    LAPW_density_response(Hamiltonian0<double> const& h0__, K_point_set& ks__);
+
+    /// Frozen valence density matrices, in local-k-point order, with spin as the last dimension.
+    std::vector<mdarray<std::complex<double>, 3>>
+    density_matrices() const;
+
+    /// Full occupied/virtual response, including overlap and global occupation derivatives.
+    /** Optionally return the collectively summed smearing free-energy derivative. */
+    std::vector<mdarray<std::complex<double>, 3>>
+    density_matrix_response(std::vector<matrix_direction_t> const& directions__, double* entropy__ = nullptr) const;
+};
 
 /// Represent the k-point independent part of Hamiltonian.
 /** \tparam T   Precision of the wave-functions (float or double).
@@ -208,6 +331,16 @@ class Hamiltonian0
 
     void
     generate_pw_coefs(Potential const& potential__);
+
+    /// Build atom-local dH/dS at fixed geometry and physical fields, without updating radial integrals.
+    /// Collective on the context communicator, before looping over locally owned k-points.
+    std::vector<lapw_atom_basis_response_t>
+    lapw_radial_basis_response(std::vector<radial_basis_response_t> const& response__) const;
+
+    /// Prepare the Hartree/XC field contribution to dH without changing any ground-state fields.
+    /// Collective on the context communicator, before looping over locally owned k-points.
+    lapw_hamiltonian_response_t
+    lapw_field_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__) const;
 };
 
 template <typename T>
@@ -223,6 +356,10 @@ class Hamiltonian_k
     /// Hubbard correction.
     /** In general case it is a k-dependent matrix */
     std::shared_ptr<U_operator<T>> u_op_;
+
+    /// Frozen matching transformation from independent PW/LO to atom AW/LO coefficients.
+    void
+    lapw_basis_coefficients(int ia__, mdarray<std::complex<T>, 2>& row__, mdarray<std::complex<T>, 2>& col__) const;
 
     /// Copy constructor is forbidden.
     Hamiltonian_k(Hamiltonian_k<T> const& src__) = delete;
@@ -479,6 +616,30 @@ class Hamiltonian_k
      */
     void
     set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Radial-basis response of the complete PW/LO matrices, including AW matching.
+    /** Atom-local derivatives are prepared once by H0().lapw_radial_basis_response().
+     *  The interstitial domain, physical potentials and independent PW/LO coefficients stay fixed.
+     *  Collective on the k-point communicator.
+     */
+    void
+    set_fv_h_o_radial_response(int ispn__, std::vector<radial_basis_response_t> const& response__,
+                               std::vector<lapw_atom_basis_response_t> const& atoms__,
+                               la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Basis, interstitial boundary and kinetic-metric contribution to the PW/LO geometry response.
+    /** Radial functions, MT radii, local matrices and potential Fourier covectors stay fixed.
+     *  Physical-field derivatives are separate. Collective on the k-point communicator.
+     */
+    void
+    set_fv_h_o_geometry_response(int ispn__, xc_geometry_direction_t const& direction__,
+                                 la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Hartree/XC field contribution to the complete PW/LO dH, at fixed basis and geometry.
+    /// Collective on the k-point communicator. The overlap has no field contribution.
+    void
+    set_fv_h_field_response(int ispn__, lapw_hamiltonian_response_t const& response__,
+                            la::dmatrix<std::complex<T>>& h__) const;
 
     /// Add interstitial contribution to apw-apw block of Hamiltonian and overlap.
     void

@@ -101,7 +101,7 @@ class Force
 
     void
     add_ibs_force(K_point<double>* kp__, Hamiltonian_k<double>& Hk__, mdarray<double, 2>& ffac__,
-                  mdarray<double, 2>& forcek__) const;
+                  mdarray<double, 2>& forcek__, int ispn__) const;
 
   public:
     Force(Simulation_context& ctx__, Density& density__, Potential& potential__, K_point_set& kset__);

@@ -85,6 +85,19 @@ struct xc_geometry_derivatives_t
     }
 };
 
+/// Replicated Cartesian atom and lattice-column directions, in bohr.
+/** Atom and cell directions are independent; no affine atom displacement is implied. */
+struct xc_geometry_direction_t
+{
+    std::vector<std::array<double, 3>> atoms;
+    std::array<double, 9> lattice{};
+
+    explicit xc_geometry_direction_t(int num_atoms__)
+        : atoms(num_atoms__)
+    {
+    }
+};
+
 /// Total XC energy and primitive-field derivatives.
 /** energy is the same globally reduced energy on every context rank.
  *  For the FFT callback, derivatives are divided by the grid quadrature weight.
@@ -111,9 +124,41 @@ struct xc_callback_output_t
 /** Register before constructing Density/Potential and keep it fixed during SCF. */
 using xc_callback_t = std::function<void(Simulation_context const&, xc_callback_input_t const&, xc_callback_output_t&)>;
 
+/// Independent input direction, with the shapes and spin convention of the base input.
+struct xc_callback_direction_t
+{
+    double const* rho;
+    double const* gradient;
+    double const* tau;
+    /// Optional quadrature direction; absent means fixed points, weights and block centres.
+    xc_point_derivatives_t const* geometry{nullptr};
+};
+
+/// Directional derivatives of the XC covectors.
+/** Return the Hessian of the entire discrete energy applied to the direction.
+ *  Point callbacks return raw covectors, including nonlocal coupling between
+ *  all points, spins and ranks. No gradient adjoint or tau operator is applied
+ *  here. Outputs are initialized to zero by the caller.
+ */
+struct xc_callback_response_t
+{
+    double* vrho;
+    double* vgradient;
+    double* vtau;
+    /// Optional raw quadrature-covector response, with no sampling or geometry pullback.
+    xc_point_derivatives_t* geometry{nullptr};
+};
+
+using xc_response_callback_t = std::function<void(Simulation_context const&, xc_callback_input_t const&,
+                                                  xc_callback_direction_t const&, xc_callback_response_t&)>;
+
 /// Pull back local point covectors, including field sampling, to replicated atom/cell derivatives.
 using xc_quadrature_pullback_t = std::function<void(Simulation_context const&, xc_point_set_t const&,
                                                     xc_point_derivatives_t const&, xc_geometry_derivatives_t&)>;
+
+/// Differentiate the host's distributed quadrature at fixed row topology and radial/angular rules.
+using xc_quadrature_direction_callback_t = std::function<void(Simulation_context const&, xc_point_set_t const&,
+                                                              xc_geometry_direction_t const&, xc_point_derivatives_t&)>;
 
 void
 validate_external_xc_context(Simulation_context const& ctx__);

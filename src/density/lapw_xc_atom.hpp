@@ -6,6 +6,7 @@
 #ifndef __LAPW_XC_ATOM_HPP__
 #define __LAPW_XC_ATOM_HPP__
 
+#include <memory>
 #include "function3d/kinetic_density.hpp"
 #include "unit_cell/atom.hpp"
 
@@ -43,6 +44,37 @@ class LAPW_xc_atom
         return result;
     }
 
+    std::unique_ptr<Spheric_kinetic_density_operator<std::complex<double>>>
+    kinetic_response(radial_basis_response_t const* response__) const
+    {
+        if (!response__) {
+            return nullptr;
+        }
+        auto const& rf = response__->radial_functions;
+        if (rf.size(0) != type_.num_mt_points() || rf.size(1) != type_.indexr().size() || rf.size(2) != 2) {
+            RTE_THROW("LAPW XC atom: incompatible radial response");
+        }
+        mdarray<double, 2> radial({rf.size(0), rf.size(1)}), derivative({rf.size(0), rf.size(1)});
+        for (int i = 0; i < type_.indexr().size(); i++) {
+            for (int ir = 0; ir < type_.num_mt_points(); ir++) {
+                radial(ir, i)     = rf(ir, i, 0);
+                derivative(ir, i) = rf(ir, i, 1) / type_.radial_grid(ir);
+            }
+        }
+        return std::make_unique<Spheric_kinetic_density_operator<std::complex<double>>>(
+                type_.radial_grid(), type_.indexb(), radial, sf::lmax(lmmax_), radial_wave_function_t::R,
+                std::vector<int>{}, derivative);
+    }
+
+    double
+    radial_product(int ir, int i, int j, radial_basis_response_t const* response) const
+    {
+        int a = type_.indexb(i).idxrf, b = type_.indexb(j).idxrf;
+        return response ? response->radial_functions(ir, a, 0) * radial_(ir, b) +
+                                  radial_(ir, a) * response->radial_functions(ir, b, 0)
+                        : radial_(ir, a) * radial_(ir, b);
+    }
+
   public:
     LAPW_xc_atom(Atom const& atom__, int lmax__)
         : type_(atom__.type())
@@ -55,8 +87,9 @@ class LAPW_xc_atom
     }
 
     /// Return {rho, tau} per spin, with D_ij = sum_n f_n conj(c_ni) c_nj.
+    /** A supplied radial response returns the field variation at fixed D. */
     std::array<std::vector<Flm>, 2>
-    fields(mdarray<std::complex<double>, 3> const& dm__) const
+    fields(mdarray<std::complex<double>, 3> const& dm__, radial_basis_response_t const* response__ = nullptr) const
     {
         int n  = type_.indexb().size();
         int ns = static_cast<int>(dm__.size(2));
@@ -74,6 +107,7 @@ class LAPW_xc_atom
                 }
             }
         }
+        auto tangent = kinetic_response(response__);
         std::array<std::vector<Flm>, 2> result;
         mdarray<std::complex<double>, 2> dm({n, n});
         for (int s = 0; s < ns; s++) {
@@ -90,33 +124,33 @@ class LAPW_xc_atom
                     for (auto const& g : gaunt_.gaunt_vector(type_.indexb(i).lm, type_.indexb(j).lm)) {
                         double weight = (i == j ? 1 : 2) * std::real(dm__(i, j, s) * g.coef);
                         for (int ir = 0; ir < type_.num_mt_points(); ir++) {
-                            rho(g.lm3, ir) +=
-                                    weight * radial_(ir, type_.indexb(i).idxrf) * radial_(ir, type_.indexb(j).idxrf);
+                            rho(g.lm3, ir) += weight * radial_product(ir, i, j, response__);
                         }
                     }
                 }
             }
-            kinetic_.add_density(dm, result[1].back());
+            kinetic_.add_density(dm, result[1].back(), tangent.get());
         }
         return result;
     }
 
     /// Complex Hermitian matrix from already-weighted radial-sample covectors.
-    /** No radial quadrature, r^2 factor or occupation is applied again. */
+    /** No radial quadrature, r^2 factor or occupation is applied again.
+     *  If a radial response is supplied, return the matrix variation at fixed covectors. */
     mdarray<std::complex<double>, 2>
-    matrix_elements(Flm const& drho__, Flm const& dtau__) const
+    matrix_elements(Flm const& drho__, Flm const& dtau__, radial_basis_response_t const* response__ = nullptr) const
     {
         if (drho__.angular_domain_size() != lmmax_ || drho__.radial_grid().hash() != type_.radial_grid().hash()) {
             RTE_THROW("LAPW XC atom: incompatible charge covector");
         }
-        auto result = kinetic_.matrix_elements_from_derivatives(dtau__);
-        int n       = type_.indexb().size();
+        auto tangent = kinetic_response(response__);
+        auto result  = kinetic_.matrix_elements_from_derivatives(dtau__, tangent.get());
+        int n        = type_.indexb().size();
         for (int j = 0; j < n; j++) {
             for (int i = 0; i <= j; i++) {
                 for (auto const& g : gaunt_.gaunt_vector(type_.indexb(i).lm, type_.indexb(j).lm)) {
                     for (int ir = 0; ir < type_.num_mt_points(); ir++) {
-                        result(i, j) += drho__(g.lm3, ir) * g.coef * radial_(ir, type_.indexb(i).idxrf) *
-                                        radial_(ir, type_.indexb(j).idxrf);
+                        result(i, j) += drho__(g.lm3, ir) * g.coef * radial_product(ir, i, j, response__);
                     }
                 }
                 result(j, i) = std::conj(result(i, j));

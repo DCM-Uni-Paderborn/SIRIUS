@@ -8,17 +8,10 @@
 namespace sirius {
 
 void
-Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<double> energy__)
+Potential::validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& d__) const
 {
-    int present_min = energy__.has_value(), present_max = present_min;
-    ctx_.comm().allreduce<int, mpi::op_t::min>(&present_min, 1);
-    ctx_.comm().allreduce<int, mpi::op_t::max>(&present_max, 1);
-    if (present_min != present_max) {
-        RTE_THROW("LAPW XC energy presence differs between context ranks");
-    }
     bool failed{false};
     try {
-        failed = energy__ && !std::isfinite(*energy__);
         int ns = ctx_.num_spins();
         if (!ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
             ctx_.spfft<double>().processing_unit() != SPFFT_PU_HOST ||
@@ -46,7 +39,7 @@ Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<do
                 }
                 for (auto const& field : d__.local[ia][part]) {
                     if (field.angular_domain_size() != sf::lmmax(ctx_.lmax_rho()) ||
-                        field.radial_grid().hash() != grid.hash()) {
+                        field.radial_grid().hash() != grid.hash() || !field.on_host()) {
                         RTE_THROW("incompatible LAPW XC radial grid or angular extent");
                     }
                     for (size_t i = 0; i < field.size(); i++) {
@@ -74,7 +67,24 @@ Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<do
     if (invalid) {
         RTE_THROW("invalid or unsupported LAPW XC derivatives on a context rank");
     }
+}
+
+void
+Potential::set_lapw_xc_derivatives(lapw_xc_field_adjoint_t d__, std::optional<double> energy__)
+{
+    int present_min = energy__.has_value(), present_max = present_min;
+    ctx_.comm().allreduce<int, mpi::op_t::min>(&present_min, 1);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&present_max, 1);
+    if (present_min != present_max) {
+        RTE_THROW("LAPW XC energy presence differs between context ranks");
+    }
+    validate_lapw_xc_derivatives(d__);
     if (energy__) {
+        int invalid = !std::isfinite(*energy__);
+        ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+        if (invalid) {
+            RTE_THROW("nonfinite LAPW XC energy");
+        }
         double emin = *energy__, emax = *energy__;
         ctx_.comm().allreduce<double, mpi::op_t::min>(&emin, 1);
         ctx_.comm().allreduce<double, mpi::op_t::max>(&emax, 1);
@@ -92,6 +102,12 @@ Potential::get_core_xc_derivatives() const
     if (!lapw_xc_derivatives_) {
         return {};
     }
+    return project_core_xc_derivatives(*lapw_xc_derivatives_);
+}
+
+std::vector<std::array<std::vector<double>, 2>>
+Potential::project_core_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const
+{
     std::vector<std::array<std::vector<double>, 2>> result(unit_cell_.num_atom_symmetry_classes());
     for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
         auto const& cls = unit_cell_.atom_symmetry_class(ic);
@@ -99,7 +115,7 @@ Potential::get_core_xc_derivatives() const
         for (int part = 0; part < 2; part++) {
             result[ic][part].resize(nr, 0);
             for (int i = 0; i < cls.num_atoms(); i++) {
-                auto const& d = lapw_xc_derivatives_->core[cls.atom_id(i)][part];
+                auto const& d = derivatives__.core[cls.atom_id(i)][part];
                 for (int ir = 0; ir < nr; ir++) {
                     result[ic][part][ir] += d[ir] / cls.num_atoms();
                 }
@@ -107,6 +123,58 @@ Potential::get_core_xc_derivatives() const
         }
     }
     return result;
+}
+
+void
+Potential::lapw_radial_potential_response(Density const& density__, Density const& density_response__,
+                                          std::vector<std::vector<double>>& scalar__,
+                                          std::vector<std::array<std::vector<double>, 2>>& xc__) const
+{
+    auto derivatives = lapw_external_xc_response(density__, density_response__);
+    auto hartree     = hartree_response(density_response__.rho());
+    lapw_radial_potential_response(*hartree, derivatives, scalar__, xc__);
+}
+
+void
+Potential::lapw_radial_potential_response(Periodic_function<double> const& hartree__,
+                                          lapw_xc_field_adjoint_t const& derivatives__,
+                                          std::vector<std::vector<double>>& scalar__,
+                                          std::vector<std::array<std::vector<double>, 2>>& xc__) const
+{
+    int invalid =
+            &hartree__.ctx() != &ctx_ || !ctx_.full_potential() || derivatives__.core.size() != unit_cell_.num_atoms();
+    if (!invalid) {
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            for (auto const& field : derivatives__.core[ia]) {
+                invalid |= field.size() != unit_cell_.atom(ia).type().num_mt_points() ||
+                           !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); });
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW radial potential response requires matching Hartree fields and finite core covectors");
+    }
+    std::vector<std::vector<double>> spherical(unit_cell_.num_atom_symmetry_classes());
+    for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
+        auto const& cls = unit_cell_.atom_symmetry_class(ic);
+        int ia = cls.atom_id(0), nr = cls.atom_type().num_mt_points();
+        int owner = unit_cell_.spl_num_atoms().location(atom_index_t::global(ia)).ib;
+        spherical[ic].resize(nr);
+        if (ctx_.comm().rank() == owner) {
+            for (int ir = 0; ir < nr; ir++) {
+                spherical[ic][ir] = y00 * hartree__.mt()[ia](0, ir);
+                invalid |= !std::isfinite(spherical[ic][ir]);
+            }
+        }
+        ctx_.comm().bcast(spherical[ic].data(), nr, owner);
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("nonfinite LAPW spherical Hartree response");
+    }
+    xc__     = project_core_xc_derivatives(derivatives__);
+    scalar__ = std::move(spherical);
 }
 
 lapw_xc_contractions_t
