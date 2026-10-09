@@ -5589,6 +5589,8 @@ sirius_get_kpoint_properties(void* const* ks_handler__, int const* ik__, double*
 sirius_set_xc_callback:
   doc: >-
     Register an external XC evaluator before initializing the context.
+    SIRIUS supplies fields generated from its orbitals. The caller evaluates XC
+    in the same process and returns the energy and primitive-field derivatives.
     The callback is collective on the context communicator and has the C signature
     void callback(void* user_data, int nr, int ns, const int* grid_dims,
     int z_offset, int fcomm_context, int fcomm_fft,
@@ -5686,6 +5688,10 @@ sirius_set_xc_point_callback:
   doc: >-
     Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature
     before initializing the context, after defining all atoms and lattice vectors.
+    These are real-space integration points, not k points. SIRIUS reconstructs
+    the fields from its orbitals. The caller evaluates XC in the same process
+    and returns the energy and primitive-field derivatives. SIRIUS maps these
+    derivatives back to the PW, PAW or LAPW Hamiltonian.
     Each complete atom block is owned once across the context communicator.
     Empty local arrays are permitted. The callback has the C signature
     void callback(void* user_data, int nr, int ns, int nb, int fcomm,
