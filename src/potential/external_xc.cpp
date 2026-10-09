@@ -544,6 +544,7 @@ Potential::external_xc_point_response(xc_callback_input_t const& input__, xc_cal
 lapw_xc_field_adjoint_t
 Potential::lapw_external_xc_response(Density const& density__, Density const& density_response__) const
 {
+    PROFILE("sirius::Potential::lapw_external_xc_response");
     int failed = !ctx_.full_potential() || !ctx_.cb().external_xc_ || !ctx_.cb().external_xc_points_ ||
                  !ctx_.cb().external_xc_response_ || &density__.ctx() != &ctx_ || &density_response__.ctx() != &ctx_ ||
                  !density__.has_kinetic_density() || !density_response__.has_kinetic_density() ||
@@ -664,6 +665,7 @@ Potential::lapw_external_xc_geometry_response(Density const& density__,
                                               mdarray<double, 2> const& atom_directions__,
                                               r3::matrix<double> const& lattice_direction__) const
 {
+    PROFILE("sirius::Potential::lapw_external_xc_geometry_response");
     int failed = !ctx_.full_potential() || !ctx_.cb().external_xc_ || !ctx_.cb().external_xc_points_ ||
                  !ctx_.cb().external_xc_response_ || !ctx_.cb().external_xc_geometry_response_ ||
                  &density__.ctx() != &ctx_ || !density__.has_kinetic_density() || add_delta_rho_xc_ != 0 ||

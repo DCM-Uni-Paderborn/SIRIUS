@@ -133,6 +133,7 @@ class Smooth_periodic_function_sampler
     std::vector<std::array<double, 4>>
     sample(Smooth_periodic_function<double> const& field__) const
     {
+        PROFILE("sirius::Smooth_periodic_function_sampler::sample");
         bool failed = &field__.gvec() != &gvec_;
         for (auto c : field__.f_pw_local()) {
             failed |= !std::isfinite(c.real()) || !std::isfinite(c.imag());
@@ -277,6 +278,7 @@ class Smooth_periodic_function_sampler
     void
     adjoint(std::vector<std::array<double, 4>> const& covectors__, Smooth_periodic_function<double>& potential__) const
     {
+        PROFILE("sirius::Smooth_periodic_function_sampler::adjoint");
         bool failed = covectors__.size() != fractional_points_.size() || &potential__.gvec() != &gvec_;
         for (auto const& d : covectors__) {
             for (double v : d) {
