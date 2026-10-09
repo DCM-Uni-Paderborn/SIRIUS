@@ -421,13 +421,27 @@ DFT_ground_state::check_lapw_xc_derivative(double step__)
             return derivative;
         };
         Density plus_fields(ctx_), minus_fields(ctx_);
-        auto field_error = [&](Density const& response, double h) {
+        std::vector<std::pair<std::complex<double>, double>> coarse_difference;
+        auto field_error = [&](Density const& response, double h, bool refined) {
             double error{0}, peak{0}, relative{0};
+            std::array<double, 3> result{};
+            size_t index{0};
             auto compare = [&](auto r, auto p, auto m) {
-                double e = std::abs(r - (p - m) / (2 * h)), a = std::abs(r);
+                std::complex<double> difference = (p - m) / (2 * h);
+                double roundoff = 32 * std::numeric_limits<double>::epsilon() * (std::abs(p) + std::abs(m)) / (2 * h);
+                if (refined) {
+                    auto const& coarse = coarse_difference.at(index++);
+                    difference         = (4.0 * difference - coarse.first) / 3.0;
+                    roundoff           = (4 * roundoff + coarse.second) / 3;
+                } else {
+                    coarse_difference.emplace_back(difference, roundoff);
+                }
+                double e = std::abs(r - difference), a = std::abs(r);
                 if (!std::isfinite(e) || !std::isfinite(a)) {
                     error = std::numeric_limits<double>::infinity();
                 } else {
+                    // Weak responses can be below the cancellation noise of the base fields.
+                    e     = std::max(0.0, e - roundoff);
                     error = std::max(error, e);
                     peak  = std::max(peak, a);
                 }
@@ -451,12 +465,17 @@ DFT_ground_state::check_lapw_xc_derivative(double step__)
                 }
                 ctx_.comm().allreduce<double, mpi::op_t::max>(&error, 1);
                 ctx_.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
-                relative = std::max(relative, error / std::max(1e-12, peak));
+                double scaled_error = error / std::max(1e-12, peak);
+                if (scaled_error > relative) {
+                    relative = scaled_error;
+                    result   = {relative, error, peak};
+                }
                 error = peak = 0;
             }
-            return relative;
+            return result;
         };
         for (int direction = 0; direction < 2; direction++) {
+            coarse_difference.clear();
             constexpr double offset{0.17};
             auto evaluate = [&](double t) {
                 set_orbitals(direction, offset + t, false);
@@ -513,12 +532,15 @@ DFT_ground_state::check_lapw_xc_derivative(double step__)
                 double minus = evaluate(-h);
                 minus_fields.generate<double>(kset_, false, false, true);
                 result[direction][j] = (plus - minus) / (2 * h);
-                double error = field_error(*fields, h), tolerance = std::max(5e-9, 2 * h * h);
-                if (error > tolerance) {
+                // Both existing stencils give a fourth-order field derivative.
+                auto error       = field_error(*fields, h, j == 2);
+                double tolerance = std::max(5e-9, 8 * std::pow(step__, 4));
+                if (!std::isfinite(error[0]) || (j == 2 && error[0] > tolerance)) {
                     std::ostringstream message;
                     message << std::scientific << "LAPW orbital rho/tau response fails finite differences: direction "
-                            << direction + 1 << ", step " << h << ", relative error " << error << ", tolerance "
-                            << tolerance;
+                            << direction + 1 << ", step " << h << ", relative error " << error[0] << ", tolerance "
+                            << tolerance << ", roundoff-adjusted absolute error " << error[1] << ", response scale "
+                            << error[2];
                     RTE_THROW(message.str());
                 }
             }
