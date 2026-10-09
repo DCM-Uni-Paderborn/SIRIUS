@@ -231,8 +231,10 @@ class Local_operator
      */
     std::array<std::unique_ptr<Smooth_periodic_function<T>>, 6> veff_vec_;
 
-    // Spin channels for collinear PW, scalar/z/x/y components for spinors.
+    /// XC derivatives with respect to tau, allocated for Libxc meta-GGA or external XC.
+    /// Collinear fields are spin-resolved. Spinor fields use scalar/z/x/y components.
     std::array<std::unique_ptr<Smooth_periodic_function<T>>, 4> vtau_vec_;
+    /// Zero when XC has no tau dependence. Used in the Davidson preconditioner.
     std::array<T, 2> vtau0_{};
 
     /// Temporary array to store [V*phi](G)

@@ -939,7 +939,7 @@ class Potential : public Field4D
 
     /// Operator-only staging must not silently reuse an unrelated XC energy.
     void
-    check_xc_energy_available() const
+    require_xc_energy() const
     {
         if (lapw_xc_derivatives_ && !lapw_xc_energy_) {
             RTE_THROW("LAPW XC derivatives were staged without their functional energy");
@@ -967,7 +967,7 @@ class Potential : public Field4D
     double
     energy_vtau(Density const& density__) const
     {
-        check_xc_energy_available();
+        require_xc_energy();
         if (lapw_xc_derivatives_) {
             return lapw_xc_contractions(density__).tau;
         }
@@ -1007,7 +1007,7 @@ class Potential : public Field4D
     auto
     energy_vxc(Density const& density__) const
     {
-        check_xc_energy_available();
+        require_xc_energy();
         if (lapw_xc_derivatives_) {
             return lapw_xc_contractions(density__).rho;
         }
@@ -1018,7 +1018,7 @@ class Potential : public Field4D
     auto
     energy_vxc_core(Density const& density__) const
     {
-        check_xc_energy_available();
+        require_xc_energy();
         if (ctx_.full_potential()) {
             RTE_THROW("pseudo-core XC contraction is not defined for full potential");
         }
@@ -1029,7 +1029,7 @@ class Potential : public Field4D
     auto
     energy_exc(Density const& density__) const
     {
-        check_xc_energy_available();
+        require_xc_energy();
         if (lapw_xc_energy_) {
             return *lapw_xc_energy_;
         }

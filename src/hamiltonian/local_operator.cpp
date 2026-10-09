@@ -178,7 +178,7 @@ Local_operator<T>::Local_operator(Simulation_context const& ctx__, fft::spfft_tr
             vtau_vec_[j]->fft_transform(1);
         }
     } else if (potential__.has_kinetic_potential()) {
-        // Weighted adjoint of the coarse-to-fine kinetic-density Fourier map.
+        // Restrict dE_xc/dtau to the orbital FFT grid using the adjoint of density-grid prolongation.
         bool spinor = ctx_.num_mag_dims() == 3;
         for (int s = 0; s < (spinor ? 4 : ctx_.num_spins()); s++) {
             vtau_vec_[s]  = std::make_unique<Smooth_periodic_function<T>>(fft_coarse__, gvec_coarse_p__);
@@ -525,6 +525,7 @@ Local_operator<T>::apply_h(fft::spfft_transform_type<T>& spfftk__, std::shared_p
         }
     }
     if (tau_op) {
+        // Add -1/2 div(v_tau grad(psi)), including the spin-matrix form when needed.
         // Stage each band block once. The ordinary GPU Hamiltonian has already updated hphi.
         for (auto s = spins__.begin(); s != spins__.end(); s++) {
             if (phi_fft[s.get()].on_device()) {

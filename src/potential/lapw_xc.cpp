@@ -184,7 +184,7 @@ Potential::lapw_radial_potential_response(Periodic_function<double> const& hartr
 lapw_xc_contractions_t
 Potential::lapw_xc_contractions(Density const& density__) const
 {
-    check_xc_energy_available();
+    require_xc_energy();
     if (!lapw_xc_derivatives_) {
         return {};
     }

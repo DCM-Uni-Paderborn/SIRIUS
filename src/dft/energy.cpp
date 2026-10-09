@@ -82,7 +82,7 @@ energy_vha(Potential const& potential)
 double
 energy_bxc(Density const& density, Potential const& potential)
 {
-    potential.check_xc_energy_available();
+    potential.require_xc_energy();
     double ebxc{0};
     for (int j = 0; j < density.ctx().num_mag_dims(); j++) {
         ebxc += sirius::inner(density.mag(j), potential.effective_magnetic_field(j));
@@ -126,7 +126,7 @@ eval_sum(Density const& density, K_point_set const& kset)
 double
 energy_veff(Density const& density, Potential const& potential)
 {
-    potential.check_xc_energy_available();
+    potential.require_xc_energy();
     double energy = sirius::inner(density.rho(), potential.effective_potential()) +
                     potential.lapw_xc_contractions(density).rho - potential.external_xc_background_contraction();
     auto const& ctx = density.ctx();
