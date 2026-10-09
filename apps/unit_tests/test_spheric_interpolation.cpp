@@ -47,12 +47,16 @@ test_spline_transpose(int n__)
 int
 test_sampling_geometry(Spheric_function_interpolator const& sampler, Spheric_function_interpolator const& dsampler,
                        std::vector<r3::vector<double>> const& points,
-                       std::vector<std::array<double, 4>> const& covectors, Flm const& field_direction)
+                       std::vector<std::array<double, 4>> const& covectors, Flm const& field_direction,
+                       bool include_radial = false)
 {
     std::vector<r3::vector<double>> directions;
     double lhs{0}, rhs{0}, error{0};
     for (size_t p = 0; p < points.size(); p++) {
         directions.emplace_back(0.1 * r3::vector<double>(points[p][1], -points[p][2], points[p][0]));
+        if (include_radial) {
+            directions.back() += 0.1 * points[p];
+        }
         auto response = dsampler.position_response(points[p], directions.back());
         for (int k = 0; k < 4; k++) {
             lhs += covectors[p][k] * response[k];
@@ -65,7 +69,7 @@ test_sampling_geometry(Spheric_function_interpolator const& sampler, Spheric_fun
     error             = std::abs(lhs - rhs) / std::max(1.0, std::abs(lhs));
     bool dual_failure = !std::isfinite(error) || error > 2e-10;
     // Gradient sampling is C1 at the inner join; its transpose-direction FD is only first-order there.
-    for (double h : {1e-5, 5e-6}) {
+    for (double h : {5e-6, 2.5e-6}) {
         auto plus = points, minus = points;
         for (size_t p = 0; p < points.size(); p++) {
             plus[p] += h * directions[p];
@@ -124,6 +128,7 @@ test_spheric_interpolation()
         auto actual     = polynomial_sample.value_gradient(p);
         double expected = 1 + 0.7 * std::pow(p.length(), 2) + 0.2 * p[0] - 0.3 * p[1] + 0.4 * p[2] + 0.17 * p[0] * p[2];
         exact_error     = std::max(exact_error, std::abs(actual[0] - expected));
+        exact_error     = std::max(exact_error, std::abs(polynomial_sample.value(p) - actual[0]));
         std::array<double, 4> covector{0.4, -0.2, 0.5, 0.7};
         auto position_derivative = polynomial_sample.position_adjoint(p, covector);
         for (int a = 0; a < 3; a++) {
@@ -134,6 +139,14 @@ test_spheric_interpolation()
         }
     }
     check("Cartesian polynomial values/gradients/geometry adjoint including endpoints", exact_error, 2e-12);
+    auto surface = polynomial_sample.value_gradient({0, grid.last(), 0});
+    auto rounded = polynomial_sample.value_gradient(
+            {0, std::nextafter(grid.last(), std::numeric_limits<double>::infinity()), 0});
+    double surface_error{0};
+    for (int k = 0; k < 4; k++) {
+        surface_error = std::max(surface_error, std::abs(surface[k] - rounded[k]));
+    }
+    check("radial endpoint tolerates coordinate roundoff", surface_error, 2e-12);
     for (double step : {1e-4, 5e-5}) {
         double error{0};
         for (size_t i = 0; i + 2 < points.size(); i++) {
@@ -224,8 +237,10 @@ test_spheric_interpolation()
     auto empty = sampler.adjoint({}, {});
     check("empty sample set", std::abs(empty.checksum()), 0);
     for (auto p : {r3::vector<double>({0, 0, 0}), r3::vector<double>({0.01, 0, 0}), r3::vector<double>({4, 0, 0}),
+                   r3::vector<double>({grid.last() + 1e-6, 0, 0}),
                    r3::vector<double>({std::numeric_limits<double>::quiet_NaN(), 0, 0})}) {
         check.reject("invalid sampling point", [&] { sampler.value_gradient(p); });
+        check.reject("invalid value-only sampling point", [&] { sampler.value(p); });
     }
     return failures;
 }
@@ -284,6 +299,7 @@ test_inner_extension(spheric_inner_extension_t mode)
         }
         auto actual = sampler.value_gradient(position);
         auto delta  = dsampler.value_gradient(position);
+        error = std::max(error, std::abs(sampler.value(position) - actual[0]) / std::max(1.0, std::abs(actual[0])));
         covectors.push_back({0.7, 0.2, -0.1, 0.3});
         for (int a = 0; a < 4; a++) {
             error = std::max(error, std::abs(actual[a] - exact[a]) / std::max(1.0, std::abs(exact[a])));
@@ -440,6 +456,176 @@ test_cusp_dipole()
 }
 
 int
+test_coulomb_kinetic_interpolation()
+{
+    std::vector<double> x{
+            1e-6, 1.976562109375e-6, 4.9062484375e-6, 9.789058984375e-6, 2.5414052734375e-5, 1e-4, 1e-3, 1e-2, 1};
+    Radial_grid_ext<double> grid(static_cast<int>(x.size()), x.data());
+    int n = sf::lmmax(1), failures{0};
+    std::vector<double> power;
+    for (int l : sf::l_by_lm(1)) {
+        power.push_back(radial_solver_local::scalar_relativistic_origin_power(l / 2, 3) +
+                        radial_solver_local::scalar_relativistic_origin_power((l + 1) / 2, 3) - 4);
+    }
+    Flm field(n, grid), direction(n, grid);
+    for (int lm = 0; lm < n; lm++) {
+        for (int ir = 0; ir < grid.num_points(); ir++) {
+            double r = grid[ir], c = lm ? 1e-8 / (lm + 1) : 1e-7 / y00;
+            field(lm, ir)     = c * std::pow(r, power[lm]) * (1 + 0.4 * r + 0.3 * r * r);
+            direction(lm, ir) = 0.2 * c * std::pow(r, power[lm]) * (1 + 0.1 * r + r * r);
+        }
+    }
+    Spheric_function_interpolator sampler(field, spheric_inner_extension_t::kinetic, power);
+    Spheric_function_interpolator dsampler(direction, spheric_inner_extension_t::kinetic, power);
+    std::vector<r3::vector<double>> points{{2e-7, 0, 0},  {0, 0, 1e-6},           {3.393485299e-6, 0, 0},
+                                           {0, -7e-6, 0}, {0.001, -0.002, 0.003}, {0, 0, 0.5}};
+    std::vector<std::array<double, 4>> covectors;
+    double error{0}, curvature_error{0}, lhs{0};
+    for (auto p : points) {
+        double r = p.length();
+        std::vector<double> harmonics(n);
+        mdarray<double, 2> gradient({n, 3});
+        sf::spherical_harmonics(1, p, harmonics.data());
+        sf::dRlm_dr(1, p, gradient);
+        std::array<double, 4> expected{};
+        r3::matrix<double> hessian;
+        auto unit = (1 / r) * p;
+        for (int lm = 0; lm < n; lm++) {
+            double c          = lm ? 1e-8 / (lm + 1) : 1e-7 / y00;
+            double value      = c * std::pow(r, power[lm]) * (1 + 0.4 * r + 0.3 * r * r);
+            double derivative = power[lm] * value / r + c * std::pow(r, power[lm]) * (0.4 + 0.6 * r);
+            double second     = power[lm] * (power[lm] - 1) * value / (r * r) +
+                            2 * power[lm] * c * std::pow(r, power[lm] - 1) * (0.4 + 0.6 * r) +
+                            0.6 * c * std::pow(r, power[lm]);
+            expected[0] += value * harmonics[lm];
+            for (int k = 0; k < 3; k++) {
+                expected[k + 1] += derivative * harmonics[lm] * p[k] / r + value * gradient(lm, k);
+            }
+            // The l=1 field is (f(r)/r) times a Cartesian linear polynomial.
+            for (int a = 0; a < 3; a++) {
+                for (int b = 0; b < 3; b++) {
+                    if (lm == 0) {
+                        hessian(a, b) += harmonics[lm] * ((second - derivative / r) * unit[a] * unit[b] +
+                                                          (a == b ? derivative / r : 0));
+                    } else {
+                        double first = derivative / r - value / (r * r);
+                        double next  = second / r - 2 * derivative / (r * r) + 2 * value / (r * r * r);
+                        double ca    = r * gradient(lm, a) + harmonics[lm] * unit[a];
+                        double cb    = r * gradient(lm, b) + harmonics[lm] * unit[b];
+                        hessian(a, b) +=
+                                first * (unit[a] * cb + ca * unit[b]) +
+                                r * harmonics[lm] * ((next - first / r) * unit[a] * unit[b] + (a == b ? first / r : 0));
+                    }
+                }
+            }
+        }
+        auto actual = sampler.value_gradient(p);
+        covectors.push_back({r * r, 0.2 * r * r * r, 0.1 * r * r * r, -0.3 * r * r * r});
+        error        = std::max(error, std::abs(sampler.value(p) - actual[0]) / std::max(1.0, std::abs(actual[0])));
+        auto tangent = dsampler.value_gradient(p);
+        for (int k = 0; k < 4; k++) {
+            error = std::max(error, std::abs(actual[k] - expected[k]) / std::max(1.0, std::abs(expected[k])));
+            lhs += covectors.back()[k] * tangent[k];
+        }
+        for (auto v : {0.1 * r3::vector<double>(p[1], -p[2], p[0]), 0.1 * p}) {
+            auto response   = sampler.position_response(p, v);
+            double exact    = r3::dot(v, r3::vector<double>(expected[1], expected[2], expected[3]));
+            curvature_error = std::max(curvature_error, std::abs(response[0] - exact) / std::max(1.0, std::abs(exact)));
+            double peak{0}, difference{0};
+            for (int a = 0; a < 3; a++) {
+                exact = 0;
+                for (int b = 0; b < 3; b++) {
+                    exact += hessian(a, b) * v[b];
+                }
+                peak       = std::max(peak, std::abs(exact));
+                difference = std::max(difference, std::abs(response[a + 1] - exact));
+            }
+            // Use a vector norm: symmetry-zero components coexist with a singular radial curvature.
+            curvature_error = std::max(curvature_error, difference / std::max(1.0, peak));
+        }
+    }
+    Test_check check(failures);
+    check("Coulomb kinetic multipole values and gradients", error, 2e-11);
+    check("Coulomb kinetic analytic radial and tangential Hessian", curvature_error, 2e-11);
+    auto adjoint = sampler.adjoint(points, covectors);
+    double rhs{0};
+    for (size_t i = 0; i < adjoint.size(); i++) {
+        rhs += adjoint[i] * direction[i];
+    }
+    check("factored radial-sample transpose", std::abs(lhs - rhs) / std::abs(lhs), 2e-11);
+    Spheric_function_interpolator unscaled(field, spheric_inner_extension_t::kinetic);
+    check("ordinary spline overshoot is exercised", unscaled.value_gradient(points[2])[0] < 0 ? 0 : 1, 0);
+    check("factored interpolation retains positive kinetic density", sampler.value_gradient(points[2])[0] > 0 ? 0 : 1,
+          0);
+    // A radial component avoids subtracting almost equal singular monopole gradients.
+    return failures + test_sampling_geometry(sampler, dsampler, points, covectors, direction, true);
+}
+
+int
+test_positive_coulomb_interpolation(spheric_inner_extension_t inner)
+{
+    std::vector<double> x{
+            1e-6, 1.8578115234375e-5, 7.13124609375e-5, 1.59203037109375e-4, 2.8224984375e-4, 1e-3, 1e-2, 0.1, 1.8};
+    Radial_grid_ext<double> grid(static_cast<int>(x.size()), x.data());
+    int n = sf::lmmax(1), failures{0};
+    double power =
+            2 * std::sqrt(1 - std::pow(10 / speed_of_light, 2)) - (inner == spheric_inner_extension_t::kinetic ? 4 : 2);
+    std::vector<double> powers(n, power);
+    Flm field(n, grid), direction(n, grid);
+    field.zero();
+    for (int ir = 0; ir < grid.num_points(); ir++) {
+        // A positive core-like field with a sharply varying regular remainder.
+        field(0, ir) = 1e-8 * std::pow(x[ir], power) * (ir == 0 ? 3 : 0.4) / y00;
+        for (int lm = 0; lm < n; lm++) {
+            direction(lm, ir) = 1e-8 * std::pow(x[ir], power) * std::cos(ir + 0.3 * lm) / (lm + 1);
+        }
+    }
+    Spheric_function_interpolator cubic(field, inner, powers);
+    Spheric_function_interpolator sampler(field, inner, powers, spheric_interpolation_t::positive_spline);
+    Spheric_function_interpolator dsampler(direction, inner, powers, spheric_interpolation_t::positive_spline);
+    std::vector<r3::vector<double>> points{{5e-7, 0, 0}, {1e-6, 0, 0},           {3.3835446e-5, 0, 0}, {0, 0, 1.3e-4},
+                                           {x[3], 0, 0}, {0.003, -0.004, 0.007}, {0, 0, 0.6}};
+    Test_check check(failures);
+    check("factored cubic field overshoot is exercised", cubic.value(points[2]) < 0 ? 0 : 1, 0);
+    std::vector<std::array<double, 4>> covectors, positive(points.size(), {1, 0, 0, 0});
+    double lhs{0}, rhs{0};
+    for (auto const& p : points) {
+        check("positive Coulomb spline retains positive fields", sampler.value(p) > 0 ? 0 : 1, 0);
+        double r = p.length();
+        covectors.push_back({r * r, 0.2 * r * r * r, -0.1 * r * r * r, 0.3 * r * r * r});
+        auto values = dsampler.value_gradient(p);
+        for (int k = 0; k < 4; k++) {
+            lhs += covectors.back()[k] * values[k];
+        }
+    }
+    auto reverse = sampler.adjoint(points, covectors);
+    for (size_t i = 0; i < reverse.size(); i++) {
+        rhs += reverse[i] * direction[i];
+    }
+    check("positive factored value/gradient transpose", std::abs(lhs - rhs) / std::abs(lhs), 2e-11);
+    auto positive_reverse = sampler.adjoint(points, positive);
+    for (int ir = 0; ir < grid.num_points(); ir++) {
+        check("positive local kernel retains positive nodal weights", positive_reverse(0, ir) >= 0 ? 0 : 1, 0);
+    }
+    Flm linear(n, grid);
+    linear.zero();
+    for (int ir = 0; ir < grid.num_points(); ir++) {
+        linear(0, ir) = std::pow(x[ir], power) * (1 + 0.2 * x[ir]) / y00;
+    }
+    Spheric_function_interpolator exact(linear, inner, powers, spheric_interpolation_t::positive_spline);
+    double error{0};
+    for (double r : {0.001, 0.3, 1.0, grid.last()}) {
+        auto sampled      = exact.value_gradient({r, 0, 0});
+        double value      = std::pow(r, power) * (1 + 0.2 * r);
+        double derivative = power * value / r + 0.2 * std::pow(r, power);
+        error             = std::max(error, std::abs(sampled[0] - value) / std::max(1.0, std::abs(value)));
+        error             = std::max(error, std::abs(sampled[1] - derivative) / std::max(1.0, std::abs(derivative)));
+    }
+    check("positive spline reproduces the linear regular remainder", error, 2e-11);
+    return failures + test_sampling_geometry(sampler, dsampler, points, covectors, direction, true);
+}
+
+int
 main(int argc, char** argv)
 {
     sirius::initialize(1);
@@ -455,6 +641,10 @@ main(int argc, char** argv)
     result += call_test("inner charge continuation", test_inner_extension, spheric_inner_extension_t::charge);
     result += call_test("inner kinetic continuation", test_inner_extension, spheric_inner_extension_t::kinetic);
     result += call_test("cusp kinetic dipole", test_cusp_dipole);
+    result += call_test("Coulomb kinetic interpolation", test_coulomb_kinetic_interpolation);
+    for (auto inner : {spheric_inner_extension_t::charge, spheric_inner_extension_t::kinetic}) {
+        result += call_test("positive Coulomb interpolation", test_positive_coulomb_interpolation, inner);
+    }
     sirius::finalize();
     return result;
 }

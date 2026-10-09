@@ -30,15 +30,25 @@ struct radial_basis_response_t
     mdarray<double, 2> surface_derivatives;
     /// Spin-summed {rho, tau} response on the MT grid, without radial weights.
     std::array<std::vector<double>, 2> core_fields;
+    /// Occupation-weighted derivative of the core eigenvalue sum for one atom.
+    double core_eval_sum{0};
+    /// Total derivative of the SOC radial integrals, including basis and potential motion.
+    mdarray<double, 3> spin_orbit_integrals;
 
     explicit radial_basis_response_t(Atom_type const& type__)
-        : radial_functions({type__.num_mt_points(), type__.mt_radial_basis_size(), 2})
-        , surface_derivatives({3, type__.mt_radial_basis_size() - type__.num_lo_descriptors()})
+        : radial_functions({type__.num_mt_points(), type__.mt_radial_basis_size(), type__.indexb().full_j() ? 4 : 2})
+        , surface_derivatives(
+                  {type__.indexb().full_j() ? 6 : 3, type__.mt_radial_basis_size() - type__.num_lo_descriptors()})
     {
         radial_functions.zero();
         surface_derivatives.zero();
         for (auto& field : core_fields) {
             field.resize(type__.num_mt_points(), 0);
+        }
+        if (type__.parameters().so_correction() && !type__.indexb().full_j()) {
+            int order            = type__.indexr().max_order();
+            spin_orbit_integrals = mdarray<double, 3>({type__.indexr().lmax() + 1, order, order});
+            spin_orbit_integrals.zero();
         }
     }
 };
@@ -49,6 +59,10 @@ struct radial_basis_response_t
  */
 class Atom_symmetry_class
 {
+  public:
+    /// Radial channels keyed by l (scalar) or kappa (Dirac).
+    using core_states_t = std::map<int, std::vector<radial_core_state_t>>;
+
   private:
     /// Symmetry class id in the range [0, N_class).
     int id_;
@@ -66,15 +80,17 @@ class Atom_symmetry_class
     /// Raw spherical density/tau derivatives, also used by the radial core solver.
     std::array<std::vector<double>, 2> spherical_xc_derivatives_;
 
-    using core_states_t  = std::map<int, std::vector<radial_core_state_t>>;
     using enu_response_t = std::map<std::pair<int, int>, double>;
+
+    mutable std::map<int, radial_core_reference_t> core_reference_;
+    mutable std::map<int, std::shared_ptr<Radial_dirac_xc_solver const>> dirac_core_reference_;
 
     /// List of radial functions for the LAPW basis.
     /** This array stores all the radial functions (AW and LO) and their derivatives. Radial derivatives of functions
      *  are multiplied by \f$ x \f$.\n
      *  1-st dimension: index of radial point \n
      *  2-nd dimension: index of radial function \n
-     *  3-nd dimension: 0 - function itself, 1 - radial derivative r*(du/dr) */
+     *  3-rd dimension: {R, rR'} and, for a Dirac basis, {S, rS'} as well. */
     mdarray<double, 3> radial_functions_;
 
     /// Surface derivatives of AW radial functions.
@@ -96,6 +112,7 @@ class Atom_symmetry_class
 
     /// List of radial descriptor sets used to construct augmented waves.
     mutable std::vector<radial_solution_descriptor_set> aw_descriptors_;
+    mutable std::map<int, radial_solution_descriptor_set> dirac_aw_descriptors_;
 
     /// List of radial descriptor sets used to construct local orbitals.
     mutable std::vector<local_orbital_descriptor> lo_descriptors_;
@@ -103,13 +120,20 @@ class Atom_symmetry_class
     void
     update_enu_descriptors();
 
+    std::vector<angular_momentum>
+    aw_channels() const;
+
+    void
+    validate_radial_relativity(relativity_t rel__) const;
+
     core_states_t
     generate_core_radial_states(std::vector<double> const* direction__ = nullptr, core_states_t* response__ = nullptr,
                                 std::array<std::vector<double>, 2> const& xc_directions__ = {},
-                                std::array<std::vector<double>, 2>* fields_response__     = nullptr) const;
+                                std::array<std::vector<double>, 2>* fields_response__     = nullptr,
+                                double* energy_response__                                 = nullptr) const;
 
     radial_solver_result_t
-    solve_radial(relativity_t rel__, int dme__, int l__, double energy__, core_states_t const& core__,
+    solve_radial(relativity_t rel__, int dme__, angular_momentum am__, double energy__, core_states_t const& core__,
                  std::vector<double> const* direction__ = nullptr, radial_solver_result_t* response__ = nullptr,
                  core_states_t const* core_response__ = nullptr, double energy_direction__ = 0) const;
 
@@ -157,6 +181,36 @@ class Atom_symmetry_class
         return spherical_xc_derivatives_;
     }
 
+    /// Preserve immutable nuclear projectors when geometry changes the symmetry classes.
+    void
+    inherit_dirac_core_reference(Atom_symmetry_class const& previous__)
+    {
+        if (&atom_type_ != &previous__.atom_type_) {
+            RTE_THROW("Dirac core projector reuse requires the same atom type");
+        }
+        for (auto const& [channel, reference] : previous__.dirac_core_reference_) {
+            dirac_core_reference_.try_emplace(channel, reference);
+        }
+    }
+
+    /// Share core solver references between density generation and LAPW core projection.
+    /** The angular channel is l for scalar cores and kappa for Dirac cores. */
+    std::vector<radial_core_state_t>
+    solve_core_states(Radial_grid<double> const& grid__, int channel__, std::vector<double> const& potential__,
+                      int count__, std::array<std::vector<double>, 2> const& fields__, relativity_t relativity__,
+                      std::vector<double> const* direction__                    = nullptr,
+                      std::vector<radial_core_state_t>* response__              = nullptr,
+                      std::array<std::vector<double>, 2> const& xc_directions__ = {}) const;
+
+    /// Solve the channels required by the configured occupied core levels, retaining both Dirac components.
+    /** States and responses have unit occupation and are indexed by n-l-1. Potential directions use the extended grid, while raw XC
+     *  covectors and their directions use the MT grid without additional quadrature weights. */
+    core_states_t
+    solve_occupied_core_states(Radial_grid<double> const& grid__, std::vector<double> const& potential__,
+                               std::array<std::vector<double>, 2> const& fields__, relativity_t relativity__,
+                               std::vector<double> const* direction__ = nullptr, core_states_t* response__ = nullptr,
+                               std::array<std::vector<double>, 2> const& xc_directions__ = {}) const;
+
     /// Save spherical potential for debugging purposes.
     void
     save_spherical_potential() const;
@@ -169,11 +223,12 @@ class Atom_symmetry_class
     int
     generate_radial_functions(relativity_t rel__, bool update_enu__ = true);
 
-    /// Differentiate the nonrelativistic AW/LO construction without changing the stored basis or energies.
+    /// Differentiate the AW/LO construction without changing the stored basis or energies.
     /** Directions are changes in the spherical potential and optional raw density/tau XC covectors on the MT
      *  grid. Empty XC directions mean zero. Core projection includes the induced core-orbital response without
      *  adding quadrature weights to the covectors. Automatic linearisation energies follow the potential
-     *  unless update_enu__ is false. The free-atom reference remains fixed. */
+     *  unless update_enu__ is false. The free-atom reference remains fixed. Dirac valence functions
+     *  retain both components and require Dirac states for XC-dependent core projection. */
     radial_basis_response_t
     radial_basis_potential_response(std::vector<double> const& direction__,
                                     std::array<std::vector<double>, 2> const& xc_directions__ = {},
@@ -199,10 +254,12 @@ class Atom_symmetry_class
     {
         pout << "Atom : " << atom_type_.symbol() << ", class id : " << id_ << std::endl;
         pout << "augmented waves" << std::endl;
-        for (int l = 0; l < num_aw_descriptors(); l++) {
-            for (size_t order = 0; order < aw_descriptor(l).size(); order++) {
-                auto& rsd = aw_descriptor(l)[order];
+        for (auto am : aw_channels()) {
+            for (auto const& rsd : aw_descriptor(am)) {
                 if (rsd.auto_enu) {
+                    if (am.s()) {
+                        pout << "kappa=" << am.kappa() << " ";
+                    }
                     pout << rsd << std::endl;
                 }
             }
@@ -234,6 +291,15 @@ class Atom_symmetry_class
     void
     generate_radial_integrals(relativity_t rel__);
 
+    /// Physical spherical {H, O} in the full-j radial basis, diagonal in kappa and m_j.
+    /** Uses both Dirac components and the rest-energy-subtracted Hamiltonian in Hartree.
+     *  The kinetic bilinear is Hermitian; sphere boundary fluxes cancel only after matching
+     *  to an interstitial operator with the same convention. No Y00 factor is included.
+     *  A response returns dH/dO, including an optional direction of the physical potential. */
+    std::array<mdarray<double, 2>, 2>
+    dirac_spherical_matrices(radial_basis_response_t const* response__ = nullptr,
+                             std::vector<double> const& direction__    = {}) const;
+
     /// Get m-th order radial derivative of AW functions at the MT surface.
     inline double
     aw_surface_deriv(int l__, int order__, int dm__) const
@@ -241,6 +307,14 @@ class Atom_symmetry_class
         RTE_ASSERT(dm__ <= 2);
         auto idxrf = atom_type_.indexr().index_of(angular_momentum(l__), order__);
         return surface_derivatives_(dm__, idxrf);
+    }
+
+    /// Component-resolved boundary data of a full-j augmented wave.
+    inline double
+    aw_surface_deriv(angular_momentum am__, int order__, int dm__, int component__ = 0) const
+    {
+        RTE_ASSERT(dm__ >= 0 && dm__ <= 2 && component__ >= 0 && component__ < (am__.s() ? 2 : 1));
+        return surface_derivatives_(dm__ + 3 * component__, atom_type_.indexr().index_of(am__, order__));
     }
 
     /// Set surface derivative of AW radial functions.
@@ -280,9 +354,10 @@ class Atom_symmetry_class
 
     /// Get a value of the radial functions.
     inline double
-    radial_function(int ir, int idx) const
+    radial_function(int ir, int idx, int component__ = 0) const
     {
-        return radial_functions_(ir, idx, 0);
+        RTE_ASSERT(component__ >= 0 && component__ < (atom_type_.indexb().full_j() ? 2 : 1));
+        return radial_functions_(ir, idx, 2 * component__);
     }
 
     /// Set radial function.
@@ -296,9 +371,10 @@ class Atom_symmetry_class
 
     /// Get radial function derivative r*(du/dr).
     inline double
-    radial_function_derivative(int ir__, int idx__) const
+    radial_function_derivative(int ir__, int idx__, int component__ = 0) const
     {
-        return radial_functions_(ir__, idx__, 1);
+        RTE_ASSERT(component__ >= 0 && component__ < (atom_type_.indexb().full_j() ? 2 : 1));
+        return radial_functions_(ir__, idx__, 1 + 2 * component__);
     }
 
     /// Set radial function derivative r*(du/dr).
@@ -361,7 +437,16 @@ class Atom_symmetry_class
     inline radial_solution_descriptor_set&
     aw_descriptor(int idx__) const
     {
-        return aw_descriptors_[idx__];
+        return aw_descriptor(angular_momentum(idx__));
+    }
+
+    inline radial_solution_descriptor_set&
+    aw_descriptor(angular_momentum am__) const
+    {
+        if (bool(am__.s()) != atom_type_.indexb().full_j()) {
+            RTE_THROW("AW descriptor requires the initialized scalar or full-j angular channel");
+        }
+        return am__.s() ? dirac_aw_descriptors_.at(am__.kappa()) : aw_descriptors_.at(am__.l());
     }
 
     inline int
@@ -379,13 +464,13 @@ class Atom_symmetry_class
     inline void
     set_aw_enu(int l, int order, double enu)
     {
-        aw_descriptors_[l][order].enu = enu;
+        aw_descriptor(l).at(order).enu = enu;
     }
 
     inline double
     get_aw_enu(int l, int order) const
     {
-        return aw_descriptors_[l][order].enu;
+        return aw_descriptor(l).at(order).enu;
     }
 
     inline void

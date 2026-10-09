@@ -1909,7 +1909,7 @@ sirius_check_external_xc_derivative:
     gs_handler:
       type: gs_handler
       attr: in, required
-      doc: Initialized ground-state handler with CPU fp64 NC, PAW or nonrelativistic LAPW orbitals and an external XC evaluator.
+      doc: Initialized ground-state handler with fp64 NC, PAW or FP-LAPW orbitals on CPU/GPU and an external XC evaluator. Spinors require four-component point-XC registration. FP-LAPW supports scalar-relativistic or native Dirac radial functions, with SOC in NR/ZORA second variation.
     step:
       type: double
       attr: in, required
@@ -1958,7 +1958,7 @@ sirius_check_external_xc_response:
     errors:
       type: double
       attr: out, required, dimension(2)
-      doc: Relative maximum XC, spherical-potential and enabled point-input response errors at step and step/2.
+      doc: Relative maximum XC, spherical-potential and enabled point-input response errors using fourth-order stencils at step and step/2.
     error_code:
       type: int
       attr: out, optional
@@ -5609,7 +5609,7 @@ sirius_set_xc_callback:
     after completing all callback collectives. Do not unwind across the C ABI.
     The caller owns user_data and keeps it alive until the context is destroyed.
     A null function pointer disables the callback before context initialization.
-    Currently supported for CPU norm-conserving PW calculations without core
+    Currently supported for CPU/GPU norm-conserving PW calculations without core
     charge, SOC, or noncollinear magnetism. Forces and stress are not supported.
   arguments:
     handler:
@@ -5639,6 +5639,7 @@ sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data
                 if (ctx.initialized()) {
                     RTE_THROW("register external XC before initializing the context");
                 }
+                ctx.cb().external_xc_spinor_               = false;
                 ctx.cb().external_xc_geometry_             = nullptr;
                 ctx.cb().external_xc_pullback_             = nullptr;
                 ctx.cb().external_xc_quadrature_direction_ = nullptr;
@@ -5695,21 +5696,26 @@ sirius_set_xc_point_callback:
     double* dtau, int* status).
     Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr.
     Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1
-    total fields or ns=2 up/down fields. They are jointly reconstructed before
-    the callback. The energy and descriptor weights do not scale those fields.
+    total fields or ns=2 up/down fields. Explicit sirius_set_xc_spinor_mode
+    registration instead supplies ns=4 total/z/x/y fields for norm-conserving PW,
+    PAW, and FP-LAPW. They are jointly reconstructed before the callback.
+    The energy and descriptor weights do not scale those fields.
     Return raw covectors of the complete discrete energy, including model weights,
     without dividing by quadrature weights or applying host adjoints. Return the
     same globally summed energy on every rank, including empty ranks. Arrays and
     status are initially zero. Set status nonzero on failure after completing
     callback collectives. Never unwind across the C ABI. The caller retains
     user_data until the context is destroyed. Geometry changes invalidate the
-    supplied quadrature. CPU scalar/collinear PW and PAW are supported, without
-    symmetry reduction. PAW requires explicitly supplied positive core tau.
-    Nonrelativistic FP-LAPW fields are also supported. PW and PAW atomic forces
-    and stress additionally require the point geometry callbacks. Nonrelativistic
+    supplied quadrature. Scalar/collinear PW and PAW are supported on CPU/GPU,
+    without symmetry reduction. PAW and norm-conserving nonlinear core corrections
+    require explicitly supplied positive core tau. FP-LAPW fields are supported on
+    CPU/GPU with scalar-relativistic or native Dirac radial functions.
+    PW and PAW atomic forces and stress additionally require the point geometry callbacks.
     FP-LAPW forces and total stress also require joint Hessian and quadrature-direction
-    callbacks; collinear states must use full variation. SOC is not supported by
-    this point path.
+    callbacks and CPU/GPU fp64 orbitals. Scalar and collinear states use full variation.
+    Noncollinear states use NR/ZORA second variation with SOC or native Dirac full
+    variation, including the radial-basis response. Explicit cores support NR, ZORA
+    and Dirac relativity with scalar valence radial functions; native Dirac valence requires Dirac cores.
   arguments:
     handler:
       type: ctx_handler
@@ -5769,6 +5775,7 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                 if (ctx.initialized()) {
                     RTE_THROW("register external point XC before initializing the context");
                 }
+                ctx.cb().external_xc_spinor_ = false;
                 if (!fptr__) {
                     ctx.cb().external_xc_geometry_             = nullptr;
                     ctx.cb().external_xc_pullback_             = nullptr;
@@ -5798,15 +5805,71 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                     auto const& p = *in.points;
                     int status{0};
                     callback(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
-                             MPI_Comm_c2f(c.comm().native()),
+                                    MPI_Comm_c2f(c.comm().native()),
                              p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
-                             p.descriptor_weights.data(), p.block_sizes.data(),
+                                    p.descriptor_weights.data(), p.block_sizes.data(),
                              p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
-                             in.tau, &out.energy, out.vrho, out.vgradient, out.vtau, &status);
+                                    in.tau, &out.energy, out.vrho, out.vgradient, out.vtau, &status);
                     if (status) {
                         RTE_THROW("external point XC callback returned status " + std::to_string(status));
                     }
                 };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_spinor_mode:
+  doc: >-
+    Opt into total/z/x/y fields for all registered point XC callbacks before
+    initializing the context. Their ns argument becomes four; array storage
+    remains (nr,ns) and (nr,3,ns). Energy, response and geometry callbacks must
+    implement this convention together. No local spin-axis rotation is applied.
+    Supported for norm-conserving PW and PAW spinors, including SOC,
+    forces and stress with the point
+    geometry callbacks.
+    FP-LAPW spinors support energy, orbital derivatives and field Hessian actions on
+    CPU/GPU with NR/ZORA second variation including SOC, or native Dirac full variation
+    without a separate SOC correction. Complete forces and stress, including radial-basis
+    motion, require CPU/GPU fp64 orbitals and the joint Hessian and quadrature-direction callbacks.
+    Scalar/collinear registrations
+    retain their original total/up-down convention when this mode is disabled.
+    Registering a new energy callback resets the mode to disabled.
+    Called collectively on the context communicator with the same enabled value.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    enabled:
+      type: bool
+      attr: in, required
+      doc: Enable the four-component point callback convention.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_spinor_mode(void* const* handler__, bool const* enabled__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx   = get_sim_ctx(handler__);
+                int enabled = enabled__ && *enabled__;
+                int invalid = ctx.initialized() || !enabled__ ||
+                              (enabled &&
+                               (ctx.num_mag_dims() != 3 || !ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int minimum = enabled, maximum = enabled;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&minimum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&maximum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || minimum != maximum) {
+                    RTE_THROW("register a common spinor convention after point XC and before initialization");
+                }
+                ctx.cb().external_xc_spinor_ = enabled;
             },
             error_code__);
 }
@@ -5905,9 +5968,10 @@ sirius_set_xc_point_geometry_callbacks:
     Callbacks are collective, including empty ranks. Outputs start at zero.
     Set status nonzero on failure without unwinding across the C ABI.
     Both null pointers disable geometry evaluation. For PW and PAW, these callbacks
-    supply the explicit XC contribution to atomic forces and stress. Nonrelativistic
-    FP-LAPW forces and total stress additionally require the joint Hessian and
-    quadrature-direction callbacks for the self-consistent core and valence response.
+    supply the explicit XC contribution to atomic forces and stress. FP-LAPW forces
+    and total stress additionally require the joint Hessian and quadrature-direction
+    callbacks for the self-consistent valence and tau-dependent core response.
+    Supported relativity combinations are specified in sirius_set_xc_point_callback.
   arguments:
     handler:
       type: ctx_handler
@@ -5937,9 +6001,9 @@ sirius_set_xc_point_geometry_callbacks(void* const* handler__, void (*field_fptr
 {
     call_sirius(
             [&]() {
-                auto& ctx       = get_sim_ctx(handler__);
-                int invalid     = ctx.initialized() || bool(field_fptr__) != bool(pullback_fptr__) ||
-                                  (field_fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                auto& ctx   = get_sim_ctx(handler__);
+                int invalid = ctx.initialized() || bool(field_fptr__) != bool(pullback_fptr__) ||
+                              (field_fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
                 int enabled_min = bool(field_fptr__), enabled_max = enabled_min;
                 ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
                 ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
@@ -5953,7 +6017,7 @@ sirius_set_xc_point_geometry_callbacks(void* const* handler__, void (*field_fptr
                     ctx.cb().external_xc_pullback_ = nullptr;
                     return;
                 }
-                using field_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
+                using field_t    = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
                                          int const*, double const*, double const*, double const*, double const*,
                                          double*, double*, double*, double*, double*, double*, double*, double*, int*);
                 using pullback_t = void (*)(void*, int, int, int, int, int const*, double const*, double const*,

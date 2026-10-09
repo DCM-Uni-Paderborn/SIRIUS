@@ -109,7 +109,12 @@ energy_enuc(Simulation_context const& ctx, Potential const& potential)
 double
 energy_vloc(Density const& density, Potential const& potential)
 {
-    return sirius::inner(potential.local_potential(), density.rho().rg());
+    double energy   = sirius::inner(potential.local_potential(), density.rho().rg());
+    auto const& ctx = density.ctx();
+    if (ctx.cb().external_xc_ && !ctx.full_potential() && ctx.cfg().parameters().extra_charge() != 0) {
+        energy -= ctx.cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
+    }
+    return energy;
 }
 
 double
@@ -122,7 +127,14 @@ double
 energy_veff(Density const& density, Potential const& potential)
 {
     potential.check_xc_energy_available();
-    return sirius::inner(density.rho(), potential.effective_potential()) + potential.lapw_xc_contractions(density).rho;
+    double energy = sirius::inner(density.rho(), potential.effective_potential()) +
+                    potential.lapw_xc_contractions(density).rho - potential.external_xc_background_contraction();
+    auto const& ctx = density.ctx();
+    if (ctx.cb().external_xc_ && !ctx.full_potential() && ctx.cfg().parameters().extra_charge() != 0) {
+        // Hartree has zero G=0; the remaining background is the local PP term.
+        energy -= ctx.cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
+    }
+    return energy;
 }
 
 double

@@ -21,7 +21,7 @@
 
 namespace sirius {
 
-Potential::Potential(Simulation_context& ctx__)
+Potential::Potential(Simulation_context& ctx__, bool kinetic_potential__)
     : Field4D(ctx__, lmax_t(ctx__.lmax_pot()),
               {ctx__.periodic_function_ptr("veff"), ctx__.periodic_function_ptr("bz"),
                ctx__.periodic_function_ptr("bx"), ctx__.periodic_function_ptr("by")})
@@ -150,7 +150,10 @@ Potential::Potential(Simulation_context& ctx__)
             RTE_THROW("invalid Libxc meta-GGA configuration on a context rank: " + error);
         }
     }
-    if (external_xc_registered_ || ctx_.meta_gga()) {
+    if (kinetic_potential__ && (ctx_.full_potential() || unit_cell_.augment())) {
+        RTE_THROW("explicit kinetic-potential storage requires norm-conserving PW orbitals");
+    }
+    if (external_xc_registered_ || ctx_.meta_gga() || kinetic_potential__) {
         kinetic_potential_ = std::make_unique<Field4D>(ctx_, lmax_t(ctx_.lmax_pot()));
         kinetic_potential_->zero();
     }

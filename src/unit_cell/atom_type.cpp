@@ -98,6 +98,39 @@ Atom_type::init()
             RTE_THROW(s);
         }
 
+        bool dirac               = parameters_.valence_relativity() == relativity_t::dirac;
+        auto complete_radial_set = [](radial_solution_descriptor_set& set, int count) {
+            if (set.empty()) {
+                RTE_THROW("Dirac LAPW requires a nonempty radial descriptor set");
+            }
+            while (static_cast<int>(set.size()) < count) {
+                auto next = set.back();
+                next.dme++;
+                if (next.dme > 3) {
+                    RTE_THROW("Dirac LAPW boundary constraints require independent radial solutions");
+                }
+                set.push_back(next);
+            }
+        };
+        if (dirac) {
+            // Matching both spinor components needs two AW solutions. A confined
+            // LO needs two homogeneous boundary conditions and one scale condition.
+            for (auto& set : aw_descriptors_) {
+                complete_radial_set(set, 2);
+            }
+            auto scalar_lo = std::move(lo_descriptors_);
+            lo_descriptors_.clear();
+            for (auto lo : scalar_lo) {
+                complete_radial_set(lo.rsd_set, 3);
+                int l = lo.am.l();
+                if (l > 0) {
+                    lo.am = angular_momentum(l, -1);
+                    lo_descriptors_.push_back(lo);
+                }
+                lo.am = angular_momentum(l, 1);
+                lo_descriptors_.push_back(lo);
+            }
+        }
         max_aw_order_ = 0;
         for (int l = 0; l <= this->lmax_apw(); l++) {
             max_aw_order_ = std::max(max_aw_order_, (int)aw_descriptors_[l].size());
@@ -110,11 +143,23 @@ Atom_type::init()
         for (auto aw : aw_descriptors_) {
             RTE_ASSERT(aw.size() <= 3);
             for (auto e : aw) {
-                indexr_.add(angular_momentum(e.l));
+                if (!dirac) {
+                    indexr_.add(angular_momentum(e.l));
+                } else if (e.l == 0) {
+                    indexr_.add(angular_momentum(0, 1));
+                } else {
+                    indexr_.add(angular_momentum(e.l, -1), angular_momentum(e.l, 1));
+                }
             }
         }
-        for (auto e : lo_descriptors_) {
-            indexr_.add_lo(e.am);
+        for (size_t i = 0; i < lo_descriptors_.size(); i++) {
+            auto am = lo_descriptors_[i].am;
+            if (dirac && am.l() > 0) {
+                indexr_.add_lo(am, lo_descriptors_[i + 1].am);
+                i++;
+            } else {
+                indexr_.add_lo(am);
+            }
         }
     } else {
         for (int i = 0; i < this->num_beta_radial_functions(); i++) {
@@ -140,7 +185,8 @@ Atom_type::init()
     }
 
     /* initialize index of muffin-tin basis functions */
-    indexb_ = basis_functions_index(indexr_, false);
+    indexb_ = basis_functions_index(indexr_, parameters_.full_potential() &&
+                                                     parameters_.valence_relativity() == relativity_t::dirac);
 
     /* initialize index for wave functions */
     if (ps_atomic_wfs_.size()) {
@@ -199,6 +245,7 @@ Atom_type::init()
     }
 
     if (parameters_.processing_unit() == device_t::GPU && parameters_.full_potential()) {
+        radial_grid_.copy_to_device();
         idx_radial_integrals_.allocate(memory_t::device).copy_to(memory_t::device);
         rf_coef_ = mdarray<double, 3>({num_mt_points(), 4, indexr().size()}, memory_t::host_pinned,
                                       mdarray_label("Atom_type::rf_coef_"));

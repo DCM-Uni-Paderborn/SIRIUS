@@ -21,6 +21,8 @@ namespace sirius {
  *  Spheres must not overlap. Stored physical rho/tau already include any core
  *  contribution and SCF mixing. They are not rebuilt from density matrices,
  *  whose basis may have changed since the physical fields were generated.
+ *  Collinear inputs are spin-resolved; spinor inputs are total/z/x/y, with
+ *  the unpolarized core confined to the total component.
  *
  *  Points belong once to the context communicator, independently of FFT layout.
  *  All operations are collective, including empty point ranks. The geometry and
@@ -43,11 +45,37 @@ class LAPW_xc_field_map
             auto const& grid = density__.ctx().unit_cell().atom(ia__).type().radial_grid();
             int lmmax        = sf::lmmax(density__.ctx().lmax_rho());
             Flm r(lmmax, grid), t(lmmax, grid);
-            for (int s = 0; s < density__.ctx().num_spins(); s++) {
+            std::vector<double> rho_power, tau_power;
+            auto const& ctx           = density__.ctx();
+            auto const& type          = ctx.unit_cell().atom(ia__).type();
+            bool relativistic_valence = ctx.valence_relativity() != relativity_t::none;
+            bool relativistic_core    = type.num_core_electrons() != 0 && ctx.core_relativity() == relativity_t::zora;
+            bool dirac_core           = type.num_core_electrons() != 0 && ctx.core_relativity() == relativity_t::dirac;
+            auto interpolation        = ctx.valence_relativity() == relativity_t::dirac || dirac_core
+                                                ? spheric_interpolation_t::positive_spline
+                                                : spheric_interpolation_t::spline;
+            if (ctx.valence_relativity() == relativity_t::dirac || dirac_core) {
+                // Factor the least regular |kappa|=1 Coulomb products. Higher-j
+                // multipoles retain their additional powers in the regular remainder.
+                // Dirac cores retain these powers even with a scalar valence basis.
+                double gamma = std::sqrt(1 - std::pow(type.zn() / speed_of_light, 2));
+                rho_power.assign(lmmax, 2 * gamma - 2);
+                tau_power.assign(lmmax, 2 * gamma - 4);
+            } else if (relativistic_valence || relativistic_core) {
+                for (int l : sf::l_by_lm(ctx.lmax_rho())) {
+                    // The least regular gradient product in multipole l pairs the two nearest l shells.
+                    tau_power.push_back(radial_solver_local::scalar_relativistic_origin_power(l / 2, type.zn()) +
+                                        radial_solver_local::scalar_relativistic_origin_power((l + 1) / 2, type.zn()) -
+                                        4);
+                }
+            }
+            bool spinor = density__.ctx().num_mag_dims() == 3;
+            int ns      = spinor ? 4 : density__.ctx().num_spins();
+            for (int s = 0; s < ns; s++) {
                 for (size_t i = 0; i < r.size(); i++) {
-                    r[i] = density__.rho().mt()[ia__][i];
-                    t[i] = density__.kinetic_density().scalar().mt()[ia__][i];
-                    if (density__.ctx().num_spins() == 2) {
+                    r[i] = density__.component(spinor ? s : 0).mt()[ia__][i];
+                    t[i] = density__.kinetic_density().component(spinor ? s : 0).mt()[ia__][i];
+                    if (!spinor && ns == 2) {
                         r[i] = 0.5 * (r[i] + (1 - 2 * s) * density__.mag(0).mt()[ia__][i]);
                         t[i] = 0.5 * (t[i] + (1 - 2 * s) * density__.kinetic_density().vector(0).mt()[ia__][i]);
                     }
@@ -55,8 +83,8 @@ class LAPW_xc_field_map
                         RTE_THROW("LAPW XC field map: nonfinite physical muffin-tin field");
                     }
                 }
-                rho.emplace_back(r, spheric_inner_extension_t::charge);
-                tau.emplace_back(t, spheric_inner_extension_t::kinetic);
+                rho.emplace_back(r, spheric_inner_extension_t::charge, rho_power, interpolation);
+                tau.emplace_back(t, spheric_inner_extension_t::kinetic, tau_power, interpolation);
             }
         }
     };
@@ -66,6 +94,12 @@ class LAPW_xc_field_map
     std::vector<source_t> sources_;
     std::vector<int> interstitial_targets_;
     std::unique_ptr<Smooth_periodic_function_sampler> interstitial_;
+
+    int
+    num_components() const
+    {
+        return ctx_.num_mag_dims() == 3 ? 4 : ctx_.num_spins();
+    }
 
     void
     check(bool failed__, char const* message__) const
@@ -80,7 +114,7 @@ class LAPW_xc_field_map
     void
     check_covectors(xc_point_fields_t const& d__) const
     {
-        int ns       = ctx_.num_spins();
+        int ns       = num_components();
         bool invalid = d__.rho.size(0) != num_points_ || d__.rho.size(1) != ns || d__.tau.size(0) != num_points_ ||
                        d__.tau.size(1) != ns || d__.gradient.size(0) != num_points_ || d__.gradient.size(1) != 3 ||
                        d__.gradient.size(2) != ns;
@@ -145,9 +179,13 @@ class LAPW_xc_field_map
         std::string message;
         std::vector<r3::vector<double>> interstitial_points;
         try {
-            if (!ctx_.full_potential() || !density__.has_kinetic_density() || ctx_.num_mag_dims() == 3 ||
-                ctx_.so_correction() || points__.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-                RTE_THROW("LAPW XC field map requires scalar nonmagnetic/collinear full-potential fields");
+            if (!ctx_.full_potential() || !density__.has_kinetic_density() ||
+                (ctx_.num_mag_dims() == 3 && ctx_.valence_relativity() != relativity_t::none &&
+                 ctx_.valence_relativity() != relativity_t::zora && ctx_.valence_relativity() != relativity_t::dirac) ||
+                (ctx_.so_correction() && ctx_.num_mag_dims() != 3) ||
+                points__.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                RTE_THROW("LAPW XC field map requires scalar-relativistic, NR/ZORA spinor or Dirac full-potential "
+                          "rho/tau fields");
             }
             for (auto const& p : points__) {
                 for (int x = 0; x < 3; x++) {
@@ -164,9 +202,12 @@ class LAPW_xc_field_map
                 auto& source  = sources_.back();
                 double radius = atom.type().radial_grid().last();
                 auto limits   = r3::find_translations(radius, uc.lattice_vectors());
+                auto centre   = r3::dot(uc.lattice_vectors(), atom.position());
                 for (int p = 0; p < num_points_; p++) {
-                    auto d0    = points__[p] - r3::dot(uc.lattice_vectors(), atom.position());
-                    auto shift = r3::dot(uc.inverse_lattice_vectors(), d0);
+                    auto d0          = points__[p] - centre;
+                    auto shift       = r3::dot(uc.inverse_lattice_vectors(), d0);
+                    double tolerance = 32 * std::numeric_limits<double>::epsilon() *
+                                       std::max({1.0, radius, points__[p].length(), centre.length()});
                     for (int x = 0; x < 3; x++) {
                         shift[x] = std::nearbyint(shift[x]);
                     }
@@ -174,12 +215,17 @@ class LAPW_xc_field_map
                     for (int z = -limits[2]; z <= limits[2]; z++) {
                         for (int y = -limits[1]; y <= limits[1]; y++) {
                             for (int x = -limits[0]; x <= limits[0]; x++) {
-                                auto d = d0 - r3::dot(uc.lattice_vectors(), r3::vector<double>(x, y, z));
-                                if (d.length() > radius) {
+                                auto d          = d0 - r3::dot(uc.lattice_vectors(), r3::vector<double>(x, y, z));
+                                double distance = d.length();
+                                if (distance > radius + tolerance) {
                                     continue;
                                 }
-                                if (owner[p] != -1 || d.length() < 1e-12) {
+                                if (owner[p] != -1 || distance < 1e-12) {
                                     RTE_THROW("LAPW XC field map: overlapping spheres or exact-nucleus target");
+                                }
+                                // Surface quadrature must not change domains after coordinate roundoff.
+                                if (distance > radius) {
+                                    d = d * (radius / distance);
                                 }
                                 owner[p] = ia;
                                 source.displacements.push_back(d);
@@ -208,7 +254,7 @@ class LAPW_xc_field_map
     sample(std::vector<Smooth_periodic_function<double>> const& rho__,
            std::vector<Smooth_periodic_function<double>> const& tau__) const
     {
-        int ns = ctx_.num_spins();
+        int ns = num_components();
         check(rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns),
               "LAPW XC field map: incompatible spin fields");
         xc_point_fields_t result(num_points_, ns);
@@ -231,9 +277,8 @@ class LAPW_xc_field_map
                     int p = source.targets[j];
                     for (int s = 0; s < ns; s++) {
                         auto r           = source.rho[s].value_gradient(source.displacements[j]);
-                        auto t           = source.tau[s].value_gradient(source.displacements[j]);
                         result.rho(p, s) = r[0];
-                        result.tau(p, s) = t[0];
+                        result.tau(p, s) = source.tau[s].value(source.displacements[j]);
                         for (int x = 0; x < 3; x++) {
                             result.gradient(p, x, s) = r[x + 1];
                         }
@@ -267,7 +312,7 @@ class LAPW_xc_field_map
                       std::vector<r3::vector<double>> const& point_directions__,
                       mdarray<double, 2> const& atom_directions__, r3::matrix<double> const& lattice_direction__) const
     {
-        int ns = ctx_.num_spins();
+        int ns = num_components();
         check(rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns),
               "LAPW XC geometry response: incompatible spin fields");
         check_geometry_direction(point_directions__, atom_directions__, lattice_direction__);
@@ -298,9 +343,9 @@ class LAPW_xc_field_map
                     int p = source.targets[j];
                     for (int s = 0; s < ns; s++) {
                         auto r           = source.rho[s].position_response(source.displacements[j], directions[j]);
-                        auto t           = source.tau[s].position_response(source.displacements[j], directions[j]);
+                        auto t           = source.tau[s].value_gradient(source.displacements[j]);
                         result.rho(p, s) = r[0];
-                        result.tau(p, s) = t[0];
+                        result.tau(p, s) = t[1] * directions[j][0] + t[2] * directions[j][1] + t[3] * directions[j][2];
                         for (int x = 0; x < 3; x++) {
                             result.gradient(p, x, s) = r[x + 1];
                         }
@@ -326,7 +371,7 @@ class LAPW_xc_field_map
                      std::vector<Smooth_periodic_function<double>> const& tau__,
                      xc_point_fields_t const& derivatives__) const
     {
-        int ns = ctx_.num_spins();
+        int ns = num_components();
         check(rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns),
               "LAPW XC geometry adjoint: incompatible spin fields");
         check_covectors(derivatives__);
@@ -383,7 +428,7 @@ class LAPW_xc_field_map
     adjoint_impl(xc_point_fields_t const& d__, std::vector<r3::vector<double>> const* point_directions__,
                  mdarray<double, 2> const* atom_directions__, r3::matrix<double> const* lattice_direction__) const
     {
-        int ns = ctx_.num_spins();
+        int ns = num_components();
         check_covectors(d__);
         if (point_directions__) {
             check_geometry_direction(*point_directions__, *atom_directions__, *lattice_direction__);
@@ -417,9 +462,12 @@ class LAPW_xc_field_map
                             point_directions__
                                     ? source.tau[s].geometry_adjoint_response(source.displacements, dt, directions)
                                     : source.tau[s].adjoint(source.displacements, dt));
-                    for (int ir = 0; ir < type.num_mt_points(); ir++) {
-                        result.core.back()[0][ir] += result.local.back()[0][s](0, ir) / (ns * y00);
-                        result.core.back()[1][ir] += result.local.back()[1][s](0, ir) / (ns * y00);
+                    if (ns != 4 || s == 0) {
+                        double core_spins = ns == 4 ? 1 : ns;
+                        for (int ir = 0; ir < type.num_mt_points(); ir++) {
+                            result.core.back()[0][ir] += result.local.back()[0][s](0, ir) / (core_spins * y00);
+                            result.core.back()[1][ir] += result.local.back()[1][s](0, ir) / (core_spins * y00);
+                        }
                     }
                 }
             }

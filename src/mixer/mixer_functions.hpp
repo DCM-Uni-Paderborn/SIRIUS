@@ -29,6 +29,9 @@ FunctionProperties<Periodic_function<double>>
 periodic_function_property();
 
 FunctionProperties<Periodic_function<double>>
+periodic_function_property_tau();
+
+FunctionProperties<Periodic_function<double>>
 periodic_function_property_rho_pw(bool use_coarse_gvec__);
 
 FunctionProperties<Periodic_function<double>>

@@ -13,10 +13,116 @@
 #include "function3d/xc_point_fields.hpp"
 #include "lapw/step_function.hpp"
 #include <map>
+#include <sstream>
+#include <tuple>
 
 using namespace sirius;
 
 namespace {
+
+// Independent occupied-state radial Pulay contraction used only in the checks below.
+double
+radial_basis_derivative(Potential& potential, K_point_set& kset, std::vector<std::vector<double>> const& directions__,
+                        std::vector<std::array<std::vector<double>, 2>> const& xc_directions__ = {},
+                        bool update_enu__                                                      = true)
+{
+    auto& ctx_  = kset.ctx();
+    auto& uc    = ctx_.unit_cell();
+    int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
+                  ctx_.valence_relativity() != relativity_t::none || ctx_.so_correction() || ctx_.num_mag_dims() == 3 ||
+                  ctx_.hubbard_correction() ||
+                  (uc.num_core_electrons() != 0 && ctx_.core_relativity() != relativity_t::none) ||
+                  (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) ||
+                  directions__.size() != uc.num_atom_symmetry_classes() ||
+                  (!xc_directions__.empty() && xc_directions__.size() != directions__.size());
+    if (!invalid) {
+        for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
+            invalid |= directions__[ic].size() != uc.atom_symmetry_class(ic).atom_type().num_mt_points() ||
+                       !std::all_of(directions__[ic].begin(), directions__[ic].end(),
+                                    [](double x) { return std::isfinite(x); });
+            if (!xc_directions__.empty()) {
+                auto const& cls = uc.atom_symmetry_class(ic);
+                for (auto const& field : xc_directions__[ic]) {
+                    invalid |=
+                            !field.empty() &&
+                            (field.size() != directions__[ic].size() ||
+                             !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); }) ||
+                             (cls.atom_type().num_core_electrons() != 0 && cls.spherical_xc_derivatives()[0].empty()));
+                }
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW radial basis derivative requires nonrelativistic scalar/collinear valence states and valid "
+                  "directions");
+    }
+
+    // Differentiate the stored basis without updating its potential or energies.
+    Hamiltonian0<double> h0(potential, false);
+    std::vector<radial_basis_response_t> response;
+    for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
+        response.push_back(uc.atom_symmetry_class(ic).radial_basis_potential_response(
+                directions__[ic], xc_directions__.empty() ? std::array<std::vector<double>, 2>{} : xc_directions__[ic],
+                update_enu__));
+    }
+    auto matrices = h0.lapw_radial_basis_response(response);
+
+    int ns = ctx_.num_spins();
+    double result{0};
+    for (auto it : kset.spl_num_kpoints()) {
+        auto& kp = *kset.get<double>(it.i);
+        Matching_coefficients matching(uc, kp.gkvec());
+        std::vector<mdarray<std::complex<double>, 2>> alm, dalm;
+        for (int ia = 0; ia < uc.num_atoms(); ia++) {
+            auto const& atom = uc.atom(ia);
+            std::array<index_range, 2> shape{kp.gkvec().count(), atom.type().mt_aw_basis_size()};
+            alm.emplace_back(shape);
+            dalm.emplace_back(shape);
+            matching.generate<false>(atom, alm.back());
+            matching.generate_potential_response<false>(atom, response[atom.symmetry_class().id()], dalm.back());
+        }
+        for (int s = 0; s < ns; s++) {
+            for (int band = 0; band < ctx_.num_bands(); band++) {
+                double weight = kp.weight() * kp.band_occupancy(band, s) / kp.comm().size();
+                if (weight == 0) {
+                    continue;
+                }
+                auto all   = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(band));
+                int offset = kp.gkvec().num_gvec();
+                for (int ia = 0; ia < uc.num_atoms(); ia++) {
+                    auto const& type = uc.atom(ia).type();
+                    int n = type.mt_basis_size(), naw = type.mt_aw_basis_size();
+                    std::vector<std::complex<double>> c(n), dc(n);
+                    for (int i = 0; i < naw; i++) {
+                        for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                            c[i] += alm[ia](ig, i) * all[kp.gkvec().offset() + ig];
+                            dc[i] += dalm[ia](ig, i) * all[kp.gkvec().offset() + ig];
+                        }
+                    }
+                    kp.comm().allreduce(c.data(), naw);
+                    kp.comm().allreduce(dc.data(), naw);
+                    for (int i = naw; i < n; i++) {
+                        c[i] = all[offset + i];
+                    }
+                    auto const& d = matrices[ia];
+                    double energy = kp.band_energy(band, s);
+                    for (int j = 0; j < n; j++) {
+                        for (int i = 0; i < n; i++) {
+                            result +=
+                                    weight * std::real(2.0 * std::conj(dc[i]) *
+                                                               (h0.hmt(ia)(i, j, s) - energy * d.overlap(i, j)) * c[j] +
+                                                       std::conj(c[i]) * (d.h(i, j, s) - energy * d.o(i, j)) * c[j]);
+                        }
+                    }
+                    offset += n;
+                }
+            }
+        }
+    }
+    ctx_.comm().allreduce(&result, 1);
+    return result;
+}
 
 // A fixed model parameter keeps geometry dependence in the explicit quadrature data.
 constexpr double functional_normalization = 336.0;
@@ -34,7 +140,8 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
         RTE_THROW("LAPW fixture requires reconstructed point fields");
     }
     double moment{0}, energy{0};
-    for (int s = 0; s < in.num_spins; s++) {
+    bool spinor = in.num_spins == 4;
+    for (int s = 0; s < (spinor ? 1 : in.num_spins); s++) {
         for (int p = 0; p < in.num_points; p++) {
             int j = p + in.num_points * s;
             moment += in.points->descriptor_weights[p] * (in.rho[j] + 0.3 * in.tau[j]);
@@ -47,9 +154,10 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
             int j    = p + in.num_points * s;
             double w = in.points->energy_weights[p], d = in.points->descriptor_weights[p];
             double r = in.rho[j], t = in.tau[j];
-            double local = 0.02 * r * r + 0.01 * t * t + 0.005 * r * t;
-            out.vrho[j]  = w * (0.04 * r + 0.005 * t) + d * nonlocal;
-            out.vtau[j]  = w * (0.02 * t + 0.005 * r) + 0.3 * d * nonlocal;
+            double local      = 0.02 * r * r + 0.01 * t * t + 0.005 * r * t;
+            double descriptor = spinor && s > 0 ? 0 : nonlocal;
+            out.vrho[j]       = w * (0.04 * r + 0.005 * t) + d * descriptor;
+            out.vtau[j]       = w * (0.02 * t + 0.005 * r) + 0.3 * d * descriptor;
             for (int x = 0; x < 3; x++) {
                 int k = p + in.num_points * (x + 3 * s);
                 local += 0.002 * in.gradient[k] * in.gradient[k];
@@ -58,7 +166,7 @@ functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc_call
             energy += w * local;
             if (out.geometry) {
                 out.geometry->energy_weights[p] += local;
-                out.geometry->descriptor_weights[p] += nonlocal * (r + 0.3 * t);
+                out.geometry->descriptor_weights[p] += descriptor * (r + 0.3 * t);
             }
         }
     }
@@ -90,7 +198,8 @@ functional_response(Simulation_context const& ctx, xc_callback_input_t const& in
                     xc_callback_direction_t const& direction, xc_callback_response_t& out)
 {
     double moment{0}, base_moment{0};
-    for (int s = 0; s < in.num_spins; s++) {
+    bool spinor = in.num_spins == 4;
+    for (int s = 0; s < (spinor ? 1 : in.num_spins); s++) {
         for (int p = 0; p < in.num_points; p++) {
             int j = p + in.num_points * s;
             moment += in.points->descriptor_weights[p] * (direction.rho[j] + 0.3 * direction.tau[j]);
@@ -111,10 +220,12 @@ functional_response(Simulation_context const& ctx, xc_callback_input_t const& in
             double dw = direction.geometry ? direction.geometry->energy_weights[p] : 0;
             double dd = direction.geometry ? direction.geometry->descriptor_weights[p] : 0;
             double r = in.rho[j], t = in.tau[j], dr = direction.rho[j], dt = direction.tau[j];
-            out.vrho[j]  = scale * (w * (0.04 * dr + 0.005 * dt) + dw * (0.04 * r + 0.005 * t) + d * nonlocal +
-                                    dd * base_nonlocal);
+            double descriptor      = spinor && s > 0 ? 0 : nonlocal;
+            double base_descriptor = spinor && s > 0 ? 0 : base_nonlocal;
+            out.vrho[j]  = scale * (w * (0.04 * dr + 0.005 * dt) + dw * (0.04 * r + 0.005 * t) + d * descriptor +
+                                   dd * base_descriptor);
             out.vtau[j]  = scale * (w * (0.02 * dt + 0.005 * dr) + dw * (0.02 * t + 0.005 * r) +
-                                    0.3 * (d * nonlocal + dd * base_nonlocal));
+                                   0.3 * (d * descriptor + dd * base_descriptor));
             double local = (0.04 * r + 0.005 * t) * dr + (0.02 * t + 0.005 * r) * dt;
             for (int x = 0; x < 3; x++) {
                 int k            = p + in.num_points * (x + 3 * s);
@@ -124,7 +235,7 @@ functional_response(Simulation_context const& ctx, xc_callback_input_t const& in
             if (out.geometry) {
                 out.geometry->energy_weights[p] += scale * local;
                 out.geometry->descriptor_weights[p] +=
-                        scale * (nonlocal * (r + 0.3 * t) + base_nonlocal * (dr + 0.3 * dt));
+                        scale * (descriptor * (r + 0.3 * t) + base_descriptor * (dr + 0.3 * dt));
             }
         }
     }
@@ -133,7 +244,9 @@ functional_response(Simulation_context const& ctx, xc_callback_input_t const& in
 auto
 context(int mag, bool distributed_fft, bool second_variation, bool core = false, bool relativistic_core = false,
         double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false, int auto_enu = 0,
-        std::string smearing = "", bool moving_core_grid = false)
+        std::string smearing = "", bool moving_core_grid = false, std::string processing_unit = "CPU",
+        bool spin_orbit = false, std::string valence_relativity = "none", bool external_scalar = false,
+        std::string core_relativity = "", int radial_points = 0)
 {
     auto config                               = R"({"parameters": {
         "electronic_structure_method": "full_potential_lapwlo", "use_symmetry": false,
@@ -144,17 +257,27 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     "iterative_solver": {"type": "exact", "min_tolerance": 1e-11},
     "mixer": {"type": "linear", "beta": 0.4, "use_hartree": false}})"_json;
     config["parameters"]["num_mag_dims"]      = mag;
-    config["parameters"]["fixed_mag"]         = mag ? 0.4 : 0.0;
+    config["parameters"]["fixed_mag"]         = mag == 1 && valence_relativity != "dirac" ? 0.4 : 0.0;
     config["control"]["use_second_variation"] = second_variation;
+    config["control"]["processing_unit"]      = processing_unit;
+    config["parameters"]["so_correction"]     = spin_orbit;
     config["control"]["mpi_grid_dims"]        = {distributed_fft ? mpi::Communicator::world().size() : 1, 1};
-    config["parameters"]["core_relativity"]   = relativistic_core ? "dirac" : "none";
-    config["parameters"]["num_bands"]         = core ? (moving_core_grid ? 16 : 8) : 4;
-    config["parameters"]["pw_cutoff"]         = pw_cutoff;
+    config["parameters"]["core_relativity"] =
+            core_relativity.empty() ? (relativistic_core ? "dirac" : "none") : core_relativity;
+    config["parameters"]["valence_relativity"] = valence_relativity;
+    // Spinor bands hold one electron; retain virtual states for the core response.
+    config["parameters"]["num_bands"] =
+            core ? (moving_core_grid ? 16 : 8) * (mag == 3 || valence_relativity == "dirac" ? 2 : 1)
+                 : (valence_relativity == "dirac" ? 8 : 4);
+    config["parameters"]["pw_cutoff"] = pw_cutoff;
     if (moving_core_grid) {
         config["mixer"]["type"] = "anderson_stable";
     }
     if (!smearing.empty()) {
         config["parameters"]["smearing"] = smearing;
+        if (valence_relativity == "dirac") {
+            config["parameters"]["smearing_width"] = 0.2;
+        }
     }
     config["settings"]["simple_lapw_ri"] = simple_radial_integrals;
     auto ctx                             = std::make_unique<Simulation_context>(config);
@@ -162,7 +285,7 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     std::string label = core ? "Ne" : "He";
     auto& type        = ctx->unit_cell().add_atom_type(label);
     type.zn(core ? 10 : 2);
-    type.set_radial_grid(radial_grid_t::power, core ? 3201 : 801, 1e-6, 1.8, 2.0);
+    type.set_radial_grid(radial_grid_t::power, radial_points ? radial_points : (core ? 3201 : 801), 1e-6, 1.8, 2.0);
     auto grid = Radial_grid_factory<double>(radial_grid_t::power, 3000, 1e-7, 20.0, 3.0);
     std::vector<double> rho(grid.num_points());
     for (int ir = 0; ir < grid.num_points(); ir++) {
@@ -183,7 +306,7 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
     }
     ctx->unit_cell().add_atom(
             label, {0.23 + 0.23 * displacement / 6, 0.31 - 0.37 * displacement / 7, 0.43 + 0.19 * displacement / 8},
-            {0, 0, mag ? 0.2 : 0.0});
+            {mag == 3 ? 0.09 : 0, mag == 3 ? 0.13 : 0, mag ? 0.2 : 0.0});
     if (mag && !second_variation && !core) {
         ctx->unit_cell().add_atom(label, {0.71, 0.79, 0.86}, {0, 0, 0.2});
     } else if (moving_core_grid) {
@@ -269,11 +392,29 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
             points->block_centres = {{1.38, 2.17, 3.44}};
         }
     }
-    ctx->cb().external_xc_points_   = std::move(points);
-    ctx->cb().external_xc_          = functional;
-    ctx->cb().external_xc_response_ = functional_response;
+    // Scalar-relativistic fixtures test the bare basis and H/O response before enabling external XC.
+    if (valence_relativity == "none" || external_scalar) {
+        ctx->cb().external_xc_points_   = std::move(points);
+        ctx->cb().external_xc_          = functional;
+        ctx->cb().external_xc_response_ = functional_response;
+        ctx->cb().external_xc_spinor_   = mag == 3;
+    }
     ctx->initialize();
     return ctx;
+}
+
+std::vector<std::complex<double>>
+lapw_coefficients(K_point<double> const& kp, int spin, int band)
+{
+    auto all   = kp.spinor_wave_functions().gather(wf::spin_index(spin), wf::band_index(band));
+    int offset = kp.gkvec().num_gvec();
+    std::vector<std::complex<double>> c(all.begin(), all.begin() + offset);
+    for (int ia = 0; ia < kp.ctx().unit_cell().num_atoms(); ia++) {
+        auto const& type = kp.ctx().unit_cell().atom(ia).type();
+        c.insert(c.end(), all.begin() + offset + type.mt_aw_basis_size(), all.begin() + offset + type.mt_basis_size());
+        offset += type.mt_basis_size();
+    }
+    return c;
 }
 
 double
@@ -282,14 +423,7 @@ occupied_lapw_lagrangian(Simulation_context const& ctx, K_point<double> const& k
 {
     double value{0};
     for (int b = 0; b < ctx.num_bands(); b++) {
-        auto all = kp.spinor_wave_functions().gather(wf::spin_index(spin), wf::band_index(b));
-        int ng   = kp.gkvec().num_gvec();
-        std::vector<std::complex<double>> c(all.begin(), all.begin() + ng);
-        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
-            auto const& type = ctx.unit_cell().atom(ia).type();
-            c.insert(c.end(), all.begin() + ng + type.mt_aw_basis_size(), all.begin() + ng + type.mt_basis_size());
-            ng += type.mt_basis_size();
-        }
+        auto c        = lapw_coefficients(kp, spin, b);
         double weight = kp.weight() * kp.band_occupancy(b, spin) * ctx.blacs_grid().comm().size() / kp.comm().size();
         for (int j = 0; j < h.num_cols_local(); j++) {
             for (int i = 0; i < h.num_rows_local(); i++) {
@@ -319,6 +453,127 @@ potential_samples(Periodic_function<double> const& potential)
         }
     }
     return result;
+}
+
+std::array<std::vector<double>, 2>
+lapw_field_samples(Density const& density)
+{
+    std::array<std::vector<double>, 2> result;
+    for (int part : {0, 1}) {
+        auto const& fields = part == 0 ? static_cast<Field4D const&>(density) : density.kinetic_density();
+        for (int s = 0; s <= density.ctx().num_mag_dims(); s++) {
+            auto values = potential_samples(fields.component(s));
+            result[part].insert(result[part].end(), values.begin(), values.end());
+        }
+    }
+    return result;
+}
+
+void
+check_coefficient_geometry(Test_check& check, Density const& density, K_point_set& ks,
+                           std::vector<mdarray<std::complex<double>, 3>> const& matrices)
+{
+    auto& ctx       = ks.ctx();
+    auto lattice    = ctx.unit_cell().lattice_vectors();
+    auto quadrature = ctx.cb().external_xc_points_;
+    std::vector<r3::vector<double>> positions, centres;
+    for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+        positions.push_back(ctx.unit_cell().atom(ia).position());
+        centres.push_back(ctx.unit_cell().get_cartesian_coordinates(positions.back()));
+    }
+    for (int part = 0; part < 3; part++) {
+        xc_geometry_direction_t direction(ctx.unit_cell().num_atoms());
+        if (part != 1) {
+            direction.atoms[0] = {0.23, -0.37, 0.19};
+        }
+        r3::matrix<double> strain;
+        if (part != 0) {
+            strain(0, 0) = 0.07;
+            strain(1, 1) = -0.03;
+            strain(2, 2) = 0.02;
+            strain(0, 1) = -0.04;
+            strain(2, 0) = 0.05;
+        }
+        auto dlattice = dot(strain, lattice);
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                direction.lattice[x + 3 * y] = dlattice(x, y);
+            }
+        }
+        auto analytic = lapw_field_samples(*density.lapw_density_matrix_geometry_response(ks, matrices, direction));
+        auto evaluate = [&](double step) {
+            auto shifted = lattice;
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    shifted(x, y) += step * dlattice(x, y);
+                }
+            }
+            ctx.unit_cell().set_lattice_vectors(shifted);
+            for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                auto const& d = direction.atoms[ia];
+                ctx.unit_cell().atom(ia).set_position(
+                        dot(inverse(shifted), centres[ia] + r3::vector<double>{d[0], d[1], d[2]} * step));
+            }
+            for (auto it : ks.spl_num_kpoints()) {
+                ks.get<double>(it.i)->update();
+            }
+            auto next                    = std::make_shared<xc_point_set_t>(ctx);
+            next->coordinates            = quadrature->coordinates;
+            next->energy_weights         = quadrature->energy_weights;
+            next->descriptor_weights     = quadrature->descriptor_weights;
+            next->block_sizes            = quadrature->block_sizes;
+            next->block_centres          = quadrature->block_centres;
+            ctx.cb().external_xc_points_ = next;
+            return lapw_field_samples(*density.lapw_density_matrix_fields(ks, matrices));
+        };
+        for (double step : {1e-4, 5e-5}) {
+            auto plus = evaluate(step), minus = evaluate(-step);
+            for (int field : {0, 1}) {
+                double error{0}, peak{0};
+                for (size_t i = 0; i < analytic[field].size(); i++) {
+                    double residual = std::abs(analytic[field][i] - (plus[field][i] - minus[field][i]) / (2 * step));
+                    error           = std::isfinite(residual) ? std::max(error, residual)
+                                                              : std::numeric_limits<double>::infinity();
+                    peak            = std::max(peak, std::abs(analytic[field][i]));
+                }
+                ctx.comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                ctx.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                check(field == 0 ? "PW/LO geometry rho response" : "PW/LO geometry tau response",
+                      error / std::max(1e-12, peak), 3e-7);
+                check("nonzero geometry field response", peak > 1e-8 ? 0 : 1, 0);
+            }
+        }
+        ctx.unit_cell().set_lattice_vectors(lattice);
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            ctx.unit_cell().atom(ia).set_position(positions[ia]);
+        }
+        for (auto it : ks.spl_num_kpoints()) {
+            ks.get<double>(it.i)->update();
+        }
+        ctx.cb().external_xc_points_ = quadrature;
+        if (part == 0) {
+            auto bad = direction;
+            if (ctx.comm().rank() == 0) {
+                bad.atoms.clear();
+            }
+            check.reject("geometry fields reject malformed directions collectively",
+                         [&] { density.lapw_density_matrix_geometry_response(ks, matrices, bad); });
+            bad = direction;
+            if (ctx.comm().rank() == 0) {
+                bad.lattice[0] = std::numeric_limits<double>::quiet_NaN();
+            }
+            check.reject("geometry fields reject nonfinite directions collectively",
+                         [&] { density.lapw_density_matrix_geometry_response(ks, matrices, bad); });
+            if (ctx.comm().size() > 1) {
+                bad = direction;
+                if (ctx.comm().rank() == 0) {
+                    bad.atoms[0][0] += 0.01;
+                }
+                check.reject("geometry fields reject inconsistent replicas",
+                             [&] { density.lapw_density_matrix_geometry_response(ks, matrices, bad); });
+            }
+        }
+    }
 }
 
 double
@@ -411,36 +666,45 @@ radial_hartree_response(Simulation_context const& ctx, Potential const& potentia
 std::vector<double>
 sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::vector<double>> const& vs,
                      std::vector<std::array<std::vector<double>, 2>> const& core_xc,
-                     std::vector<double>* hartree = nullptr, std::vector<double>* xc = nullptr)
+                     std::vector<double>* hartree = nullptr, std::vector<double>* xc = nullptr,
+                     Density* valence = nullptr)
 {
-    std::vector<int> nlo;
-    for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
-        nlo.push_back(ctx.unit_cell().atom(ia).type().mt_lo_basis_size());
-    }
     std::vector<std::complex<double>> saved;
     for (auto it : ks.spl_num_kpoints()) {
         auto kp   = ks.get<double>(it.i);
         auto& psi = kp->spinor_wave_functions();
-        wf::Wave_functions<double> evec(kp->gkvec_sptr(), nlo, wf::num_mag_dims(0), wf::num_bands(ctx.num_bands()),
-                                        memory_t::host);
+        Matching_coefficients matching(ctx.unit_cell(), kp->gkvec());
+        std::vector<mdarray<std::complex<double>, 2>> alm;
+        for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+            auto const& atom = ctx.unit_cell().atom(ia);
+            alm.emplace_back(std::array<index_range, 2>{kp->gkvec().count(), atom.type().mt_aw_basis_size()});
+            matching.generate<false>(atom, alm.back());
+        }
+        // Reconstruct every physical band, including the second-variation spinors.
         for (int s = 0; s < ctx.num_spins(); s++) {
             for (int b = 0; b < ctx.num_bands(); b++) {
                 auto spin = wf::spin_index(s);
                 auto band = wf::band_index(b);
                 auto data = psi.at(memory_t::host, 0, spin, band);
                 saved.insert(saved.end(), data, data + psi.ld());
-                for (int ig = 0; ig < kp->gkvec().count(); ig++) {
-                    evec.pw_coeffs(ig, wf::spin_index(0), band) = psi.pw_coeffs(ig, spin, band);
-                }
-                for (auto atom : evec.spl_num_atoms()) {
-                    int naw = ctx.unit_cell().atom(atom.i).type().mt_aw_basis_size();
-                    for (int j = 0; j < nlo[atom.i]; j++) {
-                        evec.mt_coeffs(j, atom.li, wf::spin_index(0), band) =
-                                psi.mt_coeffs(naw + j, atom.li, spin, band);
+                for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
+                    int naw = ctx.unit_cell().atom(ia).type().mt_aw_basis_size();
+                    std::vector<std::complex<double>> c(naw);
+                    for (int xi = 0; xi < naw; xi++) {
+                        for (int ig = 0; ig < kp->gkvec().count(); ig++) {
+                            c[xi] += alm[ia](ig, xi) * psi.pw_coeffs(ig, spin, band);
+                        }
+                    }
+                    kp->comm().allreduce(c.data(), naw);
+                    auto location = psi.spl_num_atoms().location(atom_index_t::global(ia));
+                    if (location.ib == kp->comm().rank()) {
+                        auto local = location.index_local;
+                        for (int xi = 0; xi < naw; xi++) {
+                            psi.mt_coeffs(xi, local, spin, band) = c[xi];
+                        }
                     }
                 }
             }
-            kp->generate_lapw_wave_functions(evec, psi, s);
         }
     }
     auto restore = [&] {
@@ -461,6 +725,9 @@ sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::
         Density density(ctx);
         density.generate_core_charge_density(vs, core_xc);
         density.generate<double>(ks, false, true, false);
+        if (valence) {
+            valence->generate<double>(ks, false, false, true);
+        }
         if (hartree) {
             Potential potential(ctx);
             // Omit the fixed nuclear potential before subtraction to avoid near-origin cancellation.
@@ -473,7 +740,12 @@ sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::
         }
         for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
             for (auto* fields : {static_cast<Field4D*>(&density), &density.kinetic_density()}) {
-                for (int s = 0; s < ctx.num_spins(); s++) {
+                for (int s = 0; s < (ctx.num_mag_dims() == 3 ? 4 : ctx.num_spins()); s++) {
+                    if (ctx.num_mag_dims() == 3) {
+                        auto const& component = fields->component(s).mt()[ia];
+                        result.insert(result.end(), component.begin(), component.end());
+                        continue;
+                    }
                     auto const& scalar = fields->scalar().mt()[ia];
                     for (size_t i = 0; i < scalar.size(); i++) {
                         result.push_back(ctx.num_spins() == 1
@@ -520,24 +792,41 @@ radial_fields_error(std::vector<std::array<std::vector<Flm>, 2>> const& analytic
 }
 
 std::array<double, 4>
-lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<double>>& dh)
+lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<double>>& dh,
+                     la::dmatrix<std::complex<double>> const* overlap_direction  = nullptr,
+                     la::dmatrix<std::complex<double>> const* physical_direction = nullptr)
 {
-    auto& ctx = hk.H0().ctx();
-    auto& kp  = hk.kp();
-    int n = kp.gklo_basis_size(), bs = ctx.cyclic_block_size();
+    auto& ctx  = hk.H0().ctx();
+    auto& kp   = hk.kp();
+    bool dirac = ctx.valence_relativity() == relativity_t::dirac;
+    int n      = dirac ? 2 * kp.num_gkvec() + ctx.unit_cell().mt_lo_basis_size() : kp.gklo_basis_size();
+    int bs     = ctx.cyclic_block_size();
     la::dmatrix<std::complex<double>> h(n, n, ctx.blacs_grid(), bs, bs);
     la::dmatrix<std::complex<double>> s(n, n, ctx.blacs_grid(), bs, bs);
     la::dmatrix<std::complex<double>> ds(n, n, ctx.blacs_grid(), bs, bs);
     la::dmatrix<std::complex<double>> shifted_h(n, n, ctx.blacs_grid(), bs, bs);
     la::dmatrix<std::complex<double>> shifted_s(n, n, ctx.blacs_grid(), bs, bs);
-    hk.set_fv_h_o(0, h, s);
+    la::dmatrix<std::complex<double>> physical_s(n, n, ctx.blacs_grid(), bs, bs);
+    la::dmatrix<std::complex<double>> shifted_physical(n, n, ctx.blacs_grid(), bs, bs);
+    if (dirac) {
+        hk.set_dirac_h_o(h, s);
+    } else {
+        hk.set_fv_h_o(0, h, s);
+    }
+    if (physical_direction) {
+        hk.set_fv_h_o(0, shifted_h, physical_s, true);
+    }
     for (int j = 0; j < ds.num_cols_local(); j++) {
         for (int i = 0; i < ds.num_rows_local(); i++) {
             int row = ds.irow(i), col = ds.icol(j);
-            ds(i, j) = 0.03 * s(i, j) + 0.002 * std::polar(1.0, 0.7 * (row - col)) / ((1.0 + row) * (1.0 + col));
+            ds(i, j) = overlap_direction ? (*overlap_direction)(i, j)
+                                         : 0.03 * s(i, j) + 0.002 * std::polar(1.0, 0.7 * (row - col)) /
+                                                                    ((1.0 + row) * (1.0 + col));
         }
     }
-    auto full_ds = ds.get_full_matrix();
+    auto full_ds                 = ds.get_full_matrix();
+    auto full_physical           = physical_direction ? physical_s.get_full_matrix() : s.get_full_matrix();
+    auto full_physical_direction = physical_direction ? physical_direction->get_full_matrix() : ds.get_full_matrix();
     std::array<double, 4> errors{};
     for (bool degenerate : {false, true}) {
         if (degenerate) {
@@ -546,9 +835,20 @@ lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<d
                     h(i, j) = 0.25 * s(i, j);
                 }
             }
+            if (physical_direction) {
+                // A common degenerate physical norm is gauge independent.
+                for (int j = 0; j < s.num_cols_local(); j++) {
+                    for (int i = 0; i < s.num_rows_local(); i++) {
+                        physical_s(i, j) = s(i, j);
+                    }
+                }
+                full_physical           = s.get_full_matrix();
+                full_physical_direction = ds.get_full_matrix();
+            }
         }
-        LAPW_eigensystem reference(hk, h, s);
-        auto direction         = reference.perturbation(dh, ds);
+        auto physical_ds = physical_direction ? (degenerate ? &ds : physical_direction) : nullptr;
+        LAPW_eigensystem reference(hk, h, s, physical_direction ? &physical_s : nullptr);
+        auto direction         = reference.perturbation(dh, ds, physical_ds);
         double mu              = degenerate ? 0.25 : reference.energies()[ctx.num_bands() / 2];
         constexpr double width = 0.4;
         auto occupations       = [&](auto const& spectrum, double chemical_potential) {
@@ -573,7 +873,7 @@ lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<d
             std::complex<double> trace{0};
             for (int j = 0; j < n; j++) {
                 for (int i = 0; i < n; i++) {
-                    trace += response(i, j) * reference.overlap()(j, i) + p(i, j) * full_ds(j, i);
+                    trace += response(i, j) * full_physical(j, i) + p(i, j) * full_physical_direction(j, i);
                 }
             }
             errors[2]   = std::max(errors[2], std::abs(trace - (energy_sum - slope_sum * dmu)));
@@ -582,9 +882,12 @@ lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<d
                     for (int i = 0; i < h.num_rows_local(); i++) {
                         shifted_h(i, j) = h(i, j) + step * dh(i, j);
                         shifted_s(i, j) = s(i, j) + step * ds(i, j);
+                        if (physical_direction) {
+                            shifted_physical(i, j) = physical_s(i, j) + step * (*physical_ds)(i, j);
+                        }
                     }
                 }
-                LAPW_eigensystem shifted(hk, shifted_h, shifted_s);
+                LAPW_eigensystem shifted(hk, shifted_h, shifted_s, physical_direction ? &shifted_physical : nullptr);
                 return shifted.density_matrix(occupations(shifted, mu + step * dmu));
             };
             for (double step : {1e-4, 5e-5}) {
@@ -621,9 +924,16 @@ lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<d
                 saved    = dh(0, 0);
                 dh(0, 0) = std::numeric_limits<double>::quiet_NaN();
             }
-            expect_rejection([&] { reference.perturbation(dh, ds); });
+            expect_rejection([&] { reference.perturbation(dh, ds, physical_ds); });
             if (kp.comm().rank() == 0) {
                 dh(0, 0) = saved;
+            }
+            if (physical_direction) {
+                expect_rejection([&] { reference.perturbation(dh, ds); });
+                if (kp.comm().size() > 1) {
+                    expect_rejection(
+                            [&] { LAPW_eigensystem bad(hk, h, s, kp.comm().rank() == 0 ? &physical_s : nullptr); });
+                }
             }
             if (kp.comm().size() > 1) {
                 auto different = f;
@@ -641,16 +951,181 @@ lapw_spectrum_checks(Hamiltonian_k<double> const& hk, la::dmatrix<std::complex<d
 }
 
 int
+test_lapw_spinor_spectrum(bool distributed, std::string relativity)
+{
+    auto ctx = context(3, distributed, true, false, false, 0, 5.0, false, 0, "", false, "CPU", false, relativity, true);
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0.07, -0.03, 0.02}, 1);
+    ks.initialize();
+    DFT_ground_state gs(ks);
+    gs.initial_state();
+    Hamiltonian0<double> h0(gs.potential(), false);
+    auto& kp = *ks.get<double>(0);
+    Hamiltonian_k<double> hk(h0, kp);
+    int n = kp.gklo_basis_size(), nf = ctx->num_fv_states(), nb = ctx->num_bands(), bs = ctx->cyclic_block_size();
+    int failures{0};
+    Test_check check(failures, ctx->comm(), "two-stage LAPW spinor spectrum " + relativity);
+    using matrix_t = la::dmatrix<std::complex<double>>;
+    std::array<std::unique_ptr<matrix_t>, 4> h, dh, shifted_h;
+    LAPW_spinor_eigensystem::matrix_set_t base{}, direction{}, shifted{};
+    for (int s = 0; s < 4; s++) {
+        for (auto* set : {&h, &dh, &shifted_h}) {
+            (*set)[s] = std::make_unique<matrix_t>(n, n, ctx->blacs_grid(), bs, bs);
+        }
+        base[s]      = h[s].get();
+        direction[s] = dh[s].get();
+        shifted[s]   = shifted_h[s].get();
+    }
+    matrix_t overlap(n, n, ctx->blacs_grid(), bs, bs), ds(n, n, ctx->blacs_grid(), bs, bs);
+    matrix_t shifted_s(n, n, ctx->blacs_grid(), bs, bs);
+    constexpr double width = 0.12;
+    auto occupations       = [&](auto const& spectrum, double mu) {
+        std::vector<double> f;
+        for (double energy : spectrum.energies()) {
+            f.push_back(smearing::fermi_dirac::occupancy(mu - energy, width));
+        }
+        return f;
+    };
+    for (bool degenerate : {false, true}) {
+        for (int j = 0; j < overlap.num_cols_local(); j++) {
+            for (int i = 0; i < overlap.num_rows_local(); i++) {
+                int row = overlap.irow(i), col = overlap.icol(j);
+                double diagonal = row == col ? 1.0 : 0.0, metric = 1 + 0.01 * row;
+                auto wave     = std::polar(1.0, 0.4 * (row - col)) / ((1.0 + row) * (1.0 + col));
+                overlap(i, j) = diagonal * metric + (degenerate ? 0.0 : 0.006) * wave;
+                ds(i, j)      = 0.015 * diagonal + 0.01 * wave;
+                for (int s = 0; s < 4; s++) {
+                    double energy  = row < nf ? -0.3 : 0.4 + 0.07 * row;
+                    (*h[s])(i, j)  = degenerate
+                                             ? diagonal * metric * (s == 0 ? energy : 0.035 * (s + 1))
+                                             : diagonal * (s == 0 ? -0.4 + 0.3 * row : 0.02 * (s + 1)) +
+                                                      0.012 * (s + 1) * std::polar(1.0, 0.5 * (s + 1) * (row - col)) /
+                                                              ((1.0 + row) * (1.0 + col));
+                    (*dh[s])(i, j) = 0.013 * (s + 1) * diagonal * std::cos(row + 1.0) / (row + 1.0) +
+                                     0.008 * (s + 1) * std::polar(1.0, 0.3 * (s + 1) * (row - col)) / (1.0 + row + col);
+                }
+            }
+        }
+        LAPW_spinor_eigensystem reference(hk, base, overlap);
+        auto tangent = reference.perturbation(direction, ds);
+        double mu    = 0.5 * (reference.energies().front() + reference.energies().back());
+        auto f       = occupations(reference, mu);
+        std::vector<double> slopes;
+        double slope_sum{0}, energy_sum{0}, count = std::accumulate(f.begin(), f.end(), 0.0);
+        for (int b = 0; b < nb; b++) {
+            slopes.push_back(-smearing::fermi_dirac::delta(mu - reference.energies()[b], width));
+            slope_sum += slopes.back();
+            energy_sum += slopes.back() * tangent.spinor.energies[b];
+        }
+        auto p       = reference.density_matrix(f);
+        auto full_ds = ds.get_full_matrix();
+        std::complex<double> charge{0};
+        for (int j = 0; j < n; j++) {
+            for (int i = 0; i < n; i++) {
+                charge += p(i, j, 0) * reference.overlap()(j, i);
+            }
+        }
+        check("spinor density preserves the metric electron count", std::abs(charge - count), 3e-10);
+        if (degenerate) {
+            double bnorm = 0.035 * std::sqrt(4.0 + 9.0 + 16.0), error{0};
+            for (int s = 0; s < 4; s++) {
+                for (int j = 0; j < n; j++) {
+                    for (int i = 0; i < n; i++) {
+                        double expected = i == j && i < nf
+                                                  ? (s == 0 ? f.front() + f.back()
+                                                            : (f.back() - f.front()) * 0.035 * (s + 1) / bnorm) /
+                                                            (1 + 0.01 * i)
+                                                  : 0;
+                        error           = std::max(error, std::abs(p(i, j, s) - expected));
+                    }
+                }
+            }
+            check("Pauli density matches the analytic tilted-spin solution", error, 3e-12);
+        }
+        for (bool fixed_charge : {false, true}) {
+            double dmu    = fixed_charge ? energy_sum / slope_sum : 0.07;
+            auto response = reference.density_matrix_response(tangent, f, slopes, dmu);
+            std::complex<double> trace{0};
+            for (int j = 0; j < n; j++) {
+                for (int i = 0; i < n; i++) {
+                    trace += response(i, j, 0) * reference.overlap()(j, i) + p(i, j, 0) * full_ds(j, i);
+                }
+            }
+            check("spinor response preserves the metric charge constraint",
+                  std::abs(trace - (energy_sum - slope_sum * dmu)), 3e-10);
+            std::vector<double> sampled_energies;
+            auto sample = [&](double step) {
+                for (int j = 0; j < overlap.num_cols_local(); j++) {
+                    for (int i = 0; i < overlap.num_rows_local(); i++) {
+                        shifted_s(i, j) = overlap(i, j) + step * ds(i, j);
+                        for (int s = 0; s < 4; s++) {
+                            (*shifted_h[s])(i, j) = (*h[s])(i, j) + step * (*dh[s])(i, j);
+                        }
+                    }
+                }
+                LAPW_spinor_eigensystem spectrum(hk, shifted, shifted_s);
+                sampled_energies = spectrum.energies();
+                return spectrum.density_matrix(occupations(spectrum, mu + step * dmu));
+            };
+            for (double step : {1e-4, 5e-5}) {
+                auto plus          = sample(step);
+                auto plus_energies = sampled_energies;
+                auto minus         = sample(-step);
+                double error{0}, peak{0};
+                for (size_t i = 0; i < response.size(); i++) {
+                    double e = std::abs(response[i] - (plus[i] - minus[i]) / (2 * step));
+                    error    = std::isfinite(e) ? std::max(error, e) : std::numeric_limits<double>::infinity();
+                    peak     = std::max(peak, std::abs(response[i]));
+                }
+                check("two-stage Pauli density response", error / std::max(1.0, peak), 3e-7);
+                if (!degenerate) {
+                    error = 0;
+                    for (int b = 0; b < nb; b++) {
+                        error = std::max(error, std::abs(tangent.spinor.energies[b] -
+                                                         (plus_energies[b] - sampled_energies[b]) / (2 * step)));
+                    }
+                    check("two-stage spinor energy response", error, 3e-7);
+                }
+            }
+        }
+        auto saved        = tangent.reference;
+        tangent.reference = nullptr;
+        check.reject("spinor tangent rejects a different reference",
+                     [&] { reference.density_matrix_response(tangent, f, slopes); });
+        tangent.reference = saved;
+        auto missing      = direction;
+        missing[2]        = nullptr;
+        check.reject("spinor response rejects a missing Pauli matrix", [&] { reference.perturbation(missing, ds); });
+        auto saved_value = tangent.frame[0];
+        if (kp.comm().rank() == 0) {
+            tangent.frame[0] = std::numeric_limits<double>::quiet_NaN();
+        }
+        check.reject("spinor response rejects a nonfinite frame collectively",
+                     [&] { reference.density_matrix_response(tangent, f, slopes); });
+        tangent.frame[0] = saved_value;
+    }
+    for (int j = 0; j < overlap.num_cols_local(); j++) {
+        for (int i = 0; i < overlap.num_rows_local(); i++) {
+            (*h[0])(i, j) = -0.3 * overlap(i, j);
+        }
+    }
+    LAPW_spinor_eigensystem cut(hk, base, overlap);
+    check.reject("degenerate first-variation truncation is rejected", [&] { cut.perturbation(direction, ds); });
+    return failures;
+}
+
+int
 test_occupation_response(int mag, bool distributed, bool gaussian)
 {
-    auto ctx = context(mag, distributed, false, false, false, 0, 5.0, false, 0, gaussian ? "gaussian" : "fermi_dirac");
+    auto ctx =
+            context(mag, distributed, mag == 3, false, false, 0, 5.0, false, 0, gaussian ? "gaussian" : "fermi_dirac");
     K_point_set ks(*ctx);
     ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
     ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
     ks.initialize();
-    int failures{0}, ns = ctx->num_spins(), nb = ctx->num_bands();
+    int failures{0}, ns = ctx->num_spinors(), nb = ctx->num_bands();
     Test_check check(failures, ctx->comm(),
-                     "occupation response spins=" + std::to_string(ns) +
+                     "occupation response spinors=" + std::to_string(ns) +
                              " distributed FFT=" + std::to_string(distributed));
     std::vector<mdarray<double, 2>> directions;
     for (auto it : ks.spl_num_kpoints()) {
@@ -689,7 +1164,7 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
         ks.find_band_occupancies<double>();
         return snapshot();
     };
-    for (double moment : mag ? std::vector<double>{0.4, 0.0} : std::vector<double>{0.0}) {
+    for (double moment : ns == 2 ? std::vector<double>{0.4, 0.0} : std::vector<double>{0.0}) {
         ctx->cfg().unlock();
         ctx->cfg().parameters().fixed_mag(moment);
         ctx->cfg().lock();
@@ -711,7 +1186,7 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
         check("total charge response", std::abs(count[0] + count[1]), 1e-11);
         if (moment != 0) {
             check("fixed spin moment response", std::abs(count[0] - count[1]), 1e-11);
-        } else if (mag) {
+        } else if (ns == 2) {
             check("unconstrained spin response is retained", std::abs(count[0] - count[1]) > 1e-3 ? 0 : 1, 0);
             check("unconstrained spins share one chemical potential", std::abs(response.fermi[0] - response.fermi[1]),
                   0);
@@ -777,7 +1252,7 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
     ctx->cb().band_occ_ = nullptr;
     ctx->cfg().unlock();
     ctx->cfg().parameters().extra_charge(ctx->unit_cell().num_valence_electrons() - nb * ctx->max_occupancy());
-    if (!mag) {
+    if (ns == 1) {
         ctx->cfg().parameters().smearing_width(0);
     } else {
         ctx->cfg().parameters().fixed_mag(nb * ctx->max_occupancy());
@@ -796,71 +1271,196 @@ test_occupation_response(int mag, bool distributed, bool gaussian)
 }
 
 int
-test_lapw_density_response(int mag, bool distributed)
+test_lapw_density_response(int mag, bool distributed, bool spin_orbit, std::string relativity, std::string device)
 {
-    auto ctx = context(mag, distributed, false, false, false, 0, 5.0, false, 0, "fermi_dirac");
+    bool dirac  = relativity == "dirac";
+    bool spinor = mag == 3 && !dirac;
+    auto ctx    = context(mag, distributed, spinor, false, false, 0, 5.0, false, 0, "fermi_dirac", false, device,
+                          spin_orbit, relativity, true);
+    int failures{0};
+    Test_check check(failures, ctx->comm(),
+                     "constrained LAPW spin mode=" + std::to_string(mag) + " SOC=" + std::to_string(spin_orbit) +
+                             " distributed FFT=" + std::to_string(distributed) + " " + relativity + " " + device);
     K_point_set ks(*ctx);
     ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
     ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
     ks.initialize();
     DFT_ground_state gs(ks);
     gs.initial_state();
+    if (spinor) {
+        // Exercise raw magnetic fields as well as the separately staged XC covectors.
+        for (int s = 0; s < 3; s++) {
+            auto& field  = gs.potential().component(s + 1);
+            double value = 0.004 * (s + 1);
+            for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                field.rg().value(ir) = value;
+            }
+            field.rg().fft_transform(-1);
+            for (auto atom : ctx->unit_cell().spl_num_atoms()) {
+                field.mt()[atom.i].zero();
+                for (int ir = 0; ir < ctx->unit_cell().atom(atom.i).radial_grid().num_points(); ir++) {
+                    field.mt()[atom.i](0, ir) = value / y00;
+                }
+            }
+            field.mt().sync(ctx->unit_cell().spl_num_atoms());
+        }
+        gs.potential().update_atomic_potential();
+        ctx->unit_cell().generate_radial_integrals();
+    }
+    if (spin_orbit) {
+        ctx->unit_cell().generate_radial_functions(ctx->out());
+        ctx->unit_cell().generate_radial_integrals();
+        double peak{0};
+        for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto& cls        = ctx->unit_cell().atom_symmetry_class(ic);
+            auto const& type = cls.atom_type();
+            auto const& grid = type.radial_grid();
+            auto base        = cls.spherical_potential();
+            std::vector<double> direction(grid.num_points());
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+            }
+            auto tangent = cls.radial_basis_potential_response(direction, {}, false);
+            auto sample  = [&](double step) {
+                auto shifted = base;
+                for (size_t ir = 0; ir < shifted.size(); ir++) {
+                    shifted[ir] += step * direction[ir];
+                }
+                cls.set_spherical_potential(shifted);
+                if (cls.generate_radial_functions(relativity_t::none, false)) {
+                    RTE_THROW("SOC radial response fixture failed");
+                }
+                cls.generate_radial_integrals(relativity_t::none);
+                std::vector<double> result;
+                for (int l = 1; l <= type.indexr().lmax(); l++) {
+                    for (int a = 0; a < type.indexr().max_order(l); a++) {
+                        for (int b = 0; b < type.indexr().max_order(l); b++) {
+                            result.push_back(cls.so_radial_integral(l, a, b));
+                        }
+                    }
+                }
+                return result;
+            };
+            std::vector<double> analytic;
+            for (int l = 1; l <= type.indexr().lmax(); l++) {
+                for (int a = 0; a < type.indexr().max_order(l); a++) {
+                    for (int b = 0; b < type.indexr().max_order(l); b++) {
+                        double value = tangent.spin_orbit_integrals(l, a, b);
+                        peak         = std::max(peak, std::abs(value));
+                        analytic.push_back(value);
+                    }
+                }
+            }
+            // The small SOC scale needs a wider fourth-order stencil above radial-solver roundoff.
+            for (double step : {1e-2, 5e-3}) {
+                auto plus = sample(step), minus = sample(-step);
+                auto half_plus = sample(step / 2), half_minus = sample(-step / 2);
+                for (size_t i = 0; i < plus.size(); i++) {
+                    plus[i]  = (8 * (half_plus[i] - half_minus[i]) - (plus[i] - minus[i])) / 3;
+                    minus[i] = 0;
+                }
+                check("SOC basis and potential derivative", potential_response_error(analytic, plus, minus, step),
+                      1e-8);
+            }
+            sample(0);
+        }
+        check("nonzero SOC radial derivative", peak > 1e-10 ? 0 : 1, 0);
+        ctx->unit_cell().generate_radial_integrals();
+    }
     Hamiltonian0<double> h0(gs.potential(), false);
-    h0.generate_pw_coefs(gs.potential());
-    int failures{0}, ns = ctx->num_spins(), nb = ctx->num_bands();
-    Test_check check(failures, ctx->comm(),
-                     "constrained LAPW spins=" + std::to_string(ns) +
-                             " distributed FFT=" + std::to_string(distributed));
+    if (!dirac) {
+        h0.generate_pw_coefs(gs.potential());
+    }
+    lapw_hamiltonian_response_t magnetic;
+    if (spinor) {
+        magnetic = h0.lapw_spin_fields();
+    }
+    int ns = ctx->num_spinors(), nc = spinor ? 4 : ns, nb = ctx->num_bands();
     using matrix_t = la::dmatrix<std::complex<double>>;
     struct matrices_t
     {
-        std::array<std::unique_ptr<matrix_t>, 2> h, s, dh, ds;
+        std::array<std::unique_ptr<matrix_t>, 4> h, dh;
+        std::array<std::unique_ptr<matrix_t>, 2> s, ds;
     };
     std::vector<matrices_t> matrices;
     std::vector<LAPW_density_response::matrix_direction_t> directions;
     for (auto it : ks.spl_num_kpoints()) {
         auto& kp = *ks.get<double>(it.i);
         Hamiltonian_k<double> hk(h0, kp);
-        int n = kp.gklo_basis_size(), bs = ctx->cyclic_block_size();
+        int n  = dirac ? 2 * kp.num_gkvec() + ctx->unit_cell().mt_lo_basis_size() : kp.gklo_basis_size();
+        int bs = ctx->cyclic_block_size();
         matrices.emplace_back();
         directions.emplace_back();
         auto& m = matrices.back();
-        for (int spin = 0; spin < ns; spin++) {
-            for (auto* part : {&m.h, &m.s, &m.dh, &m.ds}) {
+        for (int spin = 0; spin < nc; spin++) {
+            for (auto* part : {&m.h, &m.dh}) {
                 (*part)[spin] = std::make_unique<matrix_t>(n, n, ctx->blacs_grid(), bs, bs);
             }
-            hk.set_fv_h_o(spin, *m.h[spin], *m.s[spin]);
+            if (spin < ns) {
+                for (auto* part : {&m.s, &m.ds}) {
+                    (*part)[spin] = std::make_unique<matrix_t>(n, n, ctx->blacs_grid(), bs, bs);
+                }
+                if (dirac) {
+                    hk.set_dirac_h_o(*m.h[spin], *m.s[spin]);
+                } else {
+                    hk.set_fv_h_o(spin, *m.h[spin], *m.s[spin]);
+                }
+                directions.back().s[spin] = m.ds[spin].get();
+            } else {
+                hk.set_fv_h_field_response(spin, magnetic, *m.h[spin]);
+            }
             for (int j = 0; j < m.h[spin]->num_cols_local(); j++) {
                 for (int i = 0; i < m.h[spin]->num_rows_local(); i++) {
                     int row = m.h[spin]->irow(i), col = m.h[spin]->icol(j);
                     auto local          = std::polar(1.0, 0.7 * (row - col)) / ((1.0 + row) * (1.0 + col));
-                    (*m.dh[spin])(i, j) = (0.06 + 0.03 * it.i + 0.04 * spin) * (*m.s[spin])(i, j) + 0.012 * local;
-                    (*m.ds[spin])(i, j) = 0.007 * (*m.s[spin])(i, j) + 0.001 * local;
+                    (*m.dh[spin])(i, j) = (spin < ns ? (0.06 + 0.03 * it.i + 0.04 * spin) * (*m.s[spin])(i, j) : 0.0) +
+                                          0.012 * (1 + 0.2 * spin) * local;
+                    if (spin < ns) {
+                        (*m.ds[spin])(i, j) = 0.007 * (*m.s[spin])(i, j) + 0.001 * local;
+                    }
                 }
             }
             directions.back().h[spin] = m.dh[spin].get();
-            directions.back().s[spin] = m.ds[spin].get();
         }
     }
     auto sample = [&](double step) {
         std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra(matrices.size());
+        std::vector<std::unique_ptr<LAPW_spinor_eigensystem>> spinors(spinor ? matrices.size() : 0);
         size_t ik{0};
         for (auto it : ks.spl_num_kpoints()) {
             auto& kp = *ks.get<double>(it.i);
             Hamiltonian_k<double> hk(h0, kp);
             auto const& m = matrices[ik];
-            int n = kp.gklo_basis_size(), bs = ctx->cyclic_block_size();
-            matrix_t h(n, n, ctx->blacs_grid(), bs, bs), s(n, n, ctx->blacs_grid(), bs, bs);
-            for (int spin = 0; spin < ns; spin++) {
-                for (int j = 0; j < h.num_cols_local(); j++) {
-                    for (int i = 0; i < h.num_rows_local(); i++) {
-                        h(i, j) = (*m.h[spin])(i, j) + step * (*m.dh[spin])(i, j);
-                        s(i, j) = (*m.s[spin])(i, j) + step * (*m.ds[spin])(i, j);
+            int n         = dirac ? 2 * kp.num_gkvec() + ctx->unit_cell().mt_lo_basis_size() : kp.gklo_basis_size();
+            int bs        = ctx->cyclic_block_size();
+            std::array<std::unique_ptr<matrix_t>, 4> h;
+            std::array<std::unique_ptr<matrix_t>, 2> s;
+            LAPW_spinor_eigensystem::matrix_set_t pauli{};
+            for (int spin = 0; spin < nc; spin++) {
+                h[spin]     = std::make_unique<matrix_t>(n, n, ctx->blacs_grid(), bs, bs);
+                pauli[spin] = h[spin].get();
+                if (spin < ns) {
+                    s[spin] = std::make_unique<matrix_t>(n, n, ctx->blacs_grid(), bs, bs);
+                }
+                for (int j = 0; j < h[spin]->num_cols_local(); j++) {
+                    for (int i = 0; i < h[spin]->num_rows_local(); i++) {
+                        (*h[spin])(i, j) = (*m.h[spin])(i, j) + step * (*m.dh[spin])(i, j);
+                        if (spin < ns) {
+                            (*s[spin])(i, j) = (*m.s[spin])(i, j) + step * (*m.ds[spin])(i, j);
+                        }
                     }
                 }
-                spectra[ik][spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
+            }
+            if (spinor) {
+                spinors[ik] = std::make_unique<LAPW_spinor_eigensystem>(hk, pauli, *s[0]);
+            }
+            for (int spin = 0; spin < ns; spin++) {
+                if (!spinor) {
+                    spectra[ik][spin] = std::make_unique<LAPW_eigensystem>(hk, *h[spin], *s[spin]);
+                }
+                auto const& energies = spinor ? spinors[ik]->energies() : spectra[ik][spin]->energies();
                 for (int b = 0; b < nb; b++) {
-                    kp.band_energy(b, spin, spectra[ik][spin]->energies()[b]);
+                    kp.band_energy(b, spin, energies[b]);
                 }
             }
             ik++;
@@ -871,7 +1471,15 @@ test_lapw_density_response(int mag, bool distributed)
         ik = 0;
         for (auto it : ks.spl_num_kpoints()) {
             auto const& kp = *ks.get<double>(it.i);
-            int n          = kp.gklo_basis_size();
+            if (spinor) {
+                std::vector<double> f(nb);
+                for (int b = 0; b < nb; b++) {
+                    f[b] = kp.band_occupancy(b, 0);
+                }
+                result.push_back(spinors[ik++]->density_matrix(f));
+                continue;
+            }
+            int n = dirac ? 2 * kp.num_gkvec() + ctx->unit_cell().mt_lo_basis_size() : kp.gklo_basis_size();
             result.emplace_back(std::array<index_range, 3>{n, n, ns});
             for (int spin = 0; spin < ns; spin++) {
                 std::vector<double> f(n, 0);
@@ -885,21 +1493,45 @@ test_lapw_density_response(int mag, bool distributed)
         }
         return result;
     };
-    auto fields = [&](auto const& p) {
-        auto mapped = gs.density().lapw_density_matrix_fields(ks, p);
+    auto physical_fields = [&](Density const& density) {
         std::vector<double> result;
-        for (int spin = 0; spin < ns; spin++) {
-            for (auto const* field : {&mapped->component(spin), &mapped->kinetic_density().component(spin)}) {
+        for (int spin = 0; spin < (dirac ? mag + 1 : nc); spin++) {
+            for (auto const* field : {&density.component(spin), &density.kinetic_density().component(spin)}) {
                 auto values = potential_samples(*field);
                 result.insert(result.end(), values.begin(), values.end());
             }
         }
         return result;
     };
+    auto fields = [&](auto const& p) { return physical_fields(*gs.density().lapw_density_matrix_fields(ks, p)); };
+    std::vector<double> production;
+    if (spinor || dirac) {
+        for (auto it : ks.spl_num_kpoints()) {
+            auto& kp = *ks.get<double>(it.i);
+            Hamiltonian_k<double> hk(h0, kp);
+            diagonalize_fp(hk, kp, 1e-11);
+        }
+        ks.sync_band<double, sync_band_t::energy>();
+        ks.find_band_occupancies<double>();
+        LAPW_density_response production_reference(h0, ks);
+        gs.density().generate<double>(ks, false, false, true);
+        production  = physical_fields(gs.density());
+        auto mapped = fields(production_reference.density_matrices());
+        double error{0}, peak{0};
+        for (size_t i = 0; i < mapped.size(); i++) {
+            error = std::max(error, std::abs(mapped[i] - production[i]));
+            peak  = std::max(peak, std::abs(production[i]));
+        }
+        check("coefficient matrices reproduce the production spinor rho/tau", error / std::max(1.0, peak), 3e-10);
+    }
     sample(0);
     LAPW_density_response reference(h0, ks);
-    double entropy_response{0};
-    auto p = reference.density_matrices(), dp = reference.density_matrix_response(directions, &entropy_response);
+    double entropy_response{0}, eval_sum_response{0};
+    auto p  = reference.density_matrices();
+    auto dp = reference.density_matrix_response(directions, &entropy_response, &eval_sum_response);
+    if (dirac) {
+        check("nonzero Dirac occupation response", std::abs(entropy_response) > 1e-10 ? 0 : 1, 0);
+    }
     auto response = fields(dp);
     std::array<std::complex<double>, 2> trace{};
     size_t ik{0};
@@ -918,25 +1550,41 @@ test_lapw_density_response(int mag, bool distributed)
     }
     ctx->comm().allreduce(trace.data(), trace.size());
     check("charge including overlap response", std::abs(trace[0] + trace[1]), 1e-10);
-    if (mag) {
+    if (mag == 1 && !dirac) {
         check("fixed spin including overlap response", std::abs(trace[0] - trace[1]), 1e-10);
     }
     // Resolve the field response above the production chemical-potential search tolerance.
     for (double step : {1e-3, 5e-4}) {
-        auto plus            = fields(sample(step));
-        double plus_entropy  = ks.entropy_sum();
-        auto minus           = fields(sample(-step));
-        double minus_entropy = ks.entropy_sum();
+        auto plus             = fields(sample(step));
+        double plus_entropy   = ks.entropy_sum();
+        double plus_eval_sum  = ks.valence_eval_sum();
+        auto minus            = fields(sample(-step));
+        double minus_entropy  = ks.entropy_sum();
+        double minus_eval_sum = ks.valence_eval_sum();
         check("rho/tau matrix and occupation response finite difference",
               potential_response_error(response, plus, minus, step), 2e-6);
         check("occupation entropy response finite difference",
               std::abs((plus_entropy - minus_entropy) / (2 * step) - entropy_response), 2e-8);
+        check("valence eigenvalue-sum response finite difference",
+              std::abs((plus_eval_sum - minus_eval_sum) / (2 * step) - eval_sum_response), 2e-8);
     }
     sample(0);
     check.reject("missing matrix directions rejected collectively", [&] { reference.density_matrix_response({}); });
+    if (spinor) {
+        auto incomplete = directions;
+        if (!incomplete.empty()) {
+            incomplete[0].h[3] = nullptr;
+        }
+        check.reject("missing transverse direction rejected collectively",
+                     [&] { reference.density_matrix_response(incomplete); });
+    }
     if (ctx->comm().size() > 1) {
         check.reject("inconsistent entropy output rejected collectively", [&] {
             reference.density_matrix_response(directions, ctx->comm().rank() == 0 ? &entropy_response : nullptr);
+        });
+        check.reject("inconsistent eigenvalue-sum output rejected collectively", [&] {
+            reference.density_matrix_response(directions, nullptr,
+                                              ctx->comm().rank() == 0 ? &eval_sum_response : nullptr);
         });
     }
     std::complex<double> saved;
@@ -977,28 +1625,41 @@ test_lapw_density_response(int mag, bool distributed)
     sample(0);
     ctx->cb().external_xc_response_tolerance_ = response_tolerance;
     for (auto& m : matrices) {
-        for (int spin = 0; spin < ns; spin++) {
-            m.ds[spin]->zero();
+        for (int spin = 0; spin < nc; spin++) {
+            if (spin < ns) {
+                m.ds[spin]->zero();
+            }
             for (int j = 0; j < m.dh[spin]->num_cols_local(); j++) {
                 for (int i = 0; i < m.dh[spin]->num_rows_local(); i++) {
-                    (*m.dh[spin])(i, j) = 0.17 * (*m.s[spin])(i, j);
+                    (*m.dh[spin])(i, j) = spin < ns ? 0.17 * (*m.s[spin])(i, j) : 0.0;
                 }
             }
         }
     }
     double invariant{0};
-    for (auto const& values : fields(reference.density_matrix_response(directions))) {
+    for (auto const& values : fields(reference.density_matrix_response(directions, nullptr, &eval_sum_response))) {
         invariant =
                 std::isfinite(values) ? std::max(invariant, std::abs(values)) : std::numeric_limits<double>::infinity();
     }
     check("uniform potential shift leaves physical fields unchanged", invariant, 1e-11);
+    check("uniform potential shift changes the eigenvalue sum by the electron count",
+          std::abs(eval_sum_response - 0.17 * ctx->unit_cell().num_valence_electrons()), 1e-10);
+    if (dirac) {
+        check_coefficient_geometry(check, gs.density(), ks, p);
+    }
     return failures;
 }
 
 int
-test_lapw_coupled_response(int mag, bool distributed)
+test_lapw_coupled_response(int mag, bool distributed, bool spin_orbit, std::string device, std::string relativity,
+                           bool core)
 {
-    auto ctx = context(mag, distributed, false, false, false, 0, 5.0, false, 0, "fermi_dirac");
+    bool dirac  = relativity == "dirac";
+    bool spinor = mag == 3 && !dirac;
+    // Retain the complete native positive-energy subspace on the functional test grid.
+    int radial_points = core ? 321 : 0;
+    auto ctx = context(mag, distributed, spinor, core, false, 0, 5.0, false, 0, "fermi_dirac", core, device, spin_orbit,
+                       relativity, true, core ? "dirac" : "none", radial_points);
     // Geometry derivatives require unchanged point-domain membership throughout the stencil.
     auto points          = std::make_shared<xc_point_set_t>(*ctx);
     auto const& original = *ctx->cb().external_xc_points_;
@@ -1008,8 +1669,8 @@ test_lapw_coupled_response(int mag, bool distributed)
         for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
             auto const& atom = ctx->unit_cell().atom(ia);
             auto r           = r3::vector<double>{xyz[0], xyz[1], xyz[2]} -
-                               ctx->unit_cell().get_cartesian_coordinates(atom.position());
-            auto fractional  = dot(ctx->unit_cell().inverse_lattice_vectors(), r);
+                     ctx->unit_cell().get_cartesian_coordinates(atom.position());
+            auto fractional = dot(ctx->unit_cell().inverse_lattice_vectors(), r);
             for (int x = 0; x < 3; x++) {
                 fractional[x] -= std::round(fractional[x]);
             }
@@ -1029,7 +1690,9 @@ test_lapw_coupled_response(int mag, bool distributed)
     ctx->cb().external_xc_points_            = std::move(points);
     ctx->cb().external_xc_geometry_          = functional;
     ctx->cb().external_xc_geometry_response_ = true;
-    auto quadrature_tangent                  = [](auto const& c, auto const& q, auto const& d, auto& out) {
+    // Fixed points resolve the one-atom Dirac translation above near-core subtraction noise.
+    bool fixed_points       = dirac && !mag && !core;
+    auto quadrature_tangent = [fixed_points, core](auto const& c, auto const& q, auto const& d, auto& out) {
         r3::matrix<double> lattice;
         for (int y = 0; y < 3; y++) {
             for (int x = 0; x < 3; x++) {
@@ -1040,12 +1703,27 @@ test_lapw_coupled_response(int mag, bool distributed)
         double trace = strain(0, 0) + strain(1, 1) + strain(2, 2);
         auto move    = [&](auto const& r) {
             auto delta = dot(strain, r3::vector<double>{r[0], r[1], r[2]});
-            return std::array<double, 3>{delta[0] + d.atoms[0][0], delta[1] + d.atoms[0][1], delta[2] + d.atoms[0][2]};
+            for (int x = 0; x < 3; x++) {
+                if (!fixed_points) {
+                    delta[x] += d.atoms[0][x];
+                }
+            }
+            return std::array<double, 3>{delta[0], delta[1], delta[2]};
         };
         for (size_t p = 0; p < q.coordinates.size(); p++) {
-            out.coordinates[p]        = move(q.coordinates[p]);
-            out.energy_weights[p]     = trace * q.energy_weights[p];
-            out.descriptor_weights[p] = trace * q.descriptor_weights[p];
+            auto const& r = q.coordinates[p];
+            int attached{-1};
+            for (int ia = 0; core && ia < c.unit_cell().num_atoms(); ia++) {
+                auto const& atom = c.unit_cell().atom(ia);
+                auto centre      = c.unit_cell().get_cartesian_coordinates(atom.position());
+                if ((r3::vector<double>{r[0], r[1], r[2]} - centre).length() <= atom.mt_radius()) {
+                    attached = ia;
+                    break;
+                }
+            }
+            out.coordinates[p]        = attached >= 0 ? d.atoms[attached] : move(r);
+            out.energy_weights[p]     = attached >= 0 ? 0 : trace * q.energy_weights[p];
+            out.descriptor_weights[p] = attached >= 0 ? 0 : trace * q.descriptor_weights[p];
         }
         for (size_t b = 0; b < q.block_centres.size(); b++) {
             out.block_centres[b] = move(q.block_centres[b]);
@@ -1058,9 +1736,20 @@ test_lapw_coupled_response(int mag, bool distributed)
     ks.initialize();
     DFT_ground_state gs(ks);
     gs.initial_state();
-    int failures{0}, ns = ctx->num_spins();
+    int failures{0}, ns = dirac ? mag + 1 : (spinor ? 4 : ctx->num_spins());
     Test_check check(failures, ctx->comm(),
-                     "coupled LAPW spins=" + std::to_string(ns) + " distributed FFT=" + std::to_string(distributed));
+                     "coupled LAPW " + device + " spins=" + std::to_string(ns) + " SOC=" + std::to_string(spin_orbit) +
+                             " distributed FFT=" + std::to_string(distributed));
+    if (device == "GPU") {
+        check("GPU context, FFT grids and eigensolvers selected",
+              ctx->processing_unit() != device_t::GPU || ctx->spfft<double>().processing_unit() != SPFFT_PU_GPU ||
+                              ctx->spfft_coarse<double>().processing_unit() != SPFFT_PU_GPU ||
+                              !is_device_memory(ctx->gen_evp_solver().data_memory_t()) ||
+                              !is_device_memory(ctx->std_evp_solver().data_memory_t())
+                      ? 1
+                      : 0,
+              0);
+    }
     auto prepare = [&](Density& d) {
         for (int s = 0; s < ns; s++) {
             for (auto* f : {&d.component(s), &d.kinetic_density().component(s)}) {
@@ -1090,25 +1779,56 @@ test_lapw_coupled_response(int mag, bool distributed)
     zero.kinetic_density().zero();
     // Differentiate one production SCF map, not a manufactured Hamiltonian.
     // Complete eigenvectors are used only for scratch density matrices; stored orbitals stay fixed.
-    auto map = [&](Density const& input, K_point_set& kpoints) {
+    auto map = [&](Density const& input, K_point_set& kpoints, double* soc_energy = nullptr) {
         auto& c = kpoints.ctx();
         Potential potential(c);
         potential.generate(input, false, true);
         Hamiltonian0<double> h0(potential, true);
-        h0.generate_pw_coefs(potential);
+        if (!dirac) {
+            h0.generate_pw_coefs(potential);
+        }
         std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra;
+        std::vector<std::unique_ptr<LAPW_spinor_eigensystem>> spinors;
+        lapw_hamiltonian_response_t magnetic;
+        lapw_hamiltonian_response_t soc;
+        if (spinor) {
+            magnetic = h0.lapw_spin_fields();
+        }
+        if (soc_energy) {
+            soc = h0.lapw_spin_fields(true);
+        }
         using matrix_t = la::dmatrix<std::complex<double>>;
         for (auto it : kpoints.spl_num_kpoints()) {
             auto& kp = *kpoints.get<double>(it.i);
             auto hk  = h0(kp);
-            int n = kp.gklo_basis_size(), bs = c.cyclic_block_size();
+            int n    = dirac ? 2 * kp.num_gkvec() + c.unit_cell().mt_lo_basis_size() : kp.gklo_basis_size();
+            int bs   = c.cyclic_block_size();
             matrix_t h(n, n, c.blacs_grid(), bs, bs), s(n, n, c.blacs_grid(), bs, bs);
             spectra.emplace_back();
-            for (int spin = 0; spin < ns; spin++) {
-                hk.set_fv_h_o(spin, h, s);
-                spectra.back()[spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
+            spinors.emplace_back();
+            if (spinor) {
+                hk.set_fv_h_o(0, h, s);
+                std::array<std::unique_ptr<matrix_t>, 3> fields;
+                LAPW_spinor_eigensystem::matrix_set_t pauli{&h};
+                for (int j = 0; j < 3; j++) {
+                    fields[j] = std::make_unique<matrix_t>(n, n, c.blacs_grid(), bs, bs);
+                    hk.set_fv_h_field_response(j + 1, magnetic, *fields[j]);
+                    pauli[j + 1] = fields[j].get();
+                }
+                spinors.back() = std::make_unique<LAPW_spinor_eigensystem>(hk, pauli, s);
+            }
+            for (int spin = 0; spin < c.num_spinors(); spin++) {
+                if (!spinor) {
+                    if (dirac) {
+                        hk.set_dirac_h_o(h, s);
+                    } else {
+                        hk.set_fv_h_o(spin, h, s);
+                    }
+                    spectra.back()[spin] = std::make_unique<LAPW_eigensystem>(hk, h, s);
+                }
+                auto const& energies = spinor ? spinors.back()->energies() : spectra.back()[spin]->energies();
                 for (int b = 0; b < c.num_bands(); b++) {
-                    kp.band_energy(b, spin, spectra.back()[spin]->energies()[b]);
+                    kp.band_energy(b, spin, energies[b]);
                 }
             }
         }
@@ -1118,9 +1838,17 @@ test_lapw_coupled_response(int mag, bool distributed)
         size_t ik{0};
         for (auto it : kpoints.spl_num_kpoints()) {
             auto const& kp = *kpoints.get<double>(it.i);
-            int n          = kp.gklo_basis_size();
-            matrices.emplace_back(std::array<index_range, 3>{n, n, ns});
-            for (int spin = 0; spin < ns; spin++) {
+            if (spinor) {
+                std::vector<double> f(c.num_bands());
+                for (int b = 0; b < c.num_bands(); b++) {
+                    f[b] = kp.band_occupancy(b, 0);
+                }
+                matrices.push_back(spinors[ik++]->density_matrix(f));
+                continue;
+            }
+            int n = dirac ? 2 * kp.num_gkvec() + c.unit_cell().mt_lo_basis_size() : kp.gklo_basis_size();
+            matrices.emplace_back(std::array<index_range, 3>{n, n, c.num_spinors()});
+            for (int spin = 0; spin < c.num_spinors(); spin++) {
                 std::vector<double> f(n, 0);
                 for (int b = 0; b < c.num_bands(); b++) {
                     f[b] = kp.band_occupancy(b, spin);
@@ -1130,9 +1858,46 @@ test_lapw_coupled_response(int mag, bool distributed)
             }
             ik++;
         }
-        return input.lapw_density_matrix_fields(kpoints, matrices);
+        if (soc_energy) {
+            std::complex<double> energy{0};
+            ik = 0;
+            for (auto it : kpoints.spl_num_kpoints()) {
+                auto& kp = *kpoints.get<double>(it.i);
+                auto hk  = h0(kp);
+                int n = kp.gklo_basis_size(), bs = c.cyclic_block_size();
+                matrix_t h(n, n, c.blacs_grid(), bs, bs);
+                for (int s = 1; s < 4; s++) {
+                    hk.set_fv_h_field_response(s, soc, h);
+                    auto full = h.get_full_matrix();
+                    for (int j = 0; j < n; j++) {
+                        for (int i = 0; i < n; i++) {
+                            energy += kp.weight() / kp.comm().size() * matrices[ik](j, i, s) * full(i, j);
+                        }
+                    }
+                }
+                ik++;
+            }
+            c.comm().allreduce(&energy, 1);
+            if (!std::isfinite(std::abs(energy)) || std::abs(energy.imag()) > 1e-12) {
+                RTE_THROW("nonfinite or complex scratch SOC energy");
+            }
+            *soc_energy = energy.real();
+        }
+        auto output = input.lapw_density_matrix_fields(kpoints, matrices);
+        if (core) {
+            output->generate_core_charge_density(potential.get_spherical_potential(),
+                                                 potential.get_core_xc_derivatives());
+            for (auto atom : c.unit_cell().spl_num_atoms()) {
+                for (int ir = 0; ir < c.unit_cell().atom(atom.i).type().num_mt_points(); ir++) {
+                    output->rho().mt()[atom.i](0, ir) += output->core_charge_density(atom.i)[ir] / y00;
+                    output->kinetic_density().scalar().mt()[atom.i](0, ir) +=
+                            output->core_kinetic_density(atom.i)[ir] / y00;
+                }
+            }
+        }
+        return output;
     };
-    auto sample = [&](double step) {
+    auto sample = [&](double step, double* soc_energy = nullptr) {
         Density input(*ctx);
         copy(gs.density(), input);
         for (int s = 0; s < ns; s++) {
@@ -1140,16 +1905,19 @@ test_lapw_coupled_response(int mag, bool distributed)
             axpy(step, direction.kinetic_density().component(s), input.kinetic_density().component(s));
         }
         prepare(input);
-        auto result = map(input, ks);
+        auto result = map(input, ks, soc_energy);
         gs.potential().update_atomic_potential();
         ctx->unit_cell().generate_radial_functions(ctx->out());
-        ctx->unit_cell().generate_radial_integrals();
+        if (!dirac) {
+            ctx->unit_cell().generate_radial_integrals();
+        }
         return result;
     };
     sample(0);
     auto before = values(gs.density());
     LAPW_response response(ks, gs.density(), gs.potential());
-    auto jx       = response.apply(direction);
+    double soc_response{0};
+    auto jx       = response.apply(direction, nullptr, &soc_response);
     auto analytic = values(*jx);
     double peak{0};
     for (auto v : analytic) {
@@ -1157,10 +1925,33 @@ test_lapw_coupled_response(int mag, bool distributed)
     }
     ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
     check("nonzero coupled response", peak > 1e-8 ? 0 : 1, 0);
+    if (spin_orbit) {
+        check("nonzero SOC energy response", std::abs(soc_response) > 1e-14 ? 0 : 1, 0);
+    } else {
+        check("SOC energy response vanishes without SOC", std::abs(soc_response), 0);
+    }
     for (double step : {1e-3, 5e-4}) {
-        auto plus = values(*sample(step)), minus = values(*sample(-step));
+        double ep{0}, em{0};
+        auto plus  = values(*sample(step, spin_orbit ? &ep : nullptr));
+        auto minus = values(*sample(-step, spin_orbit ? &em : nullptr));
+        if (core) {
+            auto half_plus  = values(*sample(step / 2));
+            auto half_minus = values(*sample(-step / 2));
+            for (size_t i = 0; i < analytic.size(); i++) {
+                plus[i]  = (8 * (half_plus[i] - half_minus[i]) - (plus[i] - minus[i])) / 3;
+                minus[i] = 0;
+            }
+        }
         check("complete SCF map rho/tau finite difference", potential_response_error(analytic, plus, minus, step),
               3e-5);
+        if (spin_orbit) {
+            double fd = (ep - em) / (2 * step);
+            if (ctx->comm().rank() == 0) {
+                std::cout << "SOC energy potential response analytic=" << soc_response << " FD=" << fd << '\n';
+            }
+            check("SOC expectation potential finite difference",
+                  std::abs(fd - soc_response) / std::max(1e-12, std::abs(soc_response)), 3e-5);
+        }
     }
     sample(0);
     double zero_error{0};
@@ -1169,103 +1960,136 @@ test_lapw_coupled_response(int mag, bool distributed)
     }
     check("zero coupled response", zero_error, 1e-13);
     xc_geometry_direction_t geometry(ctx->unit_cell().num_atoms());
-    zero_error = 0;
-    for (auto v : values(*response.geometry_rhs(geometry))) {
-        zero_error = std::max(zero_error, std::abs(v));
-    }
-    check("zero geometry right-hand side", zero_error, 1e-13);
-    auto probe = context(mag, distributed, false, false, false, 0, 5.0, false, 0, "fermi_dirac");
-    K_point_set probe_ks(*probe);
-    probe_ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
-    probe_ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
-    probe_ks.initialize();
-    Density input(*probe);
-    for (int s = 0; s < ns; s++) {
-        copy(gs.density().component(s), input.component(s));
-        copy(gs.density().kinetic_density().component(s), input.kinetic_density().component(s));
-    }
-    auto lattice    = probe->unit_cell().lattice_vectors();
-    auto quadrature = ctx->cb().external_xc_points_;
-    std::vector<r3::vector<double>> centres;
-    for (int ia = 0; ia < probe->unit_cell().num_atoms(); ia++) {
-        centres.push_back(probe->unit_cell().get_cartesian_coordinates(probe->unit_cell().atom(ia).position()));
-    }
-    for (int part = 0; part < 3; part++) {
-        geometry = xc_geometry_direction_t(ctx->unit_cell().num_atoms());
-        if (part != 1) {
-            geometry.atoms[0] = {0.23, -0.37, 0.19};
+    {
+        zero_error = 0;
+        for (auto v : values(*response.geometry_rhs(geometry))) {
+            zero_error = std::max(zero_error, std::abs(v));
         }
-        r3::matrix<double> strain;
-        if (part != 0) {
-            strain(0, 0) = 0.07;
-            strain(1, 1) = -0.03;
-            strain(2, 2) = 0.02;
-            strain(0, 1) = -0.04;
-            strain(2, 0) = 0.05;
+        check("zero geometry right-hand side", zero_error, 1e-13);
+        auto probe = context(mag, distributed, spinor, core, false, 0, 5.0, false, 0, "fermi_dirac", core, device,
+                             spin_orbit, relativity, true, core ? "dirac" : "none", radial_points);
+        K_point_set probe_ks(*probe);
+        probe_ks.add_kpoint({0.07, -0.03, 0.02}, 0.3);
+        probe_ks.add_kpoint({-0.06, 0.04, 0.03}, 0.7);
+        probe_ks.initialize();
+        Density input(*probe);
+        for (int s = 0; s < ns; s++) {
+            copy(gs.density().component(s), input.component(s));
+            copy(gs.density().kinetic_density().component(s), input.kinetic_density().component(s));
         }
-        auto dlattice = dot(strain, lattice);
-        for (int y = 0; y < 3; y++) {
-            for (int x = 0; x < 3; x++) {
-                geometry.lattice[x + 3 * y] = dlattice(x, y);
+        auto lattice    = probe->unit_cell().lattice_vectors();
+        auto quadrature = ctx->cb().external_xc_points_;
+        std::vector<r3::vector<double>> centres;
+        for (int ia = 0; ia < probe->unit_cell().num_atoms(); ia++) {
+            centres.push_back(probe->unit_cell().get_cartesian_coordinates(probe->unit_cell().atom(ia).position()));
+        }
+        for (int part = 0; part < 3; part++) {
+            geometry = xc_geometry_direction_t(ctx->unit_cell().num_atoms());
+            if (part != 1) {
+                geometry.atoms[0] = {0.23, -0.37, 0.19};
             }
-        }
-        auto analytic_geometry    = values(*response.geometry_rhs(geometry));
-        auto quadrature_direction = gs.potential().external_xc_quadrature_direction(geometry);
-        auto geometry_sample      = [&](double step) {
-            auto shifted = lattice;
+            r3::matrix<double> strain;
+            if (part != 0) {
+                strain(0, 0) = 0.07;
+                strain(1, 1) = -0.03;
+                strain(2, 2) = 0.02;
+                strain(0, 1) = -0.04;
+                strain(2, 0) = 0.05;
+            }
+            auto dlattice = dot(strain, lattice);
             for (int y = 0; y < 3; y++) {
                 for (int x = 0; x < 3; x++) {
-                    shifted(x, y) += step * dlattice(x, y);
+                    geometry.lattice[x + 3 * y] = dlattice(x, y);
                 }
             }
-            probe->unit_cell().set_lattice_vectors(shifted);
-            for (int ia = 0; ia < probe->unit_cell().num_atoms(); ia++) {
-                auto const& d = geometry.atoms[ia];
-                probe->unit_cell().atom(ia).set_position(
-                        dot(inverse(shifted), centres[ia] + r3::vector<double>{d[0], d[1], d[2]} * step));
-            }
-            probe->update();
-            for (auto it : probe_ks.spl_num_kpoints()) {
-                probe_ks.get<double>(it.i)->update();
-            }
-            auto next                = std::make_shared<xc_point_set_t>(*probe);
-            next->coordinates        = quadrature->coordinates;
-            next->energy_weights     = quadrature->energy_weights;
-            next->descriptor_weights = quadrature->descriptor_weights;
-            next->block_sizes        = quadrature->block_sizes;
-            next->block_centres      = quadrature->block_centres;
-            for (size_t p = 0; p < next->coordinates.size(); p++) {
-                for (int x = 0; x < 3; x++) {
-                    next->coordinates[p][x] += step * quadrature_direction.coordinates[p][x];
+            double soc_geometry{0};
+            auto analytic_geometry =
+                    values(*response.geometry_rhs(geometry, nullptr, spin_orbit ? &soc_geometry : nullptr));
+            auto quadrature_direction = gs.potential().external_xc_quadrature_direction(geometry);
+            auto geometry_sample      = [&](double step, double* soc_energy = nullptr) {
+                auto shifted = lattice;
+                for (int y = 0; y < 3; y++) {
+                    for (int x = 0; x < 3; x++) {
+                        shifted(x, y) += step * dlattice(x, y);
+                    }
                 }
-                next->energy_weights[p] += step * quadrature_direction.energy_weights[p];
-                next->descriptor_weights[p] += step * quadrature_direction.descriptor_weights[p];
-            }
-            for (size_t b = 0; b < next->block_centres.size(); b++) {
-                for (int x = 0; x < 3; x++) {
-                    next->block_centres[b][x] += step * quadrature_direction.block_centres[b][x];
+                probe->unit_cell().set_lattice_vectors(shifted);
+                for (int ia = 0; ia < probe->unit_cell().num_atoms(); ia++) {
+                    auto const& d = geometry.atoms[ia];
+                    probe->unit_cell().atom(ia).set_position(
+                            dot(inverse(shifted), centres[ia] + r3::vector<double>{d[0], d[1], d[2]} * step));
+                }
+                probe->update();
+                for (auto it : probe_ks.spl_num_kpoints()) {
+                    probe_ks.get<double>(it.i)->update();
+                }
+                auto next                = std::make_shared<xc_point_set_t>(*probe);
+                next->coordinates        = quadrature->coordinates;
+                next->energy_weights     = quadrature->energy_weights;
+                next->descriptor_weights = quadrature->descriptor_weights;
+                next->block_sizes        = quadrature->block_sizes;
+                next->block_centres      = quadrature->block_centres;
+                for (size_t p = 0; p < next->coordinates.size(); p++) {
+                    for (int x = 0; x < 3; x++) {
+                        next->coordinates[p][x] += step * quadrature_direction.coordinates[p][x];
+                    }
+                    for (int ia = 0; core && ia < probe->unit_cell().num_atoms(); ia++) {
+                        auto const& atom = probe->unit_cell().atom(ia);
+                        auto offset = r3::vector<double>{quadrature->coordinates[p][0], quadrature->coordinates[p][1],
+                                                         quadrature->coordinates[p][2]} -
+                                      centres[ia];
+                        if (offset.length() <= atom.mt_radius()) {
+                            // Keep attached points at the same offset after the fractional-coordinate round trip.
+                            auto centre = probe->unit_cell().get_cartesian_coordinates(atom.position());
+                            for (int x = 0; x < 3; x++) {
+                                next->coordinates[p][x] = centre[x] + offset[x];
+                            }
+                            break;
+                        }
+                    }
+                    next->energy_weights[p] += step * quadrature_direction.energy_weights[p];
+                    next->descriptor_weights[p] += step * quadrature_direction.descriptor_weights[p];
+                }
+                for (size_t b = 0; b < next->block_centres.size(); b++) {
+                    for (int x = 0; x < 3; x++) {
+                        next->block_centres[b][x] += step * quadrature_direction.block_centres[b][x];
+                    }
+                }
+                probe->cb().external_xc_points_ = next;
+                return values(*map(input, probe_ks, soc_energy));
+            };
+            // The scalar tau field near the origin needs a wider atom-translation stencil with SOC.
+            // Fourth-order differences retain accuracy within the fixed point-domain margin.
+            double step_scale = spin_orbit && part == 0 ? 4 : 1;
+            for (double step : {step_scale * 1e-2, step_scale * 5e-3}) {
+                double ep{0}, em{0}, hp{0}, hm{0};
+                auto plus       = geometry_sample(step, spin_orbit ? &ep : nullptr);
+                auto minus      = geometry_sample(-step, spin_orbit ? &em : nullptr);
+                auto half_plus  = geometry_sample(step / 2, spin_orbit ? &hp : nullptr);
+                auto half_minus = geometry_sample(-step / 2, spin_orbit ? &hm : nullptr);
+                for (size_t i = 0; i < analytic_geometry.size(); i++) {
+                    plus[i]  = (8 * (half_plus[i] - half_minus[i]) - (plus[i] - minus[i])) / 3;
+                    minus[i] = 0;
+                }
+                check("explicit geometry SCF map rho/tau finite difference",
+                      potential_response_error(analytic_geometry, plus, minus, step), 3e-5);
+                if (spin_orbit) {
+                    double fd = (8 * (hp - hm) - (ep - em)) / (6 * step);
+                    if (ctx->comm().rank() == 0) {
+                        std::cout << "SOC energy geometry part=" << part << " analytic=" << soc_geometry << " FD=" << fd
+                                  << '\n';
+                    }
+                    check("SOC expectation geometry finite difference",
+                          std::abs(fd - soc_geometry) / std::max(1e-12, std::abs(soc_geometry)), 3e-5);
                 }
             }
-            probe->cb().external_xc_points_ = next;
-            return values(*map(input, probe_ks));
-        };
-        // Resolve near-origin radial-derivative cancellation without increasing the FD truncation error.
-        for (double step : {2e-2, 1e-2}) {
-            auto plus = geometry_sample(step), minus = geometry_sample(-step);
-            auto half_plus = geometry_sample(step / 2), half_minus = geometry_sample(-step / 2);
-            for (size_t i = 0; i < analytic_geometry.size(); i++) {
-                plus[i]  = (8 * (half_plus[i] - half_minus[i]) - (plus[i] - minus[i])) / 3;
-                minus[i] = 0;
-            }
-            check("explicit geometry SCF map rho/tau finite difference",
-                  potential_response_error(analytic_geometry, plus, minus, step), 3e-5);
         }
+        ctx->cb().external_xc_quadrature_direction_ = nullptr;
+        check.reject("geometry right-hand side requires a host quadrature tangent",
+                     [&] { response.geometry_rhs(geometry); });
+        ctx->cb().external_xc_quadrature_direction_ = quadrature_tangent;
     }
-    ctx->cb().external_xc_quadrature_direction_ = nullptr;
-    check.reject("geometry right-hand side requires a host quadrature tangent",
-                 [&] { response.geometry_rhs(geometry); });
-    ctx->cb().external_xc_quadrature_direction_ = quadrature_tangent;
-    auto zero_solution                          = response.solve(zero, 1e-8, 1);
+    auto zero_solution = response.solve(zero, 1e-8, 1);
     check("zero right-hand side converges without mixing", zero_solution.residual, 0);
     Density rhs(*ctx);
     copy(direction, rhs);
@@ -1282,22 +2106,74 @@ test_lapw_coupled_response(int mag, bool distributed)
             auto const& cls = ctx->unit_cell().atom_symmetry_class(ic);
             for (int i = 0; i < cls.atom_type().mt_radial_basis_size(); i++) {
                 for (int ir = 0; ir < cls.atom_type().num_mt_points(); ir++) {
-                    result.push_back(cls.radial_function(ir, i));
-                    result.push_back(cls.radial_function_derivative(ir, i));
+                    for (int component = 0; component < (dirac ? 2 : 1); component++) {
+                        result.push_back(cls.radial_function(ir, i, component));
+                        result.push_back(cls.radial_function_derivative(ir, i, component));
+                    }
                 }
             }
         }
         return result;
     };
     auto frozen_before = frozen();
-    auto solution      = response.solve(rhs, 1e-8, 100, 10, 0.4);
+    auto solution      = response.solve(rhs, core ? 1e-11 : 1e-8, 100, 10, 0.4);
     check("coupled solve residual", solution.residual, 1e-8);
     auto obtained = values(*solution.fields), expected = values(direction);
     double error{0};
     for (size_t i = 0; i < obtained.size(); i++) {
         error = std::max(error, std::abs(obtained[i] - expected[i]));
     }
+    if (dirac || core) {
+        error = 0;
+        for (int s = 0; s < ns; s++) {
+            for (int part : {0, 1}) {
+                auto const& a =
+                        part == 0 ? solution.fields->component(s) : solution.fields->kinetic_density().component(s);
+                auto const& b = part == 0 ? direction.component(s) : direction.kinetic_density().component(s);
+                auto va = potential_samples(a), vb = potential_samples(b);
+                double residual{0}, scale{1e-12};
+                for (size_t i = 0; i < va.size(); i++) {
+                    residual = std::max(residual, std::abs(va[i] - vb[i]));
+                    scale    = std::max(scale, std::abs(vb[i]));
+                }
+                error = std::max(error, residual / scale);
+            }
+        }
+    }
     check("coupled solve recovers prescribed fields", error, 2e-8);
+    double regular_error{0};
+    for (int part : {0, 1}) {
+        double residual{0}, scale{1e-12};
+        auto sample = [&](double a, double b, double factor) {
+            residual = std::max(residual, factor * std::abs(a - b));
+            scale    = std::max(scale, factor * std::abs(b));
+        };
+        for (int s = 0; s < ns; s++) {
+            auto const& a = part == 0 ? solution.fields->component(s) : solution.fields->kinetic_density().component(s);
+            auto const& b = part == 0 ? direction.component(s) : direction.kinetic_density().component(s);
+            for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                sample(a.rg().value(ir), b.rg().value(ir), 1);
+            }
+            for (auto atom : ctx->unit_cell().spl_num_atoms()) {
+                auto const& type = ctx->unit_cell().atom(atom.i).type();
+                auto const& grid = type.radial_grid();
+                bool rel         = ctx->valence_relativity() != relativity_t::none ||
+                           (type.num_core_electrons() != 0 && ctx->core_relativity() != relativity_t::none);
+                double gamma = std::sqrt(1 - std::pow(type.zn() / speed_of_light, 2));
+                double power = rel ? (part == 0 ? 2 : 4) - 2 * gamma : 0;
+                for (int ir = 0; ir < grid.num_points(); ir++) {
+                    double factor = std::pow(grid[ir] / grid.last(), power);
+                    for (int lm = 0; lm < a.mt()[atom.i].angular_domain_size(); lm++) {
+                        sample(a.mt()[atom.i](lm, ir), b.mt()[atom.i](lm, ir), factor);
+                    }
+                }
+            }
+        }
+        ctx->comm().allreduce<double, mpi::op_t::max>(&residual, 1);
+        ctx->comm().allreduce<double, mpi::op_t::max>(&scale, 1);
+        regular_error = std::max(regular_error, residual / scale);
+    }
+    check("coupled solve resolves Coulomb-regularized fields", regular_error, 2e-8);
     if (ctx->comm().rank() == 0) {
         std::cout << "coupled LAPW solve iterations: " << solution.iterations << '\n';
     }
@@ -1310,8 +2186,16 @@ test_lapw_coupled_response(int mag, bool distributed)
     }
     check.reject("nonfinite kinetic-density direction rejected collectively", [&] { response.apply(rhs); });
     rhs.kinetic_density().scalar().rg().value(0) = saved_tau;
-    auto after                                   = values(gs.density());
-    error                                        = 0;
+    if (mag == 3) {
+        double saved = rhs.kinetic_density().component(3).rg().value(0);
+        if (ctx->comm().rank() == 0) {
+            rhs.kinetic_density().component(3).rg().value(0) = std::numeric_limits<double>::quiet_NaN();
+        }
+        check.reject("nonfinite transverse direction rejected collectively", [&] { response.apply(rhs); });
+        rhs.kinetic_density().component(3).rg().value(0) = saved;
+    }
+    auto after = values(gs.density());
+    error      = 0;
     for (size_t i = 0; i < before.size(); i++) {
         error = std::max(error, std::abs(before[i] - after[i]));
     }
@@ -1322,6 +2206,10 @@ test_lapw_coupled_response(int mag, bool distributed)
         error = std::max(error, std::abs(frozen_before[i] - frozen_after[i]));
     }
     check("response solve preserves reference potential and radial functions", error, 0);
+    if (ctx->comm().size() > 1) {
+        check.reject("SOC energy output is context-collective",
+                     [&] { response.apply(zero, nullptr, ctx->comm().rank() == 0 ? &soc_response : nullptr); });
+    }
     return failures;
 }
 
@@ -1336,6 +2224,19 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                              " atoms=" + std::to_string(ctx->unit_cell().num_atoms()) + " distributed FFT=" +
                              std::to_string(distributed_fft) + " second variation=" + std::to_string(second_variation) +
                              " simple radial integrals=" + std::to_string(simple));
+    if (!mag && !second_variation && !core) {
+        ctx->cfg().unlock();
+        ctx->cfg().parameters().extra_charge(0.25);
+        ctx->cfg().lock();
+        Density charged(*ctx);
+        charged.initial_density();
+        check("charged LAPW initial density has the physical electron count",
+              std::abs(charged.rho().integrate().total - (ctx->unit_cell().num_electrons() - 0.25)), 1e-12);
+        check("charged LAPW density passes the electron-count check", charged.check_num_electrons() ? 0 : 1, 0);
+        ctx->cfg().unlock();
+        ctx->cfg().parameters().extra_charge(0);
+        ctx->cfg().lock();
+    }
     K_point_set ks(*ctx);
     ks.add_kpoint({0.07, -0.03, 0.02}, 1);
     ks.initialize();
@@ -1343,6 +2244,212 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     gs.initial_state();
     auto& density   = gs.density();
     auto& potential = gs.potential();
+    check("joint point XC field derivative", check_external_xc_point_derivative(density), 2e-10);
+    if (mag == 3) {
+        auto energy_check = [&] {
+            auto c = potential.lapw_xc_contractions(density);
+            check("spinor callback Euler identity",
+                  std::abs(c.rho + c.magnetic + c.tau - 2 * potential.energy_exc(density)), 2e-11);
+        };
+        energy_check();
+        for (auto const& values : gs.check_external_xc_derivative(1e-4)) {
+            check("spinor PW/AW/LO orbital derivative", std::abs(values[0] - values[1]), 2e-8);
+            check("spinor orbital derivative at halved step", std::abs(values[0] - values[2]), 6e-9);
+        }
+        // This quadratic fixture has a linear response; a larger core stencil avoids cancellation.
+        for (double error : gs.check_lapw_xc_response(core ? 1e-2 : 1e-3)) {
+            check("four-component LAPW callback response", error, 1e-8);
+        }
+        ctx->unit_cell().generate_radial_functions(ctx->out());
+        ctx->unit_cell().generate_radial_integrals();
+        std::vector<std::vector<double>> base, direction;
+        std::vector<radial_basis_response_t> radial;
+        for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto& cls        = ctx->unit_cell().atom_symmetry_class(ic);
+            auto const& grid = cls.atom_type().radial_grid();
+            base.push_back(cls.spherical_potential());
+            direction.emplace_back(grid.num_points());
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                direction.back()[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+            }
+            radial.push_back(cls.radial_basis_potential_response(direction.back(), {}, false));
+        }
+        auto analytic = density.lapw_radial_fields_response(ks, radial);
+        std::vector<mdarray<std::complex<double>, 3>> matrices;
+        for (auto it : ks.spl_num_kpoints()) {
+            auto const& kp = *ks.get<double>(it.i);
+            int n          = kp.gklo_basis_size();
+            matrices.emplace_back(std::array<index_range, 3>{n, n, 4});
+            auto& p = matrices.back();
+            p.zero();
+            for (int b = 0; b < ctx->num_bands(); b++) {
+                auto up = lapw_coefficients(kp, 0, b), down = lapw_coefficients(kp, 1, b);
+                double f = kp.band_occupancy(b, 0);
+                for (int j = 0; j < n; j++) {
+                    for (int i = 0; i < n; i++) {
+                        auto uu = f * up[i] * std::conj(up[j]), dd = f * down[i] * std::conj(down[j]);
+                        auto ud = f * up[i] * std::conj(down[j]), du = f * down[i] * std::conj(up[j]);
+                        p(i, j, 0) += uu + dd;
+                        p(i, j, 1) += uu - dd;
+                        p(i, j, 2) += ud + du;
+                        p(i, j, 3) += std::complex<double>(0, 1) * (ud - du);
+                    }
+                }
+            }
+        }
+        auto mapped = density.lapw_density_matrix_fields(ks, matrices);
+        Density valence(*ctx);
+        sample_radial_fields(*ctx, ks, base, potential.get_core_xc_derivatives(), nullptr, nullptr, &valence);
+        for (int part : {0, 1}) {
+            for (int s = 0; s < 4; s++) {
+                auto a = potential_samples(part == 0 ? mapped->component(s) : mapped->kinetic_density().component(s));
+                auto b = potential_samples(part == 0 ? valence.component(s) : valence.kinetic_density().component(s));
+                double error{0}, peak{0};
+                for (size_t i = 0; i < a.size(); i++) {
+                    double residual = std::abs(a[i] - b[i]);
+                    error           = std::isfinite(residual) ? std::max(error, residual)
+                                                              : std::numeric_limits<double>::infinity();
+                    peak            = std::max(peak, std::abs(b[i]));
+                }
+                ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                check("Cartesian PW/LO density matrix reproduces spinor fields", error / std::max(1e-12, peak), 1e-10);
+                check("nonzero Cartesian spinor field", peak > 1e-8 ? 0 : 1, 0);
+            }
+        }
+        {
+            Potential covectors(*ctx);
+            covectors.set_lapw_xc_derivatives(potential.lapw_external_xc_response(density, *mapped), 0);
+            auto contractions = covectors.lapw_xc_contractions(*mapped);
+            Periodic_function<double> hartree(*ctx, [&](int) { return lmax_t(ctx->lmax_pot()); });
+            hartree.zero();
+            Hamiltonian0<double> h0(potential, false);
+            auto prepared = h0.lapw_field_response(hartree, *covectors.lapw_xc_derivatives());
+            double value{0};
+            size_t ik{0};
+            for (auto it : ks.spl_num_kpoints()) {
+                auto& kp = *ks.get<double>(it.i);
+                Hamiltonian_k<double> hk(h0, kp);
+                int n = kp.gklo_basis_size(), bs = ctx->cyclic_block_size();
+                la::dmatrix<std::complex<double>> matrix(n, n, ctx->blacs_grid(), bs, bs);
+                for (int s = 0; s < 4; s++) {
+                    hk.set_fv_h_field_response(s, prepared, matrix);
+                    auto full = matrix.get_full_matrix();
+                    double error{0}, peak{0};
+                    for (int j = 0; j < n; j++) {
+                        for (int i = 0; i < n; i++) {
+                            double residual = std::abs(full(i, j) - std::conj(full(j, i)));
+                            error           = std::isfinite(residual) ? std::max(error, residual)
+                                                                      : std::numeric_limits<double>::infinity();
+                            peak            = std::max(peak, std::abs(full(i, j)));
+                            if (kp.comm().rank() == 0) {
+                                value += kp.weight() * std::real(matrices[ik](j, i, s) * full(i, j));
+                            }
+                        }
+                    }
+                    check("Hermitian Pauli field matrix", error / std::max(1e-12, peak), 1e-12);
+                    check("nonzero Pauli field matrix", peak > 1e-12 ? 0 : 1, 0);
+                }
+                ik++;
+                check.reject("Pauli field matrix rejects an invalid component",
+                             [&] { hk.set_fv_h_field_response(4, prepared, matrix); });
+            }
+            ctx->comm().allreduce(&value, 1);
+            double fields = contractions.rho + contractions.magnetic + contractions.tau;
+            check("PW/LO Pauli matrices are the transpose of physical field reconstruction",
+                  std::abs(value - fields) / std::max(1.0, std::abs(fields)), 1e-10);
+            Density zero(*ctx);
+            zero.zero();
+            zero.kinetic_density().zero();
+            auto scalar = h0.lapw_field_response(*potential.hartree_response(mapped->rho()),
+                                                 potential.lapw_external_xc_response(density, zero));
+            double transverse{0};
+            for (int s = 1; s < 4; s++) {
+                for (int ig = 0; ig < ctx->gvec().num_gvec(); ig++) {
+                    transverse = std::max(transverse, std::abs(scalar.scalar_pw(ig, s)));
+                }
+                for (auto const& atom : scalar.local) {
+                    int nb = atom.size(0);
+                    for (int j = 0; j < nb; j++) {
+                        for (int i = 0; i < nb; i++) {
+                            transverse = std::max(transverse, std::abs(atom(i, j, s)));
+                        }
+                    }
+                }
+            }
+            check("Hartree field matrices have no spin-vector contribution", transverse, 0);
+        }
+        auto mapped_radial = density.lapw_density_matrix_radial_response(ks, matrices, radial);
+        std::vector<int> nmt;
+        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+            nmt.push_back(ctx->unit_cell().atom(ia).type().mt_basis_size());
+        }
+        std::vector<std::unique_ptr<wf::Wave_functions<double>>> zero;
+        std::vector<wf::Wave_functions<double>*> orbitals;
+        for (auto it : ks.spl_num_kpoints()) {
+            zero.push_back(std::make_unique<wf::Wave_functions<double>>(
+                    ks.get<double>(it.i)->gkvec_sptr(), nmt, wf::num_mag_dims(3), wf::num_bands(ctx->num_bands()),
+                    memory_t::host));
+            zero.back()->zero(memory_t::host);
+            orbitals.push_back(zero.back().get());
+        }
+        auto combined = density.lapw_orbital_fields_response(ks, orbitals, radial);
+        double combined_error{0};
+        for (int part : {0, 1}) {
+            auto const& fields = part == 0 ? static_cast<Field4D const&>(*combined) : combined->kinetic_density();
+            for (int s = 0; s < 4; s++) {
+                for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+                    combined_error = std::max(combined_error, std::abs(fields.component(s).rg().f_pw_local(ig)));
+                }
+                for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                    auto const& field = fields.component(s).mt()[ia];
+                    for (size_t i = 0; i < field.size(); i++) {
+                        combined_error     = std::max(combined_error, std::abs(field[i] - analytic[ia][part][s][i]));
+                        auto const& mapped = part == 0 ? mapped_radial->component(s).mt()[ia]
+                                                       : mapped_radial->kinetic_density().component(s).mt()[ia];
+                        combined_error     = std::max(combined_error, std::abs(mapped[i] - analytic[ia][part][s][i]));
+                    }
+                }
+            }
+        }
+        ctx->comm().allreduce<double, mpi::op_t::max>(&combined_error, 1);
+        check("combined spinor orbital/radial response", combined_error, 1e-13);
+        auto sample = [&](double step) {
+            auto v = base;
+            for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
+                auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
+                for (size_t ir = 0; ir < v[ic].size(); ir++) {
+                    v[ic][ir] += step * direction[ic][ir];
+                }
+                cls.set_spherical_potential(v[ic]);
+                if (cls.generate_radial_functions(relativity_t::none, false)) {
+                    RTE_THROW("spinor radial response fixture failed");
+                }
+                cls.set_spherical_potential(base[ic]);
+            }
+            ctx->unit_cell().generate_radial_integrals();
+            return sample_radial_fields(*ctx, ks, v, potential.get_core_xc_derivatives());
+        };
+        double radial_step = core ? 1e-2 : 5e-3;
+        for (double step : {radial_step, radial_step / 2}) {
+            auto plus = sample(step), minus = sample(-step);
+            check("four-component radial density/tau response", radial_fields_error(analytic, plus, minus, step), 3e-5);
+        }
+        sample(0);
+        check_coefficient_geometry(check, density, ks, matrices);
+        if (ctx->comm().rank() == 0 && !matrices.empty()) {
+            matrices[0](0, 1, 3) += 0.1;
+        }
+        check.reject("Cartesian coefficient fields reject a non-Hermitian transverse block collectively",
+                     [&] { density.lapw_density_matrix_fields(ks, matrices); });
+        // Exercise the SCF lifecycle; physical convergence is not an operator test.
+        gs.find(1e-9, 1e-10, 1e-9, 20, false);
+        check("finite spinor SCF energy", std::isfinite(gs.total_energy()) ? 0 : 1, 0);
+        density.generate<double>(ks, false, true, true);
+        potential.generate(density, false, true);
+        energy_check();
+        return failures;
+    }
     {
         Periodic_function<double> direction(*ctx, [&](int) { return lmax_t(ctx->lmax_rho()); });
         direction.zero();
@@ -1936,7 +3043,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         check("nonzero orbital derivative", std::abs(values[0]) / functional_scale(*ctx) > 1e-7 ? 0 : 1, 0);
     }
     verify_restored();
-    for (double error : gs.check_lapw_xc_response(1e-3)) {
+    // The quadratic fixture permits a wider core stencil without truncation error.
+    for (double error : gs.check_lapw_xc_response(core ? 1e-2 : 1e-3)) {
         check("field-response diagnostic", error, 1e-8);
     }
     verify_restored();
@@ -2161,6 +3269,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         for (size_t ir = 0; ir < tau.size(); ir++) {
             derivative += density.core_charge_density(0)[ir] * d[cls.id()][0][ir] + tau[ir] * d[cls.id()][1][ir];
         }
+        auto radial_response = cls.radial_basis_potential_response(std::vector<double>(tau.size(), 0), d[cls.id()]);
+        check("radial basis core eigenvalue-sum response", std::abs(radial_response.core_eval_sum - derivative), 2e-7);
         for (double h : {1e-3, 5e-4}) {
             auto energy = [&](double step) {
                 auto shifted = d;
@@ -2466,14 +3576,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             auto& delta = *matched_directions.back();
             for (int s = 0; s < ctx->num_spins(); s++) {
                 for (int b = 0; b < ctx->num_bands(); b++) {
-                    auto all = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(b));
-                    std::vector<std::complex<double>> c(all.begin(), all.begin() + npw), dc(n);
-                    int offset = npw;
-                    for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
-                        int naw = ctx->unit_cell().atom(ia).type().mt_aw_basis_size();
-                        c.insert(c.end(), all.begin() + offset + naw, all.begin() + offset + nmt[ia]);
-                        offset += nmt[ia];
-                    }
+                    auto c = lapw_coefficients(kp, s, b);
+                    std::vector<std::complex<double>> dc(n);
                     for (int i = 0; i < n; i++) {
                         dc[i] = 0.007 * std::polar(1.0, 0.31 * (i + b + s)) / (1.0 + i);
                     }
@@ -2555,123 +3659,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             }
         }
         verify_restored();
-        auto lattice             = ctx->unit_cell().lattice_vectors();
-        auto original_quadrature = ctx->cb().external_xc_points_;
-        std::vector<r3::vector<double>> positions, centres;
-        for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
-            positions.push_back(ctx->unit_cell().atom(ia).position());
-            centres.push_back(ctx->unit_cell().get_cartesian_coordinates(positions.back()));
-        }
-        for (int part = 0; part < 3; part++) {
-            xc_geometry_direction_t direction(ctx->unit_cell().num_atoms());
-            if (part != 1) {
-                direction.atoms[0] = {0.23, -0.37, 0.19};
-            }
-            r3::matrix<double> strain;
-            if (part != 0) {
-                strain(0, 0) = 0.07;
-                strain(1, 1) = -0.03;
-                strain(2, 2) = 0.02;
-                strain(0, 1) = -0.04;
-                strain(2, 0) = 0.05;
-            }
-            auto dlattice = dot(strain, lattice);
-            for (int y = 0; y < 3; y++) {
-                for (int x = 0; x < 3; x++) {
-                    direction.lattice[x + 3 * y] = dlattice(x, y);
-                }
-            }
-            auto analytic = density.lapw_density_matrix_geometry_response(ks, frozen_matrices, direction);
-            auto evaluate = [&](double step) {
-                auto shifted = lattice;
-                for (int y = 0; y < 3; y++) {
-                    for (int x = 0; x < 3; x++) {
-                        shifted(x, y) += step * dlattice(x, y);
-                    }
-                }
-                ctx->unit_cell().set_lattice_vectors(shifted);
-                for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
-                    auto const& d = direction.atoms[ia];
-                    r3::vector<double> dr{d[0], d[1], d[2]};
-                    ctx->unit_cell().atom(ia).set_position(dot(inverse(shifted), centres[ia] + dr * step));
-                }
-                for (auto it : ks.spl_num_kpoints()) {
-                    ks.get<double>(it.i)->update();
-                }
-                auto next                     = std::make_shared<xc_point_set_t>(*ctx);
-                next->coordinates             = original_quadrature->coordinates;
-                next->energy_weights          = original_quadrature->energy_weights;
-                next->descriptor_weights      = original_quadrature->descriptor_weights;
-                next->block_sizes             = original_quadrature->block_sizes;
-                next->block_centres           = original_quadrature->block_centres;
-                ctx->cb().external_xc_points_ = next;
-                return density.lapw_density_matrix_fields(ks, frozen_matrices);
-            };
-            for (double step : {1e-4, 5e-5}) {
-                auto plus = evaluate(step), minus = evaluate(-step);
-                for (int field : {0, 1}) {
-                    double error{0}, peak{0};
-                    auto compare = [&](auto a, auto p, auto m) {
-                        double residual = std::abs(a - (p - m) / (2 * step));
-                        error           = std::isfinite(residual) ? std::max(error, residual)
-                                                                  : std::numeric_limits<double>::infinity();
-                        peak            = std::max(peak, std::abs(a));
-                    };
-                    for (int s = 0; s < ctx->num_spins(); s++) {
-                        auto const& a = field == 0 ? analytic->component(s) : analytic->kinetic_density().component(s);
-                        auto const& p = field == 0 ? plus->component(s) : plus->kinetic_density().component(s);
-                        auto const& m = field == 0 ? minus->component(s) : minus->kinetic_density().component(s);
-                        for (int ig = 0; ig < ctx->gvec().count(); ig++) {
-                            compare(a.rg().f_pw_local(ig), p.rg().f_pw_local(ig), m.rg().f_pw_local(ig));
-                        }
-                        for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
-                            compare(a.rg().value(ir), p.rg().value(ir), m.rg().value(ir));
-                        }
-                        for (auto atom : ctx->unit_cell().spl_num_atoms()) {
-                            for (size_t i = 0; i < a.mt()[atom.i].size(); i++) {
-                                compare(a.mt()[atom.i][i], p.mt()[atom.i][i], m.mt()[atom.i][i]);
-                            }
-                        }
-                    }
-                    ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
-                    ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
-                    check(field == 0 ? "PW/LO geometry rho response" : "PW/LO geometry tau response",
-                          error / std::max(1e-12, peak), 3e-7);
-                    check("nonzero geometry field response", peak > 1e-8 ? 0 : 1, 0);
-                }
-            }
-            ctx->unit_cell().set_lattice_vectors(lattice);
-            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
-                ctx->unit_cell().atom(ia).set_position(positions[ia]);
-            }
-            for (auto it : ks.spl_num_kpoints()) {
-                ks.get<double>(it.i)->update();
-            }
-            ctx->cb().external_xc_points_ = original_quadrature;
-            if (part == 0) {
-                auto bad = direction;
-                if (ctx->comm().rank() == 0) {
-                    bad.atoms.clear();
-                }
-                check.reject("geometry fields reject malformed directions collectively",
-                             [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
-                bad = direction;
-                if (ctx->comm().rank() == 0) {
-                    bad.lattice[0] = std::numeric_limits<double>::quiet_NaN();
-                }
-                check.reject("geometry fields reject nonfinite directions collectively",
-                             [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
-                if (ctx->comm().size() > 1) {
-                    bad = direction;
-                    if (ctx->comm().rank() == 0) {
-                        bad.atoms[0][0] += 0.01;
-                    }
-                    check.reject("geometry fields reject inconsistent replicas",
-                                 [&] { density.lapw_density_matrix_geometry_response(ks, frozen_matrices, bad); });
-                }
-            }
-            verify_restored();
-        }
+        check_coefficient_geometry(check, density, ks, frozen_matrices);
+        verify_restored();
         auto set_occupations = [&](double step) {
             size_t ik{0};
             for (auto it : ks.spl_num_kpoints()) {
@@ -2755,7 +3744,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 }
             }
             std::cout << "Radial basis Lagrangian response part=" << part << '\n';
-            double basis_derivative = gs.forces().lapw_radial_basis_derivative(radial_direction, xc_direction);
+            double basis_derivative = radial_basis_derivative(gs.potential(), ks, radial_direction, xc_direction);
             std::vector<radial_basis_response_t> radial_response;
             for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
                 radial_response.push_back(ctx->unit_cell().atom_symmetry_class(ic).radial_basis_potential_response(
@@ -2894,20 +3883,20 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 for (auto& atom : direction) {
                     std::fill(atom.begin(), atom.end(), 0);
                 }
-                check("zero radial potential direction", std::abs(gs.forces().lapw_radial_basis_derivative(direction)),
-                      0);
+                check("zero radial potential direction",
+                      std::abs(radial_basis_derivative(gs.potential(), ks, direction)), 0);
                 if (ctx->comm().rank() == 0) {
                     direction[0].pop_back();
                 }
                 check.reject("invalid radial direction rejected collectively",
-                             [&] { gs.forces().lapw_radial_basis_derivative(direction); });
+                             [&] { radial_basis_derivative(gs.potential(), ks, direction); });
                 for (int j : {0, 1}) {
                     auto invalid_xc = xc_direction;
                     if (ctx->comm().rank() == 0) {
                         invalid_xc[0][j] = {std::numeric_limits<double>::quiet_NaN()};
                     }
                     check.reject("invalid radial XC direction rejected collectively",
-                                 [&] { gs.forces().lapw_radial_basis_derivative(radial_direction, invalid_xc); });
+                                 [&] { radial_basis_derivative(gs.potential(), ks, radial_direction, invalid_xc); });
                 }
                 verify_restored();
             }
@@ -3002,9 +3991,6 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
 int
 test_lapw_force_response(int mag, double pw_cutoff, bool core)
 {
-    std::vector<std::vector<double>> frozen_potential;
-    std::vector<std::vector<double>> displaced_potential;
-    std::vector<std::array<std::vector<double>, 2>> frozen_xc, displaced_xc;
     struct state_t
     {
         std::unique_ptr<Simulation_context> ctx;
@@ -3012,40 +3998,7 @@ test_lapw_force_response(int mag, double pw_cutoff, bool core)
         std::unique_ptr<DFT_ground_state> gs;
     };
     std::unique_ptr<state_t> reference;
-    // Displaced SCFs independently check the analytic self-consistent basis response.
-    auto radial_lagrangian = [&](std::vector<std::vector<double>> const& potential,
-                                 std::vector<std::array<std::vector<double>, 2>> const& xc) {
-        auto& ctx = *reference->ctx;
-        auto& ks  = *reference->ks;
-        for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
-            ctx.unit_cell().atom_symmetry_class(ic).set_spherical_potential(potential[ic]);
-            ctx.unit_cell().atom_symmetry_class(ic).set_spherical_xc_derivatives(xc[ic]);
-        }
-        ctx.unit_cell().generate_radial_functions(ctx.out());
-        // Vary the basis, not the physical Hamiltonian or the reference orbitals.
-        for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
-            ctx.unit_cell().atom_symmetry_class(ic).set_spherical_potential(frozen_potential[ic]);
-            ctx.unit_cell().atom_symmetry_class(ic).set_spherical_xc_derivatives(frozen_xc[ic]);
-        }
-        ctx.unit_cell().generate_radial_integrals();
-        Hamiltonian0<double> h0(reference->gs->potential(), false);
-        h0.generate_pw_coefs(reference->gs->potential());
-        double value{0};
-        for (auto it : ks.spl_num_kpoints()) {
-            auto kp = ks.get<double>(it.i);
-            auto hk = h0(*kp);
-            int n = kp->gklo_basis_size(), bs = ctx.cyclic_block_size();
-            la::dmatrix<std::complex<double>> h(n, n, ctx.blacs_grid(), bs, bs);
-            la::dmatrix<std::complex<double>> o(n, n, ctx.blacs_grid(), bs, bs);
-            for (int s = 0; s < ctx.num_spins(); s++) {
-                hk.set_fv_h_o(s, h, o);
-                value += occupied_lapw_lagrangian(ctx, *kp, s, h, o);
-            }
-        }
-        ctx.comm().allreduce(&value, 1);
-        return value;
-    };
-    auto calculate = [&](double displacement, bool forces, bool frozen) {
+    auto calculate = [&](double displacement, bool forces) {
         auto state = std::make_unique<state_t>();
         state->ctx = context(mag, true, false, core, false, displacement, pw_cutoff, false, 0, "", core);
         auto& ctx  = state->ctx;
@@ -3095,230 +4048,124 @@ test_lapw_force_response(int mag, double pw_cutoff, bool core)
         state->gs = std::make_unique<DFT_ground_state>(ks);
         auto& gs  = *state->gs;
         gs.initial_state();
-        bool converged{false};
-        if (!frozen) {
-            auto found = gs.find(core ? 1e-10 : 1e-11, core ? 1e-11 : 1e-12, 1e-11, 200, false);
-            converged  = found.at("converged").get<bool>();
-            if (!converged && ctx->comm().rank() == 0) {
-                auto energies = found.at("etot_history").get<std::vector<double>>();
-                std::cout << "LAPW force SCF final energy change=" << energies.back() - energies[energies.size() - 2]
-                          << std::endl;
-            }
-            if (forces) {
-                frozen_potential = gs.potential().get_spherical_potential();
-                frozen_xc        = gs.potential().get_core_xc_derivatives();
-            }
-        } else {
-            for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-                ctx->unit_cell().atom_symmetry_class(ic).set_spherical_potential(frozen_potential[ic]);
-            }
-            ctx->unit_cell().generate_radial_functions(ctx->out());
-            gs.density().mixer_init(ctx->cfg().mixer());
-            double previous{0};
-            for (int iter = 0; iter < 200; iter++) {
-                Hamiltonian0<double> h0(gs.potential(), true, false);
-                sirius::diagonalize<double, double>(h0, ks, 1e-11, ctx->cfg().iterative_solver().num_steps());
-                ks.find_band_occupancies<double>();
-                gs.density().generate<double>(ks, false, true, true);
-                double rms = gs.density().mix();
-                gs.potential().generate(gs.density(), false, true);
-                double energy = free_energy(*ctx, ks, gs.density(), gs.potential());
-                if (rms < 1e-11 && std::abs(energy - previous) < 1e-12) {
-                    converged = true;
-                    break;
-                }
-                previous = energy;
-            }
-        }
-        if (!converged) {
+        auto found = gs.find(core ? 1e-10 : 1e-11, core ? 1e-11 : 1e-12, 1e-11, 200, false);
+        if (!found.at("converged").get<bool>()) {
             RTE_THROW("LAPW force SCF did not converge");
-        }
-        double derivative{0};
-        if (forces) {
-            auto const& ibs = gs.forces().calc_forces_ibs();
-            auto const& hf  = gs.forces().calc_forces_hf();
-            auto const& rho = gs.forces().calc_forces_rho();
-            auto xc         = gs.potential().external_xc_geometry(gs.density());
-            r3::vector<double> direction{0.23, -0.37, 0.19};
-            for (int x = 0; x < 3; x++) {
-                derivative += direction[x] * (xc.atoms[0][x] - ibs(x, 0) - hf(x, 0) - rho(x, 0));
-                if (ctx->comm().rank() == 0) {
-                    std::cout << "LAPW force component " << x << " ibs=" << ibs(x, 0) << " hf=" << hf(x, 0)
-                              << " rho=" << rho(x, 0) << " xc=" << -xc.atoms[0][x] << '\n';
-                }
-            }
         }
         double direct = gs.density().kinetic_density().scalar().integrate().total +
                         gs.potential().energy_exc(gs.density()) + 0.5 * gs.potential().energy_vha() +
                         energy_enuc(*ctx, gs.potential()) + ks.entropy_sum();
-        std::array<double, 5> result{free_energy(*ctx, ks, gs.density(), gs.potential()), derivative, direct, 0,
-                                     ks.entropy_sum()};
+        std::array<double, 3> result{free_energy(*ctx, ks, gs.density(), gs.potential()), direct, ks.entropy_sum()};
         if (forces) {
             reference = std::move(state);
-        } else if (!frozen) {
-            displaced_potential = gs.potential().get_spherical_potential();
-            displaced_xc        = gs.potential().get_core_xc_derivatives();
-            result[3]           = radial_lagrangian(displaced_potential, displaced_xc);
         }
         return result;
     };
+    auto centre     = calculate(0, true);
+    auto& gs        = *reference->gs;
+    auto& potential = gs.potential();
+    auto& ctx       = *reference->ctx;
     int failures{0};
-    for (bool frozen : core ? std::vector<bool>{false} : std::vector<bool>{false, true}) {
-        auto centre = calculate(0, true, frozen);
-        std::vector<std::vector<double>> scalar;
-        std::vector<std::array<std::vector<double>, 2>> core_direction;
-        double coupled_response{0}, total_derivative = centre[1], entropy_response{0};
-        if (!frozen) {
-            auto& gs        = *reference->gs;
-            auto& potential = gs.potential();
-            auto snapshot   = [&] {
-                std::vector<double> values{gs.total_energy(), potential.energy_exc(gs.density())};
-                for (int s = 0; s < reference->ctx->num_spins(); s++) {
-                    for (auto const* f : {&gs.density().component(s), &gs.density().kinetic_density().component(s)}) {
-                        auto field = potential_samples(*f);
-                        values.insert(values.end(), field.begin(), field.end());
-                    }
-                }
-                for (int ic = 0; ic < reference->ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-                    auto const& cls = reference->ctx->unit_cell().atom_symmetry_class(ic);
-                    for (auto rf : cls.atom_type().indexr()) {
-                        for (int ir = 0; ir < cls.atom_type().num_mt_points(); ir++) {
-                            values.push_back(cls.radial_function(ir, rf.idxrf));
-                        }
-                    }
-                }
-                return values;
-            };
-            auto before = snapshot();
-            xc_geometry_direction_t geometry(reference->ctx->unit_cell().num_atoms());
-            geometry.atoms[0] = {0.23, -0.37, 0.19};
-            LAPW_response response(*reference->ks, gs.density(), potential);
-            auto radial                = response.radial_geometry_response(geometry, 1e-8, 200);
-            scalar                     = radial.scalar;
-            core_direction             = radial.core;
-            entropy_response           = radial.entropy;
-            coupled_response           = gs.forces().lapw_radial_basis_derivative(scalar, radial.core);
-            auto explicit_xc           = potential.external_xc_geometry(gs.density());
-            double complete_derivative = response.energy_geometry_derivative(geometry, radial, explicit_xc);
-            if (reference->ctx->comm().rank() == 0) {
-                std::cout << "LAPW complete free-energy geometry derivative=" << complete_derivative
-                          << " entropy=" << radial.entropy << std::endl;
-            }
-            auto const& total = gs.forces().calc_forces_total();
-            total_derivative  = 0;
-            for (int x = 0; x < 3; x++) {
-                total_derivative -= geometry.atoms[0][x] * total(x, 0);
-            }
-            failures += std::abs(total_derivative - complete_derivative) > 2e-7;
-            failures += snapshot() != before;
-            if (reference->ctx->comm().rank() == 0) {
-                std::cout << "LAPW force coupled basis derivative=" << coupled_response
-                          << " total derivative=" << total_derivative << '\n';
+    Test_check check(failures, ctx.comm());
+    auto snapshot = [&] {
+        std::vector<double> values{gs.total_energy(), potential.energy_exc(gs.density())};
+        for (int s = 0; s < ctx.num_spins(); s++) {
+            for (auto const* f : {&gs.density().component(s), &gs.density().kinetic_density().component(s)}) {
+                auto field = potential_samples(*f);
+                values.insert(values.end(), field.begin(), field.end());
             }
         }
-        struct sample_t
-        {
-            std::array<double, 5> energies;
-            std::vector<std::vector<double>> radial_potential;
-            std::vector<std::array<std::vector<double>, 2>> core_xc;
-        };
-        std::map<double, sample_t> samples;
-        // Reuse the overlapping fourth-order stencils rather than repeating displaced SCFs.
-        auto sample = [&](double step) {
-            auto it = samples.find(step);
-            if (it == samples.end()) {
-                auto values = calculate(step, false, frozen);
-                it          = samples.emplace(step, sample_t{values, displaced_potential, displaced_xc}).first;
-            }
-            displaced_potential = it->second.radial_potential;
-            displaced_xc        = it->second.core_xc;
-            return it->second.energies;
-        };
-        // Fourth-order differences resolve the small SCF response without short-step cancellation.
-        for (double h : {2e-3, 1e-3}) {
-            auto plus            = sample(h);
-            auto direction       = displaced_potential;
-            auto xc_direction    = displaced_xc;
-            auto minus           = sample(-h);
-            auto inner_minus     = displaced_potential;
-            auto inner_xc_minus  = displaced_xc;
-            auto outer_plus      = sample(2 * h);
-            auto outer_direction = displaced_potential;
-            auto outer_xc        = displaced_xc;
-            auto outer_minus     = sample(-2 * h);
-            auto differentiate   = [&](int part) {
-                return (8 * (plus[part] - minus[part]) - (outer_plus[part] - outer_minus[part])) / (12 * h);
-            };
-            double fd = differentiate(0), response = differentiate(3);
-            double analytic_response{0};
-            double potential_error{0}, potential_peak{0};
-            if (!frozen) {
-                for (size_t ic = 0; ic < direction.size(); ic++) {
-                    for (size_t ir = 0; ir < direction[ic].size(); ir++) {
-                        double roundoff = 4 * std::numeric_limits<double>::epsilon() *
-                                          (8 * (std::abs(direction[ic][ir]) + std::abs(inner_minus[ic][ir])) +
-                                           std::abs(outer_direction[ic][ir]) + std::abs(displaced_potential[ic][ir])) /
-                                          (12 * h);
-                        direction[ic][ir] = (8 * (direction[ic][ir] - inner_minus[ic][ir]) -
-                                             (outer_direction[ic][ir] - displaced_potential[ic][ir])) /
-                                            (12 * h);
-                        potential_error =
-                                std::max(potential_error, std::abs(direction[ic][ir] - scalar[ic][ir]) - roundoff);
-                        potential_peak = std::max(potential_peak, std::abs(scalar[ic][ir]));
-                        for (int part = 0; part < 2; part++) {
-                            xc_direction[ic][part][ir] =
-                                    (8 * (xc_direction[ic][part][ir] - inner_xc_minus[ic][part][ir]) -
-                                     (outer_xc[ic][part][ir] - displaced_xc[ic][part][ir])) /
-                                    (12 * h);
-                        }
-                    }
+        for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
+            auto const& cls = ctx.unit_cell().atom_symmetry_class(ic);
+            for (auto rf : cls.atom_type().indexr()) {
+                for (int ir = 0; ir < cls.atom_type().num_mt_points(); ir++) {
+                    values.push_back(cls.radial_function(ir, rf.idxrf));
                 }
-                radial_lagrangian(frozen_potential, frozen_xc);
-                analytic_response = reference->gs->forces().lapw_radial_basis_derivative(direction, xc_direction);
             }
-            double error          = std::abs(fd - centre[1] - response);
-            double analytic_error = std::abs(fd - centre[1] - analytic_response);
-            double coupled_error  = std::abs(fd - centre[1] - coupled_response);
-            double total_error    = std::abs(fd - total_derivative);
-            if (mpi::Communicator::world().rank() == 0) {
-                std::cout << "LAPW force decomposition spin=" << mag << " pw cutoff=" << pw_cutoff << " core=" << core
-                          << " frozen radial basis=" << frozen << " h=" << h << " derivative=" << centre[1]
-                          << " FD=" << fd << " direct FD=" << differentiate(2)
-                          << " energy identity=" << centre[0] - centre[2] << " radial response=" << response
-                          << " analytic radial response=" << analytic_response << " error=" << error
-                          << " analytic error=" << analytic_error << " coupled error=" << coupled_error
-                          << " total error=" << total_error
-                          << " radial potential error=" << potential_error / std::max(1e-12, potential_peak) << '\n';
-            }
-            failures += !core && (!std::isfinite(error) || error > 2e-6);
-            failures += !core && (!std::isfinite(analytic_error) || analytic_error > 2e-6);
-            failures += std::abs(response - analytic_response) > 2e-7;
-            failures += !core && (!std::isfinite(coupled_error) || coupled_error > 2e-6);
-            failures += std::abs(response - coupled_response) > 2e-7;
-            failures += !std::isfinite(total_error) || total_error > 2e-6;
-            failures += potential_error / std::max(1e-12, potential_peak) > 3e-5;
-            failures += !frozen && std::abs(response) < 1e-5;
-            failures += !frozen && std::abs(differentiate(4) - entropy_response) > 2e-7;
-            for (auto const& point : {centre, plus, minus, outer_plus, outer_minus}) {
-                failures += !std::isfinite(point[0] - point[2]) || std::abs(point[0] - point[2]) > 2e-7;
-            }
-            failures += std::abs(fd - differentiate(2)) > 2e-7;
+        }
+        return values;
+    };
+    auto before = snapshot();
+    xc_geometry_direction_t geometry(ctx.unit_cell().num_atoms());
+    geometry.atoms[0] = {0.23, -0.37, 0.19};
+    LAPW_response response(*reference->ks, gs.density(), potential);
+    auto radial       = response.radial_geometry_response(geometry, 1e-8, 200);
+    auto explicit_xc  = potential.external_xc_geometry(gs.density());
+    double derivative = response.energy_geometry_derivative(geometry, radial, explicit_xc);
+    auto const& total = gs.forces().calc_forces_total();
+    double total_derivative{0};
+    for (int x = 0; x < 3; x++) {
+        total_derivative -= geometry.atoms[0][x] * total(x, 0);
+    }
+    check("complete force API agrees with directional response", std::abs(total_derivative - derivative), 2e-7);
+    check("force response preserves the reference state", snapshot() != before ? 1 : 0, 0);
+
+    // The two fourth-order stencils share displaced SCFs. Component derivatives are tested separately.
+    std::map<double, std::array<double, 3>> samples;
+    auto sample = [&](double step) {
+        auto it = samples.find(step);
+        if (it == samples.end()) {
+            it = samples.emplace(step, calculate(step, false)).first;
+        }
+        return it->second;
+    };
+    for (double h : {2e-3, 1e-3}) {
+        auto plus          = sample(h);
+        auto minus         = sample(-h);
+        auto outer_plus    = sample(2 * h);
+        auto outer_minus   = sample(-2 * h);
+        auto differentiate = [&](int part) {
+            return (8 * (plus[part] - minus[part]) - (outer_plus[part] - outer_minus[part])) / (12 * h);
+        };
+        double fd    = differentiate(0);
+        double error = std::abs(fd - total_derivative);
+        if (ctx.comm().rank() == 0) {
+            std::cout << "LAPW force spin=" << mag << " pw cutoff=" << pw_cutoff << " core=" << core << " h=" << h
+                      << " analytic=" << total_derivative << " FD=" << fd << " error=" << error << '\n';
+        }
+        check("complete force finite difference", error, 2e-6);
+        check("force free-energy identity derivative", std::abs(fd - differentiate(1)), 2e-7);
+        check("force entropy response", std::abs(differentiate(2) - radial.entropy), 2e-7);
+        for (auto const& point : {centre, plus, minus, outer_plus, outer_minus}) {
+            check("force free-energy identity", std::abs(point[0] - point[1]), 2e-7);
         }
     }
     return failures;
 }
 
 int
-test_lapw_cell_response(int mag, bool core)
+test_lapw_cell_response(int mag, bool core, bool spin_orbit, std::string device, std::string relativity,
+                        std::string core_relativity)
 {
-    auto calculate = [&](double step, int component, bool differentiate) {
+    bool dirac        = relativity == "dirac";
+    bool spinor       = mag == 3 && !dirac;
+    bool forces       = mag == 3 || relativity != "none";
+    int radial_points = core && core_relativity == "dirac" ? 321 : 0;
+    auto calculate    = [&](double step, int component, bool differentiate) {
         r3::matrix<double> strain;
         if (component == 0) {
             strain(0, 0) = 1;
-        } else {
+        } else if (component == 1) {
             strain(0, 1) = strain(1, 0) = 0.5;
         }
-        auto ctx      = context(mag, true, false, core, false, 0, 9.0, false, 0, "fermi_dirac", core);
+        auto ctx = context(mag, true, spinor, core, false, 0, 9.0, false, 0, "fermi_dirac", core, device, spin_orbit,
+                              relativity, true, core_relativity, radial_points);
+        if (mag == 3) {
+            // Fractional occupations retain a finite response to the vector field in this closed-shell fixture.
+            ctx->cfg().unlock();
+            ctx->cfg().parameters().smearing_width(0.2);
+            ctx->cfg().lock();
+        }
+        if (ctx->num_bands() * ctx->max_occupancy() <= ctx->unit_cell().num_valence_electrons()) {
+            RTE_THROW("LAPW cell response fixture requires unoccupied bands");
+        }
+        if (device == "GPU" &&
+            (ctx->processing_unit() != device_t::GPU || ctx->spfft<double>().processing_unit() != SPFFT_PU_GPU ||
+             ctx->spfft_coarse<double>().processing_unit() != SPFFT_PU_GPU ||
+             !is_device_memory(ctx->gen_evp_solver().data_memory_t()) ||
+             !is_device_memory(ctx->std_evp_solver().data_memory_t()))) {
+            RTE_THROW("LAPW cell test must select GPU FFT grids and eigensolvers");
+        }
         auto lattice  = ctx->unit_cell().lattice_vectors();
         auto dlattice = dot(strain, lattice);
         for (int y = 0; y < 3; y++) {
@@ -3367,6 +4214,10 @@ test_lapw_cell_response(int mag, bool core)
         ks.add_kpoint({0.07, -0.03, 0.02}, 1);
         ks.initialize();
         ctx->unit_cell().set_lattice_vectors(lattice);
+        r3::vector<double> displacement{0.23, -0.37, 0.19};
+        if (component == 2) {
+            ctx->unit_cell().atom(0).set_position(dot(inverse(lattice), base_centres[0] + step * displacement));
+        }
         ctx->update();
         ks.update();
         if (ng != ctx->gvec().num_gvec()) {
@@ -3381,6 +4232,15 @@ test_lapw_cell_response(int mag, bool core)
             if (attached[p] >= 0) {
                 auto const& centre = base_centres[attached[p]];
                 r += dot(transform, centre) - centre;
+                if (component == 2 && attached[p] == 0) {
+                    r += step * displacement;
+                }
+                auto const& atom  = ctx->unit_cell().atom(attached[p]);
+                auto moved_centre = ctx->unit_cell().get_cartesian_coordinates(atom.position());
+                if (std::abs((r - moved_centre).length() -
+                                (r3::vector<double>{xyz[0], xyz[1], xyz[2]} - centre).length()) > 1e-12) {
+                    RTE_THROW("LAPW cell stencil must retain atom-local quadrature radii");
+                }
             } else {
                 r = dot(transform, r);
             }
@@ -3390,13 +4250,51 @@ test_lapw_cell_response(int mag, bool core)
             moved->descriptor_weights.push_back(measure * points->descriptor_weights[p]);
         }
         if (!moved->coordinates.empty()) {
-            auto centre          = dot(transform, base_centres[0]);
+            auto centre = dot(transform, base_centres[0]);
+            if (component == 2) {
+                centre += step * displacement;
+            }
             moved->block_sizes   = {static_cast<int>(moved->coordinates.size())};
             moved->block_centres = {{centre[0], centre[1], centre[2]}};
         }
-        ctx->cb().external_xc_points_               = std::move(moved);
-        ctx->cb().external_xc_geometry_             = functional;
-        ctx->cb().external_xc_geometry_response_    = true;
+        ctx->cb().external_xc_points_            = std::move(moved);
+        ctx->cb().external_xc_geometry_          = functional;
+        ctx->cb().external_xc_geometry_response_ = true;
+        if (mag == 3) {
+            // A fixed vector field retains finite magnetization in the convex quadratic fixture.
+            std::array<double, 4> bias{0, 0.02, 0.013, -0.007};
+            ctx->cb().external_xc_ = [bias](auto const& c, auto const& in, auto& out) {
+                functional(c, in, out);
+                double energy{0};
+                for (int s = 1; s < in.num_spins; s++) {
+                    for (int p = 0; p < in.num_points; p++) {
+                        int j = p + in.num_points * s;
+                        energy -= bias[s] * in.points->energy_weights[p] * in.rho[j];
+                        out.vrho[j] -= bias[s] * in.points->energy_weights[p];
+                        if (out.geometry) {
+                            out.geometry->energy_weights[p] -= bias[s] * in.rho[j];
+                        }
+                    }
+                }
+                c.comm().allreduce(&energy, 1);
+                out.energy += energy;
+            };
+            ctx->cb().external_xc_geometry_ = ctx->cb().external_xc_;
+            ctx->cb().external_xc_response_ = [bias](auto const& c, auto const& in, auto const& d, auto& out) {
+                functional_response(c, in, d, out);
+                for (int s = 1; s < in.num_spins; s++) {
+                    for (int p = 0; p < in.num_points; p++) {
+                        int j = p + in.num_points * s;
+                        if (d.geometry) {
+                            out.vrho[j] -= bias[s] * d.geometry->energy_weights[p];
+                        }
+                        if (out.geometry) {
+                            out.geometry->energy_weights[p] -= bias[s] * d.rho[j];
+                        }
+                    }
+                }
+            };
+        }
         ctx->cb().external_xc_quadrature_direction_ = [attached](auto const& c, auto const& q, auto const& in,
                                                                  auto& out) {
             r3::matrix<double> dlattice;
@@ -3433,7 +4331,7 @@ test_lapw_cell_response(int mag, bool core)
                     auto const& xyz = q.coordinates[p];
                     auto fractional = dot(inverse, r3::vector<double>{xyz[0], xyz[1], xyz[2]});
                     double measure  = q.energy_weights[p] * in.energy_weights[p] +
-                                      q.descriptor_weights[p] * in.descriptor_weights[p];
+                                     q.descriptor_weights[p] * in.descriptor_weights[p];
                     for (int y = 0; y < 3; y++) {
                         for (int x = 0; x < 3; x++) {
                             out.lattice[x + 3 * y] += in.coordinates[p][x] * fractional[y] + measure * inverse(y, x);
@@ -3463,14 +4361,69 @@ test_lapw_cell_response(int mag, bool core)
             RTE_THROW("LAPW cell SCF did not converge");
         }
         double energy = free_energy(*ctx, ks, gs.density(), gs.potential());
-        std::array<double, 3> result{energy, 0, 0};
+        std::array<double, 4> result{energy, 0, 0, 0};
         if (differentiate) {
+            if (mag == 3) {
+                for (int s = 0; s < 3; s++) {
+                    double moment = gs.density().mag(s).integrate().total;
+                    if (!std::isfinite(moment) || std::abs(moment) < 1e-6) {
+                        std::ostringstream message;
+                        message << "spinor forces and stress require finite magnetization; component=" << s
+                                << " moment=" << moment;
+                        RTE_THROW(message.str());
+                    }
+                }
+            }
+            if (relativity != "none" || core_relativity != "none") {
+                Hamiltonian0<double> h0(gs.potential(), false);
+                if (!dirac) {
+                    h0.generate_pw_coefs(gs.potential());
+                }
+                LAPW_density_response spectrum(h0, ks);
+                auto mapped = gs.density().lapw_density_matrix_fields(ks, spectrum.density_matrices());
+                for (auto atom : ctx->unit_cell().spl_num_atoms()) {
+                    for (int ir = 0; ir < ctx->unit_cell().atom(atom.i).type().num_mt_points(); ir++) {
+                        mapped->rho().mt()[atom.i](0, ir) += gs.density().core_charge_density(atom.i)[ir] / y00;
+                        mapped->kinetic_density().scalar().mt()[atom.i](0, ir) +=
+                                gs.density().core_kinetic_density(atom.i)[ir] / y00;
+                    }
+                }
+                auto reference_fields = lapw_field_samples(gs.density()), spectral_fields = lapw_field_samples(*mapped);
+                double error{0};
+                for (int part : {0, 1}) {
+                    double part_error{0}, peak{1e-12};
+                    for (size_t i = 0; i < reference_fields[part].size(); i++) {
+                        double residual = std::abs(reference_fields[part][i] - spectral_fields[part][i]);
+                        part_error      = std::isfinite(residual) ? std::max(part_error, residual)
+                                                                     : std::numeric_limits<double>::infinity();
+                        peak            = std::max(peak, std::abs(reference_fields[part][i]));
+                    }
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&part_error, 1);
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                    error = std::max(error, part_error / peak);
+                }
+                if (!std::isfinite(error) || error > 3e-7 || !mapped->check_num_electrons()) {
+                    RTE_THROW("relativistic spectral fields must reproduce the normalized SCF density and tau");
+                }
+            }
             auto rho_before       = potential_samples(gs.density().rho());
             auto tau_before       = potential_samples(gs.density().kinetic_density().scalar());
             auto potential_before = potential_samples(gs.potential().effective_potential());
             auto stress           = gs.stress().calc_stress_total();
             result[1]             = ctx->unit_cell().omega() * stress(0, 0);
             result[2]             = 0.5 * ctx->unit_cell().omega() * (stress(0, 1) + stress(1, 0));
+            if (forces) {
+                auto const& force = gs.forces().calc_forces_total();
+                for (int x = 0; x < 3; x++) {
+                    result[3] -= displacement[x] * force(x, 0);
+                }
+                std::ostringstream printed;
+                gs.forces().print_info(printed, 2);
+                if (printed.str().find("total Forces") == std::string::npos ||
+                    printed.str().find("contribution from IBS") != std::string::npos) {
+                    RTE_THROW("coupled LAPW forces must print their computed total, not the unused IBS decomposition");
+                }
+            }
             for (int y = 0; y < 3; y++) {
                 for (int x = 0; x < 3; x++) {
                     if (!std::isfinite(stress(x, y))) {
@@ -3498,16 +4451,17 @@ test_lapw_cell_response(int mag, bool core)
         return it->second;
     };
     int failures{0};
-    for (int component : {0, 1}) {
+    for (int component = 0; component < (forces ? 3 : 2); component++) {
         for (double h : {2e-3, 1e-3}) {
-            double fd    = (8 * (sample(h, component) - sample(-h, component)) -
-                            (sample(2 * h, component) - sample(-2 * h, component))) /
-                           (12 * h);
+            double fd = (8 * (sample(h, component) - sample(-h, component)) -
+                         (sample(2 * h, component) - sample(-2 * h, component))) /
+                        (12 * h);
             double error = std::abs(fd - reference[component + 1]);
             if (mpi::Communicator::world().rank() == 0) {
-                std::cout << "LAPW cell spin=" << mag << " core=" << core << " component=" << component << " h=" << h
-                          << " analytic=" << reference[component + 1] << " FD=" << fd << " error=" << error
-                          << std::endl;
+                std::cout << "LAPW cell " << device << " spin=" << mag << " core=" << core << " SOC=" << spin_orbit
+                          << " relativity=" << relativity << " core_relativity=" << core_relativity
+                          << " component=" << component << " h=" << h << " analytic=" << reference[component + 1]
+                          << " FD=" << fd << " error=" << error << std::endl;
             }
             failures += !std::isfinite(error) || error > 2e-6;
         }
@@ -3538,7 +4492,7 @@ test_lapw_linearization_response()
     Test_check check(failures, ctx->comm());
     // Test moving and frozen linearisation energies against the same occupied-state contraction.
     for (bool update_enu : {false, true}) {
-        double analytic = gs.forces().lapw_radial_basis_derivative({direction}, {}, update_enu);
+        double analytic = radial_basis_derivative(gs.potential(), ks, {direction}, {}, update_enu);
         std::vector<radial_basis_response_t> radial_response;
         radial_response.push_back(cls.radial_basis_potential_response(direction, {}, update_enu));
         auto field_response   = gs.density().lapw_radial_fields_response(ks, radial_response);
@@ -3596,9 +4550,459 @@ test_lapw_linearization_response()
 }
 
 int
+test_lapw_relativistic_basis_response(std::string const& device)
+{
+    int failures{0};
+    std::vector<std::pair<std::string, bool>> cases{{"iora", false}};
+    if (device == "CPU") {
+        cases = {{"koelling_harmon", false}, {"zora", false}, {"iora", false}, {"iora", true}};
+    }
+    for (auto const& [relativity, simple] : cases) {
+        auto ctx = context(0, mpi::Communicator::world().size() > 1, false, false, false, 0, 5.0, simple, 1, "", false,
+                           device, false, relativity);
+        Test_check check(failures, ctx->comm());
+        if (device == "GPU") {
+            check("scalar-relativistic GPU orbitals and both GPU FFT grids selected",
+                  ctx->processing_unit() != device_t::GPU || ctx->spfft<double>().processing_unit() != SPFFT_PU_GPU ||
+                                  ctx->spfft_coarse<double>().processing_unit() != SPFFT_PU_GPU
+                          ? 1
+                          : 0,
+                  0);
+        }
+        K_point_set ks(*ctx);
+        ks.add_kpoint({0.07, -0.03, 0.02}, 1);
+        ks.initialize();
+        DFT_ground_state gs(ks);
+        gs.initial_state();
+        gs.potential().update_atomic_potential();
+        ctx->unit_cell().generate_radial_functions(ctx->out());
+        ctx->unit_cell().generate_radial_integrals();
+        auto& cls        = ctx->unit_cell().atom_symmetry_class(0);
+        auto base        = cls.spherical_potential();
+        auto const& grid = cls.atom_type().radial_grid();
+        auto rel         = ctx->valence_relativity();
+        std::vector<double> direction(grid.num_points());
+        for (int ir = 0; ir < grid.num_points(); ir++) {
+            direction[ir] = 0.13 * std::exp(-0.3 * grid[ir]) + 0.04 * std::sin(grid[ir]);
+        }
+        auto& potential = gs.potential();
+        auto& effective = potential.effective_potential();
+        std::vector<double> base_rg(effective.rg().values().begin(), effective.rg().values().end());
+        std::vector<double> base_mt(effective.mt()[0].begin(), effective.mt()[0].end());
+        Periodic_function<double> hartree(*ctx, [&](int) { return lmax_t(ctx->lmax_pot()); });
+        hartree.zero();
+        for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+            auto g = ctx->gvec().gvec_cart(gvec_index_t::local(ig));
+            hartree.rg().f_pw_local(ig) =
+                    std::polar(0.09 * std::exp(-0.8 * g.length() * g.length()), 0.6 * g[0] - 0.2 * g[1] + 0.3 * g[2]);
+        }
+        hartree.rg().fft_transform(1);
+        for (auto it : ctx->unit_cell().spl_num_atoms()) {
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                hartree.mt()[it.i](0, ir) = direction[ir] / y00;
+                hartree.mt()[it.i](2, ir) = 0.03 * grid[ir] * std::exp(-grid[ir]);
+            }
+        }
+        hartree.mt().sync(ctx->unit_cell().spl_num_atoms());
+        Spline<double> prototype(grid);
+        mdarray<double, 2> integral({grid.num_points(), 4});
+        integral.zero();
+        for (int ir = 0; ir < grid.num_points() - 1; ir++) {
+            double h = grid[ir + 1] - grid[ir];
+            for (int j = 0; j < 4; j++) {
+                integral(ir, j) = std::pow(h, j + 1) / (j + 1);
+            }
+        }
+        auto weights = prototype.interpolation_adjoint(integral);
+        for (int ir = 0; ir < grid.num_points(); ir++) {
+            weights[ir] *= fourpi * grid[ir] * grid[ir];
+        }
+        auto covectors = [&](double scale) {
+            lapw_xc_field_adjoint_t xc;
+            xc.rho.emplace_back(ctx->spfft<double>(), ctx->gvec_fft_sptr());
+            xc.tau.emplace_back(ctx->spfft<double>(), ctx->gvec_fft_sptr());
+            for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                xc.rho[0].value(ir) = scale * 0.03 * ctx->theta(ir);
+                xc.tau[0].value(ir) = scale * 0.02 * ctx->theta(ir);
+            }
+            xc.rho[0].fft_transform(-1);
+            xc.tau[0].fft_transform(-1);
+            xc.local.resize(1);
+            xc.core.resize(1);
+            for (int p : {0, 1}) {
+                xc.local[0][p].emplace_back(sf::lmmax(ctx->lmax_rho()), grid);
+                xc.local[0][p][0].zero();
+                xc.core[0][p].resize(grid.num_points());
+                for (int ir = 0; ir < grid.num_points(); ir++) {
+                    xc.local[0][p][0](0, ir) = scale * (p ? 0.02 : 0.03) * weights[ir] * std::exp(-grid[ir]);
+                    xc.core[0][p][ir]        = xc.local[0][p][0](0, ir) / y00;
+                }
+            }
+            return xc;
+        };
+        int part{0}; // Radial basis, physical fields, or both.
+        auto matrices = [&](double step, bool update_enu) {
+            auto v = base;
+            for (size_t ir = 0; ir < v.size(); ir++) {
+                v[ir] += step * direction[ir];
+            }
+            cls.set_spherical_potential(v);
+            if (part != 1 && cls.generate_radial_functions(rel, update_enu)) {
+                RTE_THROW("scalar-relativistic basis fixture failed");
+            }
+            double field_step = part ? step : 0;
+            for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                effective.rg().value(ir) = base_rg[ir] + field_step * hartree.rg().value(ir);
+            }
+            for (size_t i = 0; i < base_mt.size(); i++) {
+                effective.mt()[0][i] = base_mt[i] + field_step * hartree.mt()[0][i];
+            }
+            effective.rg().fft_transform(-1);
+            potential.set_lapw_xc_derivatives(covectors(field_step));
+            potential.update_atomic_potential();
+            ctx->unit_cell().generate_radial_integrals();
+            Hamiltonian0<double> h0(gs.potential(), false);
+            h0.generate_pw_coefs(gs.potential());
+            std::array<std::vector<std::complex<double>>, 3> result;
+            for (auto it : ks.spl_num_kpoints()) {
+                auto kp = ks.get<double>(it.i);
+                auto hk = h0(*kp);
+                int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                hk.set_fv_h_o(0, h, o);
+                result[0].insert(result[0].end(), h.at(memory_t::host), h.at(memory_t::host) + h.size_local());
+                result[1].insert(result[1].end(), o.at(memory_t::host), o.at(memory_t::host) + o.size_local());
+                hk.set_fv_h_o(0, h, o, true);
+                result[2].insert(result[2].end(), o.at(memory_t::host), o.at(memory_t::host) + o.size_local());
+            }
+            return result;
+        };
+        for (part = 0; part < 3; part++) {
+            if (simple && part != 2) {
+                continue;
+            }
+            for (bool update_enu : {false, true}) {
+                if (part && !update_enu) {
+                    continue;
+                }
+                auto baseline = matrices(0, update_enu);
+                std::vector<radial_basis_response_t> response;
+                if (part != 1) {
+                    response.push_back(cls.radial_basis_potential_response(direction, {}, update_enu));
+                } else {
+                    response.emplace_back(cls.atom_type());
+                }
+                Hamiltonian0<double> h0(gs.potential(), false);
+                h0.generate_pw_coefs(gs.potential());
+                auto atoms          = h0.lapw_radial_basis_response(response);
+                auto physical_atoms = h0.lapw_radial_basis_response(response, false, true);
+                std::optional<lapw_hamiltonian_response_t> field;
+                if (part) {
+                    field = h0.lapw_field_response(hartree, covectors(1));
+                }
+                if (rel == relativity_t::iora && part != 1) {
+                    double peak{0};
+                    for (int j = 0; j < cls.atom_type().mt_aw_basis_size(); j++) {
+                        for (int i = 0; i < cls.atom_type().mt_aw_basis_size(); i++) {
+                            peak = std::max(peak, std::abs(atoms[0].o(i, j)));
+                        }
+                    }
+                    check("nonzero IORA AW overlap correction response", peak > 1e-12 ? 0 : 1, 0);
+                }
+                std::array<std::vector<std::complex<double>>, 3> analytic;
+                for (auto it : ks.spl_num_kpoints()) {
+                    auto kp = ks.get<double>(it.i);
+                    auto hk = h0(*kp);
+                    int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                    la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                    la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                    la::dmatrix<std::complex<double>> physical_h(n, n, ctx->blacs_grid(), bs, bs);
+                    la::dmatrix<std::complex<double>> physical_o(n, n, ctx->blacs_grid(), bs, bs);
+                    hk.set_fv_h_o_radial_response(0, response, atoms, h, o);
+                    hk.set_fv_h_o_radial_response(0, response, physical_atoms, physical_h, physical_o);
+                    if (field) {
+                        la::dmatrix<std::complex<double>> fh(n, n, ctx->blacs_grid(), bs, bs);
+                        la::dmatrix<std::complex<double>> fo(n, n, ctx->blacs_grid(), bs, bs);
+                        hk.set_fv_h_field_response(0, *field, fh, &fo);
+                        for (size_t i = 0; i < h.size_local(); i++) {
+                            h.at(memory_t::host)[i] += fh.at(memory_t::host)[i];
+                            o.at(memory_t::host)[i] += fo.at(memory_t::host)[i];
+                        }
+                        if (part == 1 && rel == relativity_t::iora) {
+                            check.reject("IORA field response cannot discard overlap",
+                                         [&] { hk.set_fv_h_field_response(0, *field, fh); });
+                            check.reject("field matrices cannot alias",
+                                         [&] { hk.set_fv_h_field_response(0, *field, fh, &fh); });
+                            if (!simple) {
+                                auto errors = lapw_spectrum_checks(hk, h, &o);
+                                check("IORA spectral density response", errors[0], 3e-7);
+                                check("IORA degenerate spectral response", errors[1], 3e-7);
+                                check("IORA response preserves charge", errors[2], 3e-10);
+                                check("IORA invalid spectral inputs rejected", errors[3], 0);
+                            }
+                        }
+                    }
+                    if (rel == relativity_t::iora && update_enu && !simple) {
+                        auto errors = lapw_spectrum_checks(hk, h, &o, &physical_o);
+                        check("IORA physically normalized density response", errors[0], 3e-7);
+                        check("IORA normalized degenerate response", errors[1], 3e-7);
+                        check("IORA physical response preserves electron count", errors[2], 3e-10);
+                        check("IORA physical metric guards", errors[3], 0);
+                    }
+                    analytic[0].insert(analytic[0].end(), h.at(memory_t::host), h.at(memory_t::host) + h.size_local());
+                    analytic[1].insert(analytic[1].end(), o.at(memory_t::host), o.at(memory_t::host) + o.size_local());
+                    analytic[2].insert(analytic[2].end(), physical_o.at(memory_t::host),
+                                       physical_o.at(memory_t::host) + physical_o.size_local());
+                }
+                std::cout << "Scalar-relativistic LAPW basis " << relativity << " device=" << device
+                          << " simple=" << simple << " update_enu=" << update_enu << " part=" << part << '\n';
+                double step = part == 1 ? 0.1 : 0.01;
+                for (double h : {step, step / 2}) {
+                    auto plus = matrices(h, update_enu), minus = matrices(-h, update_enu);
+                    for (int p : {0, 1, 2}) {
+                        double error{0}, peak{0};
+                        for (size_t i = 0; i < analytic[p].size(); i++) {
+                            error = std::max(error, std::abs(analytic[p][i] - (plus[p][i] - minus[p][i]) / (2 * h)));
+                            peak  = std::max(peak, std::abs(analytic[p][i]));
+                        }
+                        ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                        ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                        if (part == 1 && (p == 2 || (p == 1 && rel != relativity_t::iora))) {
+                            check("zero non-IORA overlap field response", std::max(error, peak), 1e-14);
+                            continue;
+                        }
+                        check("nonzero scalar-relativistic matrix response", peak > 1e-14 ? 0 : 1, 0);
+                        check(p == 0 ? "scalar-relativistic Hamiltonian derivative"
+                                     : (p == 1 ? "scalar-relativistic overlap derivative"
+                                               : "physical overlap derivative"),
+                              error / std::max(1e-12, peak), 3e-5);
+                    }
+                }
+                auto restored = matrices(0, update_enu);
+                double error{0};
+                for (int part : {0, 1, 2}) {
+                    for (size_t i = 0; i < baseline[part].size(); i++) {
+                        error = std::max(error, std::abs(restored[part][i] - baseline[part][i]));
+                    }
+                }
+                check("scalar-relativistic reference matrices restored", error, 1e-9);
+            }
+        }
+        auto lattice  = ctx->unit_cell().lattice_vectors();
+        auto position = ctx->unit_cell().atom(0).position();
+        auto centre   = ctx->unit_cell().get_cartesian_coordinates(position);
+        Hamiltonian0<double> h0(potential, false);
+        h0.generate_pw_coefs(potential);
+        for (int geometry_part = 0; geometry_part < 3; geometry_part++) {
+            if (simple && geometry_part != 2) {
+                continue;
+            }
+            xc_geometry_direction_t geometry(1);
+            r3::vector<double> displacement;
+            if (geometry_part != 1) {
+                displacement      = {0.23, -0.37, 0.19};
+                geometry.atoms[0] = {displacement[0], displacement[1], displacement[2]};
+            }
+            r3::matrix<double> strain;
+            if (geometry_part != 0) {
+                strain(0, 0) = 0.07;
+                strain(1, 1) = -0.03;
+                strain(2, 2) = 0.02;
+                strain(0, 1) = -0.04;
+                strain(2, 0) = 0.05;
+            }
+            auto dlattice = dot(strain, lattice);
+            for (int y = 0; y < 3; y++) {
+                for (int x = 0; x < 3; x++) {
+                    geometry.lattice[x + 3 * y] = dlattice(x, y);
+                }
+            }
+            std::optional<lapw_interstitial_geometry_response_t> mass;
+            if (rel == relativity_t::zora || rel == relativity_t::iora) {
+                mass = h0.lapw_interstitial_geometry_response(geometry);
+            }
+            auto snapshot = [&](double step, bool response) {
+                std::vector<std::complex<double>> delta_theta(ctx->gvec().num_gvec());
+                std::array<std::vector<std::complex<double>>, 2> delta_mass;
+                if (!response) {
+                    auto shifted = lattice;
+                    for (int y = 0; y < 3; y++) {
+                        for (int x = 0; x < 3; x++) {
+                            shifted(x, y) += step * dlattice(x, y);
+                        }
+                    }
+                    ctx->unit_cell().set_lattice_vectors(shifted);
+                    ctx->unit_cell().atom(0).set_position(dot(inverse(shifted), centre + displacement * step));
+                    for (int ig = 0; ig < ctx->gvec().num_gvec(); ig++) {
+                        auto index = ctx->gvec().gvec(gvec_index_t::global(ig));
+                        auto g     = dot(ctx->unit_cell().reciprocal_lattice_vectors(),
+                                         r3::vector<double>(index[0], index[1], index[2]));
+                        auto moved = (ig == 0 ? 1.0 : 0.0) -
+                                     fourpi / ctx->unit_cell().omega() *
+                                             unit_step_function_form_factors(cls.atom_type().mt_radius(), g.length()) *
+                                             std::exp(std::complex<double>(0, -dot(g, centre + displacement * step)));
+                        delta_theta[ig] = moved - ctx->theta_pw(ig);
+                    }
+                    if (mass) {
+                        Smooth_periodic_function<double> mask(ctx->spfft<double>(), ctx->gvec_fft_sptr());
+                        for (int ig = 0; ig < ctx->gvec().count(); ig++) {
+                            mask.f_pw_local(ig) = delta_theta[ctx->gvec().offset() + ig];
+                        }
+                        mask.fft_transform(1);
+                        Smooth_periodic_function<double> product(ctx->spfft<double>(), ctx->gvec_fft_sptr());
+                        double alpha_half = 0.5 / (speed_of_light * speed_of_light);
+                        for (int p = 0; p < (rel == relativity_t::iora ? 2 : 1); p++) {
+                            for (int ir = 0; ir < ctx->spfft<double>().local_slice_size(); ir++) {
+                                double minv       = 1 / (1 - alpha_half * effective.rg().value(ir));
+                                product.value(ir) = mask.value(ir) * minv * (p ? alpha_half * minv : 1);
+                            }
+                            product.fft_transform(-1);
+                            delta_mass[p] = product.gather_f_pw();
+                        }
+                    }
+                }
+                std::array<std::vector<std::complex<double>>, 3> result;
+                for (auto it : ks.spl_num_kpoints()) {
+                    auto kp = ks.get<double>(it.i);
+                    if (!response) {
+                        kp->update();
+                    }
+                    auto hk = h0(*kp);
+                    int n = kp->gklo_basis_size(), bs = ctx->cyclic_block_size();
+                    la::dmatrix<std::complex<double>> h(n, n, ctx->blacs_grid(), bs, bs);
+                    la::dmatrix<std::complex<double>> o(n, n, ctx->blacs_grid(), bs, bs);
+                    if (response) {
+                        hk.set_fv_h_o_geometry_response(0, geometry, h, o, false, mass ? &*mass : nullptr);
+                        if (mass && geometry_part == 0) {
+                            check.reject("scalar mass geometry payload required",
+                                         [&] { hk.set_fv_h_o_geometry_response(0, geometry, h, o); });
+                            auto bad = *mass;
+                            bad.direction[0] += 0.01;
+                            check.reject("mass geometry direction must match",
+                                         [&] { hk.set_fv_h_o_geometry_response(0, geometry, h, o, false, &bad); });
+                            bad = *mass;
+                            if (kp->comm().rank() == 0) {
+                                bad.kinetic_pw[0] = std::numeric_limits<double>::quiet_NaN();
+                            }
+                            check.reject("nonfinite mass geometry payload rejected collectively",
+                                         [&] { hk.set_fv_h_o_geometry_response(0, geometry, h, o, false, &bad); });
+                        }
+                    } else {
+                        hk.set_fv_h_o(0, h, o);
+                        for (int j = 0; j < kp->num_gkvec_col(); j++) {
+                            auto qj = kp->gkvec_col().gkvec_cart(gvec_index_t::local(j));
+                            for (int i = 0; i < kp->num_gkvec_row(); i++) {
+                                auto qi  = kp->gkvec_row().gkvec_cart(gvec_index_t::local(i));
+                                int ig   = ctx->gvec().index_g12(kp->gkvec_row().gvec(gvec_index_t::local(i)),
+                                                                 kp->gkvec_col().gvec(gvec_index_t::local(j)));
+                                double t = 0.5 * dot(qi, qj);
+                                h(i, j) += t * (mass ? delta_mass[0][ig] : delta_theta[ig]);
+                                o(i, j) += delta_theta[ig] + (rel == relativity_t::iora ? t * delta_mass[1][ig] : 0);
+                            }
+                        }
+                    }
+                    result[0].insert(result[0].end(), h.at(memory_t::host), h.at(memory_t::host) + h.size_local());
+                    result[1].insert(result[1].end(), o.at(memory_t::host), o.at(memory_t::host) + o.size_local());
+                    if (response) {
+                        hk.set_fv_h_o_geometry_response(0, geometry, h, o, false, mass ? &*mass : nullptr, true);
+                    } else {
+                        hk.set_fv_h_o(0, h, o, true);
+                        for (int j = 0; j < kp->num_gkvec_col(); j++) {
+                            for (int i = 0; i < kp->num_gkvec_row(); i++) {
+                                int ig = ctx->gvec().index_g12(kp->gkvec_row().gvec(gvec_index_t::local(i)),
+                                                               kp->gkvec_col().gvec(gvec_index_t::local(j)));
+                                o(i, j) += delta_theta[ig];
+                            }
+                        }
+                    }
+                    result[2].insert(result[2].end(), o.at(memory_t::host), o.at(memory_t::host) + o.size_local());
+                }
+                return result;
+            };
+            auto analytic = snapshot(0, true);
+            std::cout << "Scalar-relativistic LAPW geometry " << relativity << " device=" << device
+                      << " simple=" << simple << " part=" << geometry_part << '\n';
+            for (double step : {1e-4, 5e-5}) {
+                auto plus = snapshot(step, false), minus = snapshot(-step, false);
+                for (int p : {0, 1, 2}) {
+                    double error{0}, peak{0};
+                    for (size_t i = 0; i < analytic[p].size(); i++) {
+                        double residual = std::abs(analytic[p][i] - (plus[p][i] - minus[p][i]) / (2 * step));
+                        error           = std::isfinite(residual) ? std::max(error, residual)
+                                                                  : std::numeric_limits<double>::infinity();
+                        peak            = std::max(peak, std::abs(analytic[p][i]));
+                    }
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+                    ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+                    check("nonzero scalar-relativistic geometry response", peak > 1e-7 ? 0 : 1, 0);
+                    check(p == 0 ? "scalar-relativistic geometry Hamiltonian derivative"
+                                 : (p == 1 ? "scalar-relativistic geometry overlap derivative"
+                                           : "physical geometry overlap derivative"),
+                          error / std::max(1e-12, peak), 3e-7);
+                }
+            }
+            snapshot(0, false);
+        }
+    }
+    return failures;
+}
+
+int
+test_lapw_dirac_xc(int mag, bool distributed_fft, std::string device)
+{
+    auto ctx = context(mag, distributed_fft, false, false, false, 0, 5.0, false, 0, "", false, device, false, "dirac",
+                       true);
+    int failures{0};
+    Test_check check(failures, ctx->comm(), "external Dirac LAPW XC mag=" + std::to_string(mag) + " " + device);
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0.07, -0.03, 0.02}, 1);
+    ks.initialize();
+    DFT_ground_state gs(ks);
+    gs.initial_state();
+    auto& density   = gs.density();
+    auto& potential = gs.potential();
+    check("nonzero joint point XC energy", std::abs(potential.energy_exc(density)) > 1e-8 ? 0 : 1, 0);
+    auto c = potential.lapw_xc_contractions(density);
+    check("Dirac callback Euler identity", std::abs(c.rho + c.magnetic + c.tau - 2 * potential.energy_exc(density)),
+          2e-10);
+    for (auto const& values : gs.check_external_xc_derivative(1e-4)) {
+        check("Dirac PW/full-j LO orbital derivative", std::abs(values[0] - values[1]), 2e-8);
+        check("Dirac orbital derivative at halved step", std::abs(values[0] - values[2]), 6e-9);
+    }
+    for (double error : gs.check_lapw_xc_response(1e-3)) {
+        check("Dirac point-field and Hamiltonian response", error, 1e-8);
+    }
+    Density direction(*ctx);
+    direction.zero();
+    direction.kinetic_density().zero();
+    for (int component = 0; component <= ctx->num_mag_dims(); component++) {
+        axpy(0.3 + 0.1 * component, density.component(component), direction.component(component));
+        axpy(-0.2 + 0.05 * component, density.kinetic_density().component(component),
+             direction.kinetic_density().component(component));
+    }
+    Hamiltonian0<double> h0(potential, false);
+    auto response = h0.lapw_field_response(*potential.hartree_response(direction.rho()),
+                                           potential.lapw_external_xc_response(density, direction));
+    for (auto it : ks.spl_num_kpoints()) {
+        auto& kp = *ks.get<double>(it.i);
+        auto hk  = h0(kp);
+        int n = 2 * kp.num_gkvec() + ctx->unit_cell().mt_lo_basis_size(), bs = ctx->cyclic_block_size();
+        la::dmatrix<std::complex<double>> dh(n, n, ctx->blacs_grid(), bs, bs);
+        hk.set_dirac_h_field_response(response, dh);
+        auto errors = lapw_spectrum_checks(hk, dh);
+        check("Dirac density-matrix spectral derivative", errors[0], 2e-7);
+        check("Dirac degenerate spectral derivative", errors[1], 2e-7);
+        check("Dirac spectral electron-count derivative", errors[2], 2e-10);
+        check("Dirac spectral invalid input rejection", errors[3], 0);
+    }
+    return failures;
+}
+
+int
 test_core_guard()
 {
-    auto ctx = context(0, false, true, true, true);
+    auto ctx = context(0, false, true, true, false, 0, 5.0, false, 0, "", false, "CPU", false, "none", false, "iora");
     int failures{0};
     for (bool density : {false, true}) {
         bool rejected{false};
@@ -3612,6 +5016,96 @@ test_core_guard()
             rejected = std::string(e.what()).find("tau-dependent radial core response") != std::string::npos;
         }
         failures += !rejected;
+    }
+    return failures;
+}
+
+int
+test_lapw_gpu(int mag, bool distributed_fft, bool spin_orbit = false)
+{
+    int failures{0};
+    Test_check check(failures, mpi::Communicator::world(),
+                     "external LAPW GPU spin mode=" + std::to_string(mag) + " SOC=" + std::to_string(spin_orbit));
+    std::vector<double> reference;
+    for (std::string device : {"CPU", "GPU"}) {
+        auto ctx = context(mag, distributed_fft, true, false, false, 0, 5.0, false, 0, "", false, device, spin_orbit);
+        if (device == "GPU") {
+            check("GPU orbitals and both GPU FFT grids selected",
+                  ctx->processing_unit() != device_t::GPU || ctx->spfft<double>().processing_unit() != SPFFT_PU_GPU ||
+                                  ctx->spfft_coarse<double>().processing_unit() != SPFFT_PU_GPU
+                          ? 1
+                          : 0,
+                  0);
+        }
+        K_point_set ks(*ctx);
+        ks.add_kpoint({0.07, -0.03, 0.02}, 1);
+        ks.initialize();
+        DFT_ground_state gs(ks);
+        gs.initial_state();
+        auto& density   = gs.density();
+        auto& potential = gs.potential();
+        if (spin_orbit) {
+            check("second-variation SOC selected", ctx->so_correction() ? 0 : 1, 0);
+            Hamiltonian0<double> h0(potential, false);
+            std::vector<int> nmt(ctx->unit_cell().num_atoms());
+            for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
+                nmt[ia] = ctx->unit_cell().atom(ia).mt_basis_size();
+            }
+            double peak{0};
+            for (auto it : ks.spl_num_kpoints()) {
+                auto& kp = *ks.get<double>(it.i);
+                std::vector<wf::Wave_functions<double>> so;
+                for (int j = 0; j < 3; j++) {
+                    so.emplace_back(kp.gkvec_sptr(), nmt, wf::num_mag_dims(0), wf::num_bands(ctx->num_fv_states()),
+                                    memory_t::host);
+                    so.back().zero(memory_t::host, wf::spin_index(0), wf::band_range(0, ctx->num_fv_states()));
+                }
+                h0.apply_so_correction(kp.fv_states(), so);
+                for (auto const& field : so) {
+                    for (auto atom : field.spl_num_atoms()) {
+                        for (int b = 0; b < ctx->num_fv_states(); b++) {
+                            for (int i = 0; i < nmt[atom.i]; i++) {
+                                peak = std::max(peak, std::abs(field.mt_coeffs(i, atom.li, wf::spin_index(0),
+                                                                               wf::band_index(b))));
+                            }
+                        }
+                    }
+                }
+            }
+            ctx->comm().allreduce<double, mpi::op_t::max>(&peak, 1);
+            check("nonzero SOC operator", std::isfinite(peak) && peak > 1e-12 ? 0 : 1, 0);
+        }
+        auto c = potential.lapw_xc_contractions(density);
+        check("callback Euler identity", std::abs(c.rho + c.magnetic + c.tau - 2 * potential.energy_exc(density)),
+              2e-11);
+        check("joint point XC field derivative", check_external_xc_point_derivative(density), 2e-10);
+        std::vector<double> sample{potential.energy_exc(density)};
+        for (auto const* fields : std::array<Field4D const*, 2>{&density, &density.kinetic_density()}) {
+            for (int s = 0; s <= mag; s++) {
+                auto values = potential_samples(fields->component(s));
+                sample.insert(sample.end(), values.begin(), values.end());
+            }
+        }
+        if (device == "CPU") {
+            reference = sample;
+        } else {
+            double error{0}, peak{0};
+            for (size_t i = 0; i < sample.size(); i++) {
+                error = std::max(error, std::abs(sample[i] - reference[i]));
+                peak  = std::max(peak, std::abs(reference[i]));
+            }
+            check("CPU/GPU density, tau and XC energy", error / std::max(1.0, peak), 1e-10);
+        }
+        for (auto const& values : gs.check_external_xc_derivative(1e-4)) {
+            check("PW/AW/LO orbital derivative", std::abs(values[0] - values[1]), 2e-8);
+            check("orbital derivative at halved step", std::abs(values[0] - values[2]), 6e-9);
+        }
+        for (double error : gs.check_lapw_xc_response(1e-3)) {
+            check("field and point response", error, 1e-8);
+        }
+        // Exercise GPU diagonalization and MT operators without imposing SCF convergence.
+        gs.find(1e-9, 1e-10, 1e-9, 1, false);
+        check("finite SCF lifecycle energy", std::isfinite(gs.total_energy()) ? 0 : 1, 0);
     }
     return failures;
 }
@@ -3652,58 +5146,192 @@ test_replicated_eigenvector_remap()
     return !std::isfinite(error) || error != 0;
 }
 
-} // namespace
+int
+test_response_suite(std::string const& mode)
+{
+    bool coupled     = mode.empty() || mode == "coupled-response";
+    bool density     = mode.empty() || mode == "density-response";
+    bool occupations = mode.empty() || mode == "occupation-response";
+    bool distributed = mpi::Communicator::world().size() > 1;
+    int result{0};
+    auto run = [&](int mag, bool fft, bool soc) {
+        std::string prefix = soc ? "SOC " : mag == 3 ? "noncollinear " : fft ? "distributed " : "";
+        if (coupled) {
+            result += call_test(prefix + "coupled LAPW response", test_lapw_coupled_response, mag, fft, soc, "CPU",
+                                "none", false);
+        }
+        if (density) {
+            result += call_test((prefix.empty() ? "constrained " : prefix) + "LAPW density response",
+                                test_lapw_density_response, mag, fft, soc, "none", "CPU");
+        }
+        if (occupations && !soc) {
+            result += call_test((prefix.empty() ? "weighted k-point " : prefix) + "occupation response",
+                                test_occupation_response, mag, fft, false);
+        }
+    };
+    for (int mag : {0, 1}) {
+        run(mag, distributed, false);
+    }
+    run(3, distributed, false);
+    if (coupled || density) {
+        run(3, distributed, true);
+    }
+    if (occupations) {
+        result += call_test("Gaussian occupation response", test_occupation_response, 0, false, true);
+    }
+    return result;
+}
 
 int
-main(int argc, char** argv)
+run_tests(int argc, char** argv)
 {
-    sirius::initialize(true);
+    std::string mode = argc > 1 ? argv[1] : "";
+    bool distributed = mpi::Communicator::world().size() > 1;
     int result{0};
-    if (argc > 1 && (std::string(argv[1]) == "cell-response" || std::string(argv[1]) == "core-cell")) {
+    if (mode == "dirac") {
+        int mag            = argc > 2 ? std::stoi(argv[2]) : 3;
+        std::string device = argc > 3 ? argv[3] : "CPU";
+        if ((mag != 0 && mag != 1 && mag != 3) || (device != "CPU" && device != "GPU")) {
+            RTE_THROW("Dirac XC fixture requires spin mode 0/1/3 and CPU/GPU");
+        }
+        return call_test("external Dirac LAPW XC", test_lapw_dirac_xc, mag, distributed, device);
+    }
+    if (mode == "dirac-density") {
+        int mag            = argc > 2 ? std::stoi(argv[2]) : 3;
+        std::string device = argc > 3 ? argv[3] : "CPU";
+        if ((mag != 0 && mag != 1 && mag != 3) || (device != "CPU" && device != "GPU")) {
+            RTE_THROW("Dirac density fixture requires spin mode 0/1/3 and CPU/GPU");
+        }
+        return call_test("native Dirac LAPW density response", test_lapw_density_response, mag, distributed, false,
+                         "dirac", device);
+    }
+    if (mode == "dirac-response") {
+        result = call_test("external Dirac LAPW XC", test_lapw_dirac_xc, 3, distributed, "CPU");
+        result += call_test("native Dirac LAPW density response", test_lapw_density_response, 3, distributed, false,
+                            "dirac", "CPU");
+        result += call_test("native Dirac coupled LAPW response", test_lapw_coupled_response, 3, distributed, false,
+                            "CPU", "dirac", false);
+        return result;
+    }
+    if (mode == "core-guard") {
+        return call_test("external LAPW core response guard", test_core_guard);
+    }
+    bool scalar_dirac = mode == "scalar-dirac-core-coupled" || mode == "scalar-dirac-core-soc-coupled";
+    if (mode == "dirac-coupled" || mode == "dirac-core-coupled" || scalar_dirac) {
+        int mag            = argc > 2 ? std::stoi(argv[2]) : 3;
+        std::string device = argc > 3 ? argv[3] : "CPU";
+        bool soc           = mode == "scalar-dirac-core-soc-coupled";
+        if ((mag != 0 && mag != 1 && mag != 3) || (device != "CPU" && device != "GPU") || (soc && mag != 3)) {
+            RTE_THROW("coupled Dirac-core fixture requires spin mode 0/1/3 and CPU/GPU");
+        }
+        return call_test("native Dirac-core coupled LAPW response", test_lapw_coupled_response, mag, distributed, soc,
+                         device, scalar_dirac ? "zora" : "dirac", mode != "dirac-coupled");
+    }
+    if (mode == "dirac-cell" || mode == "dirac-core-cell") {
+        int mag            = argc > 2 ? std::stoi(argv[2]) : 0;
+        std::string device = argc > 3 ? argv[3] : "CPU";
+        if (argc > 4 || (mag != 0 && mag != 1 && mag != 3) || (device != "CPU" && device != "GPU")) {
+            RTE_THROW("Dirac LAPW cell test requires spin mode 0/1/3 and CPU/GPU");
+        }
+        bool core = mode == "dirac-core-cell";
+        return call_test("native Dirac LAPW forces and stress", test_lapw_cell_response, mag, core, false, device,
+                         "dirac", core ? "dirac" : "none");
+    }
+    if (mode == "linearization") {
+        return call_test("external LAPW linearisation response", test_lapw_linearization_response);
+    }
+    if (mode == "relativistic-basis") {
+        std::string device = argc > 2 ? argv[2] : "CPU";
+        if (argc > 3 || (device != "CPU" && device != "GPU")) {
+            RTE_THROW("scalar-relativistic basis test requires CPU/GPU");
+        }
+        return call_test("scalar-relativistic LAPW basis response", test_lapw_relativistic_basis_response, device);
+    }
+    if (mode == "scalar-cell") {
+        std::string rel      = argc > 2 ? argv[2] : "iora";
+        std::string device   = argc > 3 ? argv[3] : "CPU";
+        int mag              = argc > 4 ? std::stoi(argv[4]) : 0;
+        int core             = argc > 5 ? std::stoi(argv[5]) : 0;
+        std::string core_rel = argc > 6 ? argv[6] : "none";
+        if ((rel != "zora" && rel != "iora" && rel != "koelling_harmon") || (device != "CPU" && device != "GPU") ||
+            (mag != 0 && mag != 1) || (core != 0 && core != 1) ||
+            (core_rel != "none" && core_rel != "zora" && core_rel != "dirac") || (!core && core_rel != "none")) {
+            RTE_THROW(
+                    "scalar LAPW cell test requires ZORA/IORA/KH, CPU/GPU, spin/core mode 0/1 and NR/ZORA/Dirac core");
+        }
+        result = call_test("scalar-relativistic LAPW forces and stress", test_lapw_cell_response, mag, bool(core),
+                           false, device, rel, core_rel);
+        return result;
+    }
+    if (mode == "gpu") {
+        for (int mag : {0, 3}) {
+            result += call_test("external LAPW GPU", test_lapw_gpu, mag, distributed, false);
+        }
+        result += call_test("external LAPW GPU SOC", test_lapw_gpu, 3, distributed, true);
+        return result;
+    }
+    if (mode == "gpu-coupled") {
+        for (int mag : {0, 3}) {
+            result += call_test("GPU coupled LAPW response", test_lapw_coupled_response, mag, distributed, mag == 3,
+                                "GPU", "none", false);
+        }
+        return result;
+    }
+    if (mode == "gpu-cell") {
+        int mag = argc > 2 ? std::stoi(argv[2]) : 3;
+        if (mag != 0 && mag != 1 && mag != 3) {
+            RTE_THROW("GPU LAPW cell test requires spin mode 0, 1 or 3");
+        }
+        result = call_test("GPU LAPW forces and stress", test_lapw_cell_response, mag, false, mag == 3, "GPU", "none",
+                           "none");
+        return result;
+    }
+    if (mode == "spinor" || mode == "core-spinor") {
+        return call_test("external LAPW spinor SCF", test_lapw_external, 3, distributed, true, mode == "core-spinor");
+    }
+    if (mode == "cell-response" || mode == "core-cell") {
         int first = argc > 2 ? std::stoi(argv[2]) : 0;
         int last  = argc > 2 ? first : 1;
-        if (first < 0 || first > 1) {
-            RTE_THROW("LAPW cell test requires spin mode 0 or 1");
+        if ((first != 0 && first != 1 && first != 3) || (first == 3 && mode == "core-cell")) {
+            RTE_THROW("LAPW cell test requires spin mode 0, 1 or a core-free spinor mode 3");
         }
         for (int mag = first; mag <= last; mag++) {
-            result += call_test("external LAPW cell response", test_lapw_cell_response, mag,
-                                std::string(argv[1]) == "core-cell");
+            result += call_test("external LAPW cell response", test_lapw_cell_response, mag, mode == "core-cell", false,
+                                "CPU", "none", "none");
         }
-        sirius::finalize();
-        return std::min(result, 1);
+        return result;
     }
-    if (argc > 1 && std::string(argv[1]) == "coupled-response") {
-        for (int mag : {0, 1}) {
-            result += call_test("coupled LAPW response", test_lapw_coupled_response, mag, false);
-            if (mpi::Communicator::world().size() > 1) {
-                result += call_test("distributed coupled LAPW response", test_lapw_coupled_response, mag, true);
-            }
+    if (mode == "coupled-response" || mode == "density-response" || mode == "occupation-response") {
+        return test_response_suite(mode);
+    }
+    if (mode == "soc-response") {
+        result =
+                call_test("SOC LAPW density response", test_lapw_density_response, 3, distributed, true, "none", "CPU");
+        result += call_test("SOC coupled LAPW response", test_lapw_coupled_response, 3, distributed, true, "CPU",
+                            "none", false);
+        return result;
+    }
+    if (mode == "soc-cell") {
+        std::string rel      = argc > 2 ? argv[2] : "none";
+        std::string device   = argc > 3 ? argv[3] : "CPU";
+        int core             = argc > 4 ? std::stoi(argv[4]) : 0;
+        std::string core_rel = argc > 5 ? argv[5] : "none";
+        if ((rel != "none" && rel != "zora") || (device != "CPU" && device != "GPU") || (core != 0 && core != 1) ||
+            (core_rel != "none" && core_rel != "zora" && core_rel != "dirac") || (!core && core_rel != "none")) {
+            RTE_THROW("SOC LAPW cell test requires NR/ZORA valence, CPU/GPU, core mode 0/1 and NR/ZORA/Dirac core");
         }
-        sirius::finalize();
-        return std::min(result, 1);
+        result = call_test("SOC LAPW forces and stress", test_lapw_cell_response, 3, bool(core), true, device, rel,
+                           core_rel);
+        return result;
     }
-    if (argc > 1 && std::string(argv[1]) == "density-response") {
-        for (int mag : {0, 1}) {
-            result += call_test("constrained LAPW density response", test_lapw_density_response, mag, false);
-            if (mpi::Communicator::world().size() > 1) {
-                result += call_test("distributed LAPW density response", test_lapw_density_response, mag, true);
-            }
+    if (mode == "spinor-spectrum") {
+        std::string rel = argc > 2 ? argv[2] : "none";
+        if (rel != "none" && rel != "zora") {
+            RTE_THROW("LAPW spinor spectrum test requires NR/ZORA valence");
         }
-        sirius::finalize();
-        return std::min(result, 1);
+        return call_test("two-stage LAPW spinor response", test_lapw_spinor_spectrum, distributed, rel);
     }
-    if (argc > 1 && std::string(argv[1]) == "occupation-response") {
-        for (int mag : {0, 1}) {
-            result += call_test("weighted k-point occupation response", test_occupation_response, mag, false, false);
-            if (mpi::Communicator::world().size() > 1) {
-                result += call_test("distributed occupation response", test_occupation_response, mag, true, false);
-            }
-        }
-        result += call_test("Gaussian occupation response", test_occupation_response, 0, false, true);
-        sirius::finalize();
-        return std::min(result, 1);
-    }
-    if (argc > 1 && (std::string(argv[1]) == "force-response" || std::string(argv[1]) == "core-force")) {
+    if (mode == "force-response" || mode == "core-force") {
         int first = argc > 3 ? std::stoi(argv[3]) : 0;
         int last  = argc > 3 ? first : 1;
         if (first < 0 || first > 1) {
@@ -3711,43 +5339,37 @@ main(int argc, char** argv)
         }
         for (int mag = first; mag <= last; mag++) {
             result += call_test("external LAPW force response", test_lapw_force_response, mag,
-                                argc > 2 ? std::stod(argv[2]) : 9.0, std::string(argv[1]) == "core-force");
+                                argc > 2 ? std::stod(argv[2]) : 9.0, mode == "core-force");
         }
-        sirius::finalize();
-        return std::min(result, 1);
+        return result;
     }
-    if (argc > 1 && std::string(argv[1]) == "core") {
+    if (mode == "core") {
         for (int mag : {0, 1}) {
             for (bool second : {false, true}) {
-                bool distributed = mpi::Communicator::world().size() > 1;
                 result += call_test("external LAPW core SCF", test_lapw_external, mag, distributed, second, true);
             }
         }
-        sirius::finalize();
-        return std::min(result, 1);
+        return result;
     }
     for (int mag : {0, 1}) {
-        for (bool second : {false, true}) {
-            bool distributed = mpi::Communicator::world().size() > 1 && mag != second;
-            result += call_test("external LAPW SCF", test_lapw_external, mag, distributed, second, false);
-        }
+        result += call_test("external LAPW SCF", test_lapw_external, mag, false, bool(mag), false);
     }
+    result += call_test("external LAPW spinor SCF", test_lapw_external, 3, distributed, true, false);
     result += call_test("external LAPW core response guard", test_core_guard);
     result += call_test("external LAPW linearisation response", test_lapw_linearization_response);
     result += call_test("replicated LAPW eigenvector redistribution", test_replicated_eigenvector_remap);
-    for (int mag : {0, 1}) {
-        result += call_test("coupled LAPW response", test_lapw_coupled_response, mag, false);
-        result += call_test("constrained LAPW density response", test_lapw_density_response, mag, false);
-        if (mpi::Communicator::world().size() > 1) {
-            result += call_test("distributed coupled LAPW response", test_lapw_coupled_response, mag, true);
-            result += call_test("distributed LAPW density response", test_lapw_density_response, mag, true);
-        }
-        result += call_test("weighted k-point occupation response", test_occupation_response, mag, false, false);
-        if (mpi::Communicator::world().size() > 1) {
-            result += call_test("distributed occupation response", test_occupation_response, mag, true, false);
-        }
-    }
-    result += call_test("Gaussian occupation response", test_occupation_response, 0, false, true);
+    result += test_response_suite("");
+    result += call_test("two-stage LAPW spinor response", test_lapw_spinor_spectrum, distributed, "none");
+    return result;
+}
+
+} // namespace
+
+int
+main(int argc, char** argv)
+{
+    sirius::initialize(true);
+    int result = call_test("LAPW external XC tests", run_tests, argc, argv);
     sirius::finalize();
     return std::min(result, 1);
 }

@@ -207,7 +207,9 @@ class K_point
         band_energies_ = mdarray<double, 2>({ctx_.num_bands(), ctx_.num_spinors()}, mdarray_label("band_energies"));
         band_energies_.zero();
 
-        if (ctx_.num_mag_dims() == 1) {
+        if (ctx_.valence_relativity() == relativity_t::dirac) {
+            ispn_map_[1] = 0;
+        } else if (ctx_.num_mag_dims() == 1) {
             ispn_map_[1] = 1;
         } else if (ctx_.num_mag_dims() == 3) {
             ispn_map_[1] = 0;
@@ -296,6 +298,12 @@ class K_point
      */
     void
     generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf::Wave_functions<T>& wf__, int ispn__);
+
+    /// Store positive-energy PW coefficients in two slots and intrinsic full-j MT coefficients in slot zero.
+    /** The PW slots label free positive-energy spinors, not the four physical Dirac components. */
+    void
+    generate_dirac_wave_functions(mdarray<std::complex<double>, 2> const& evec__,
+                                  wf::Wave_functions<T>* target__ = nullptr);
 
     /// Generate two-component spinor wave functions.
     /** In case of second-variational diagonalization spinor wave-functions are generated from the first-variational
@@ -413,7 +421,7 @@ class K_point
     inline int
     num_occupied_bands(int ispn__ = -1) const
     {
-        if (ctx_.num_mag_dims() == 3) {
+        if (ctx_.num_mag_dims() == 3 || ctx_.valence_relativity() == relativity_t::dirac) {
             ispn__ = 0;
         }
         for (int j = ctx_.num_bands() - 1; j >= 0; j--) {

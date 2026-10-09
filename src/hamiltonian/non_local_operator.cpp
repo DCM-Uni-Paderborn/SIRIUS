@@ -114,7 +114,8 @@ D_operator<T>::initialize(Potential& potential__)
 
     auto& uc = this->ctx_.unit_cell();
 
-    const int s_idx[2][2] = {{0, 3}, {2, 1}};
+    // Blocks 2 and 3 map down to up and up to down, respectively.
+    const int s_idx[2][2] = {{0, 2}, {3, 1}};
 
     #pragma omp parallel for
     for (int ia = 0; ia < uc.num_atoms(); ia++) {

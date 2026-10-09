@@ -23,7 +23,9 @@ struct paw_xc_field_adjoint_t
 /// Joint smooth/local PAW field map for one nonlocal XC evaluation.
 /** Every target row is owned once across the context communicator. Scalar
  *  inputs denote total fields; collinear inputs are separate up/down fields,
- *  not charge/magnetization components. Smooth rho excludes augmentation Q
+ *  not charge/magnetization components. Spinors instead use
+ *  total/z/x/y components, with unpolarized pseudo cores in the total field only.
+ *  Smooth rho excludes augmentation Q
  *  and pseudo-core charge. Smooth tau is the positive pseudo-orbital
  *  kinetic density, without Q or core terms. Coefficients must be current.
  *
@@ -53,7 +55,7 @@ class PAW_xc_field_map
     sample(std::vector<Smooth_periodic_function<double>> const& rho__,
            std::vector<Smooth_periodic_function<double>> const& tau__) const
     {
-        int ns     = ctx_.num_spins();
+        int ns     = ctx_.num_mag_dims() + 1;
         int failed = rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns);
         ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
         if (failed) {
@@ -81,7 +83,7 @@ class PAW_xc_field_map
                      std::vector<Smooth_periodic_function<double>> const& tau__,
                      xc_point_fields_t const& derivatives__) const
     {
-        int ns     = ctx_.num_spins();
+        int ns     = ctx_.num_mag_dims() + 1;
         int failed = rho__.size() != static_cast<size_t>(ns) || tau__.size() != static_cast<size_t>(ns);
         ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
         if (failed) {
@@ -118,13 +120,13 @@ class PAW_xc_field_map
     paw_xc_field_adjoint_t
     adjoint(xc_point_fields_t const& derivatives__) const
     {
-        int ns        = ctx_.num_spins();
+        int ns        = ctx_.num_mag_dims() + 1;
         auto const& r = derivatives__.rho;
         auto const& g = derivatives__.gradient;
         auto const& t = derivatives__.tau;
         int failed    = r.size(0) != num_points_ || r.size(1) != ns || t.size(0) != num_points_ || t.size(1) != ns ||
-                        g.size(0) != num_points_ || g.size(1) != 3 || g.size(2) != ns;
-        auto finite   = [](auto const& a) {
+                     g.size(0) != num_points_ || g.size(1) != 3 || g.size(2) != ns;
+        auto finite = [](auto const& a) {
             for (size_t i = 0; i < a.size(); i++) {
                 if (!std::isfinite(a[i])) {
                     return false;

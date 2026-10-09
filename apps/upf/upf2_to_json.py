@@ -236,10 +236,10 @@ def parse_PAW(upf_dict, root):
     assert len(upf_dict['paw_data']['occupations']) == size
 
     # ---- Read AE core correction (density of core charge)
+    node = root.findall("./PP_PAW/PP_AE_NLCC")[0]
     if 'size' in node.attrib:
         if upf_dict['header']['mesh_size'] != int(node.attrib['size']):
             print('WARNING: mesh_size != size(PP_AE_NLCC)')
-    node = root.findall("./PP_PAW/PP_AE_NLCC")[0]
     size = upf_dict['header']['mesh_size']
 
     upf_dict['paw_data']['ae_core_charge_density'] = [

@@ -30,6 +30,9 @@ void
 check_xc_potential(Density const& rho__);
 
 double
+check_external_xc_point_derivative(Density const& density__);
+
+double
 xc_mt(Radial_grid<double> const& rgrid__, SHT const& sht__, std::vector<XC_functional> const& xc_func__,
       int num_mag_dims__, std::vector<Flm const*> rho__, std::vector<Flm*> vxc__, Flm* exc__, bool use_lalp__);
 
@@ -391,7 +394,9 @@ class Potential : public Field4D
     external_xc_geometry(Density const& density__) const;
 
     /// Constructor
-    Potential(Simulation_context& ctx__);
+    /// Explicit kinetic-potential storage is available for norm-conserving PW operator construction.
+    /// It does not enable a tau-dependent XC functional.
+    Potential(Simulation_context& ctx__, bool kinetic_potential__ = false);
 
     /// Recompute some variables that depend on atomic positions or the muffin-tin radius.
     void
@@ -641,7 +646,8 @@ class Potential : public Field4D
     /// LAPW Poisson-operator geometry derivative at fixed Fourier and atom-local density coefficients.
     /** Includes reciprocal metric, moving multipoles and sphere boundary values, with fixed MT radii.
      *  Atom displacements are Cartesian and independent of lattice-column changes. Directions and the
-     *  nuclear-term flag are context-replicated. Uses CPU fields and preserves potential/energy state.
+     *  nuclear-term flag are context-replicated. Uses host field coefficients with the context's CPU/GPU
+     *  Poisson backend and preserves potential/energy state.
      *  Add hartree_response for the separate density variation; the zero-G gauge is unchanged.
      */
     std::unique_ptr<Periodic_function<double>>
@@ -921,6 +927,10 @@ class Potential : public Field4D
     lapw_xc_contractions_t
     lapw_xc_contractions(Density const& density__) const;
 
+    /// Contract supplied XC covectors without changing the staged potential or energy.
+    lapw_xc_contractions_t
+    lapw_xc_contractions(Density const& density__, lapw_xc_field_adjoint_t const& derivatives__) const;
+
     auto const*
     lapw_xc_derivatives() const
     {
@@ -982,6 +992,17 @@ class Potential : public Field4D
         return energy_vha_;
     }
 
+    /// Remove the neutralizing PP background from external-XC energy contractions.
+    double
+    external_xc_background_contraction() const
+    {
+        double charge = ctx_.cfg().parameters().extra_charge();
+        if (!external_xc_registered_ || ctx_.full_potential() || charge == 0) {
+            return 0;
+        }
+        return charge * xc_potential().integrate().total / unit_cell_.omega();
+    }
+
     /// Integral of \f$ \rho({\bf r}) V^{XC}({\bf r}) \f$.
     auto
     energy_vxc(Density const& density__) const
@@ -990,7 +1011,7 @@ class Potential : public Field4D
         if (lapw_xc_derivatives_) {
             return lapw_xc_contractions(density__).rho;
         }
-        return inner(density__.rho(), xc_potential());
+        return inner(density__.rho(), xc_potential()) - external_xc_background_contraction();
     }
 
     /// Integral of \f$ \rho_{c}({\bf r}) V^{XC}({\bf r}) \f$.

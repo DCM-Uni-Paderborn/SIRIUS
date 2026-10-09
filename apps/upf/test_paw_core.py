@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-from upf2_to_json import add_paw_core_kinetic_density
+from upf2_to_json import add_paw_core_kinetic_density, parse_PAW
 from upf_to_json import main
 
 
@@ -189,6 +189,27 @@ class PawCoreTest(unittest.TestCase):
                     main()
             self.assertEqual(error.exception.code, 2)
             self.assertEqual(before, output.read_bytes())
+
+    def test_paw_core_size_checks_density_not_occupations(self):
+        root = ET.fromstring('''<UPF>
+          <PP_NONLOCAL><PP_AUGMENTATION cutoff_r_index="3">
+            <PP_Q>0</PP_Q><PP_MULTIPOLES>0</PP_MULTIPOLES>
+          </PP_AUGMENTATION></PP_NONLOCAL>
+          <PP_FULL_WFC>
+            <PP_AEWFC.1 l="0">0 1 0</PP_AEWFC.1>
+            <PP_PSWFC.1 l="0">0 1 0</PP_PSWFC.1>
+          </PP_FULL_WFC>
+          <PP_PAW core_energy="0">
+            <PP_OCCUPATIONS size="1">2</PP_OCCUPATIONS>
+            <PP_AE_NLCC size="3">4 3 2</PP_AE_NLCC>
+            <PP_AE_VLOC size="3">-6 -4 -2</PP_AE_VLOC>
+          </PP_PAW>
+        </UPF>''')
+        data = {'header': {'pseudo_type': 'PAW', 'mesh_size': 3, 'number_of_proj': 1}}
+        with patch('sys.stdout', new_callable=io.StringIO) as output:
+            parse_PAW(data, root)
+        self.assertNotIn('mesh_size != size(PP_AE_NLCC)', output.getvalue())
+        self.assertEqual(data['paw_data']['ae_core_charge_density'], [4.0, 3.0, 2.0])
 
 
 if __name__ == '__main__':

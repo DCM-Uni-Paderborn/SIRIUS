@@ -718,6 +718,7 @@ Unit_cell::get_symmetry()
         return;
     }
 
+    auto previous_classes = atom_symmetry_classes_;
     if (atom_symmetry_classes_.size() != 0) {
         atom_symmetry_classes_.clear();
         for (int ia = 0; ia < num_atoms(); ia++) {
@@ -750,6 +751,15 @@ Unit_cell::get_symmetry()
             /* take next id */
             atom_class_id++;
             atom_symmetry_classes_.push_back(std::make_shared<Atom_symmetry_class>(atom_class_id, atom(i).type()));
+            // Electronic states change, but the nuclear no-pair projector does not.
+            // The core solver revalidates the radial grid before reusing it.
+            if (parameters_.core_relativity() == relativity_t::dirac && atom(i).type().num_core_electrons() != 0) {
+                for (auto const& previous : previous_classes) {
+                    if (&previous->atom_type() == &atom(i).type()) {
+                        atom_symmetry_classes_.back()->inherit_dirac_core_reference(*previous);
+                    }
+                }
+            }
 
             /* scan all atoms */
             for (int j = 0; j < num_atoms(); j++) {

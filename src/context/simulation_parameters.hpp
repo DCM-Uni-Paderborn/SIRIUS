@@ -325,15 +325,21 @@ class Simulation_parameters
     inline int
     num_mag_comp() const // TODO: rename; current name does not reflect the meaning
     {
+        if (valence_relativity_ == relativity_t::dirac) {
+            return 1; // The full-j atom basis already contains both physical spin components.
+        }
         return (num_mag_dims() == 3) ? 3 : num_spins(); // std::max(mag_dims, spins)
     }
 
-    /// Number of non-zero spinor components.
+    /// Number of non-zero spinor components (positive-energy PW coefficient slots for Dirac).
     /** In non magnetic case this is equal to 1, in collinear magnetic case it is also equal to 1 (pure spinors),
      *  in non-collinear case the number of components is 2 (general spinor case). */
     inline int
     num_spinor_comp() const
     {
+        if (valence_relativity_ == relativity_t::dirac) {
+            return 2;
+        }
         if (num_mag_dims() != 3) {
             return 1;
         } else {
@@ -348,6 +354,9 @@ class Simulation_parameters
     inline int
     num_spinors() const
     {
+        if (valence_relativity_ == relativity_t::dirac) {
+            return 1;
+        }
         if (num_mag_dims() == 1) {
             return 2;
         } else {
@@ -382,6 +391,9 @@ class Simulation_parameters
     int
     num_bands() const
     {
+        if (valence_relativity_ == relativity_t::dirac) {
+            return cfg().parameters().num_bands();
+        }
         if (this->num_fv_states() != -1) {
             return this->num_fv_states() * this->num_spinor_comp();
         } else {
@@ -393,6 +405,9 @@ class Simulation_parameters
     inline int
     max_occupancy() const
     {
+        if (valence_relativity_ == relativity_t::dirac) {
+            return 1;
+        }
         return (this->num_mag_dims() == 0) ? 2 : 1;
     }
 

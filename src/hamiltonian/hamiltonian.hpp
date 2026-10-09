@@ -37,18 +37,32 @@ template <typename T>
 class Periodic_function;
 
 /// Hartree and XC matrix response at fixed geometry and radial basis.
+/// Scalar/collinear states use spin channels; noncollinear states use total/z/x/y components.
+/// Dirac states use four canonical Fourier columns and one intrinsic full-j atom matrix.
 struct lapw_hamiltonian_response_t
 {
     Simulation_context const* context{nullptr};
     mdarray<std::complex<double>, 2> scalar_pw, kinetic_pw;
     std::vector<mdarray<std::complex<double>, 3>> local;
+    /// IORA mass response in the interstitial and muffin-tin overlap; empty for other modes.
+    mdarray<std::complex<double>, 2> overlap_pw;
+    std::vector<mdarray<std::complex<double>, 3>> overlap_local;
 };
 
 /// Atom-local radial-basis derivatives and the unperturbed overlap, in AW/LO order.
+/// Native Dirac stores only local-field dH; its bare H/O response uses the full-j basis directly.
 struct lapw_atom_basis_response_t
 {
     mdarray<std::complex<double>, 3> h;
     mdarray<double, 2> o, overlap;
+};
+
+/// Moving interstitial boundary at fixed scalar-relativistic potential samples.
+struct lapw_interstitial_geometry_response_t
+{
+    Simulation_context const* context{nullptr};
+    std::vector<double> direction;
+    std::vector<std::complex<double>> kinetic_pw, overlap_pw;
 };
 template <typename T>
 class Local_operator;
@@ -82,14 +96,27 @@ class Hamiltonian0;
 /** Uses every PW/LO eigenvector, not only the stored bands. Occupations and their
  *  energy derivatives are supplied explicitly for this spectrum. All calls are
  *  collective on the k-point communicator and leave the ground state unchanged.
+ *  Native Dirac matrices retain both positive-energy PW blocks and the intrinsic
+ *  full-j LO block in one spectrum, using the physical four-component overlap.
  */
 class LAPW_eigensystem
 {
   private:
+    friend class LAPW_spinor_eigensystem;
+    enum class space_t
+    {
+        pw_lo,
+        first_variation,
+        second_variation
+    };
     Simulation_context& ctx_;
     K_point<double>& kp_;
-    mdarray<std::complex<double>, 2> vectors_, overlap_;
-    std::vector<double> energies_;
+    int dimension_;
+    mdarray<std::complex<double>, 2> vectors_, overlap_, physical_overlap_;
+    std::vector<double> energies_, physical_norms_;
+
+    LAPW_eigensystem(Hamiltonian_k<double> const& hk__, la::dmatrix<std::complex<double>> const& h__,
+                     la::dmatrix<std::complex<double>> const& s__, space_t space__);
 
     void
     validate_matrix(la::dmatrix<std::complex<double>> const& matrix__) const;
@@ -102,11 +129,12 @@ class LAPW_eigensystem
     {
         LAPW_eigensystem const* reference{nullptr};
         mdarray<std::complex<double>, 2> h, s;
-        std::vector<double> energies;
+        std::vector<double> energies, physical_norms;
     };
 
     LAPW_eigensystem(Hamiltonian_k<double> const& hk__, la::dmatrix<std::complex<double>> const& h__,
-                     la::dmatrix<std::complex<double>> const& s__);
+                     la::dmatrix<std::complex<double>> const& s__,
+                     la::dmatrix<std::complex<double>> const* physical_overlap__ = nullptr);
     LAPW_eigensystem(LAPW_eigensystem const&) = delete;
     LAPW_eigensystem&
     operator=(LAPW_eigensystem const&) = delete;
@@ -125,9 +153,11 @@ class LAPW_eigensystem
 
     /// Transform dH/dS and compute energy directions without changing the eigenvectors.
     perturbation_t
-    perturbation(la::dmatrix<std::complex<double>> const& h__, la::dmatrix<std::complex<double>> const& s__) const;
+    perturbation(la::dmatrix<std::complex<double>> const& h__, la::dmatrix<std::complex<double>> const& s__,
+                 la::dmatrix<std::complex<double>> const* physical_overlap__ = nullptr) const;
 
-    /// Coefficient density matrix C f C^H in independent PW/LO order.
+    /// Coefficient density matrix C f C^H, including optional physical (IORA) normalization.
+    /// IORA uses the ordinary overlap, as in normalize_for_iora, not its energy-dependent eigenproblem metric.
     mdarray<std::complex<double>, 2>
     density_matrix(std::vector<double> const& occupations__) const;
 
@@ -136,6 +166,60 @@ class LAPW_eigensystem
      *  charge/spin population and must be determined across k-points by the caller.
      */
     mdarray<std::complex<double>, 2>
+    density_matrix_response(perturbation_t const& direction__, std::vector<double> const& occupations__,
+                            std::vector<double> const& slopes__, double mu_response__ = 0) const;
+};
+
+/// Density response of the truncated first-/second-variation noncollinear LAPW problem.
+/** Includes motion of the retained first-variation subspace into the excluded
+ *  states. Matrices use canonical total/z/x/y components and a common overlap.
+ *  All calls are k-point-collective and leave the ground state unchanged.
+ */
+class LAPW_spinor_eigensystem
+{
+  public:
+    using matrix_set_t = std::array<la::dmatrix<std::complex<double>> const*, 4>;
+    struct perturbation_t
+    {
+        LAPW_spinor_eigensystem const* reference{nullptr};
+        mdarray<std::complex<double>, 2> frame;
+        LAPW_eigensystem::perturbation_t spinor;
+    };
+
+  private:
+    Simulation_context& ctx_;
+    K_point<double>& kp_;
+    std::unique_ptr<LAPW_eigensystem> auxiliary_, spinor_;
+    mdarray<std::complex<double>, 2> frame_;
+    std::array<mdarray<std::complex<double>, 2>, 4> h_;
+
+    std::array<mdarray<std::complex<double>, 2>, 4>
+    matrices(matrix_set_t const& h__) const;
+
+  public:
+    LAPW_spinor_eigensystem(Hamiltonian_k<double> const& hk__, matrix_set_t const& h__,
+                            la::dmatrix<std::complex<double>> const& s__);
+
+    auto const&
+    energies() const
+    {
+        return spinor_->energies();
+    }
+
+    auto const&
+    overlap() const
+    {
+        return auxiliary_->overlap();
+    }
+
+    perturbation_t
+    perturbation(matrix_set_t const& h__, la::dmatrix<std::complex<double>> const& s__) const;
+
+    /// Coefficient density matrices in independent PW/LO order, with four Pauli components.
+    mdarray<std::complex<double>, 3>
+    density_matrix(std::vector<double> const& occupations__) const;
+
+    mdarray<std::complex<double>, 3>
     density_matrix_response(perturbation_t const& direction__, std::vector<double> const& occupations__,
                             std::vector<double> const& slopes__, double mu_response__ = 0) const;
 };
@@ -152,6 +236,7 @@ class LAPW_density_response
   private:
     K_point_set& ks_;
     std::vector<std::array<std::unique_ptr<LAPW_eigensystem>, 2>> spectra_;
+    std::vector<std::unique_ptr<LAPW_spinor_eigensystem>> spinor_spectra_;
     std::vector<mdarray<double, 2>> bands_, occupations_;
     std::array<double, 2> fermi_;
     double width_, moment_, charge_;
@@ -163,19 +248,25 @@ class LAPW_density_response
   public:
     struct matrix_direction_t
     {
-        std::array<la::dmatrix<std::complex<double>> const*, 2> h{}, s{};
+        /// Noncollinear H uses total/z/x/y components and only S[0], the common metric.
+        /// Native Dirac uses only H[0]/S[0], each containing both PW components and full-j LOs.
+        std::array<la::dmatrix<std::complex<double>> const*, 4> h{};
+        std::array<la::dmatrix<std::complex<double>> const*, 2> s{};
+        /// Ordinary-overlap direction for IORA physical orbital normalization; absent in other modes.
+        std::array<la::dmatrix<std::complex<double>> const*, 2> physical_s{};
     };
 
     LAPW_density_response(Hamiltonian0<double> const& h0__, K_point_set& ks__);
 
-    /// Frozen valence density matrices, in local-k-point order, with spin as the last dimension.
+    /// Frozen valence matrices in local-k-point order, with spin channels, total/z/x/y or one full-j block last.
     std::vector<mdarray<std::complex<double>, 3>>
     density_matrices() const;
 
     /// Full occupied/virtual response, including overlap and global occupation derivatives.
-    /** Optionally return the collectively summed smearing free-energy derivative. */
+    /** Optionally return the collectively summed smearing and valence eigenvalue-sum derivatives. */
     std::vector<mdarray<std::complex<double>, 3>>
-    density_matrix_response(std::vector<matrix_direction_t> const& directions__, double* entropy__ = nullptr) const;
+    density_matrix_response(std::vector<matrix_direction_t> const& directions__, double* entropy__ = nullptr,
+                            double* eval_sum__ = nullptr) const;
 };
 
 /// Represent the k-point independent part of Hamiltonian.
@@ -219,6 +310,13 @@ class Hamiltonian0
     /// Plane-wave coefficients of the squared inverse relativistic mass weighted by the unit step-function.
     mdarray<std::complex<T>, 1> rm2_inv_pw_;
 
+    /// Prepare canonical Fourier covectors and the full-j atom correction before any local k-point loop.
+    void
+    prepare_dirac_fields();
+
+    std::vector<mdarray<std::complex<T>, 3>>
+    dirac_atom_matrices(std::vector<radial_basis_response_t> const* response__ = nullptr) const;
+
     /* copy constructor is forbidden */
     Hamiltonian0(Hamiltonian0<T> const& src) = delete;
     /* copy assignment operator is forbidden */
@@ -253,6 +351,9 @@ class Hamiltonian0
     Local_operator<T>&
     local_op() const
     {
+        if (!local_op_) {
+            RTE_THROW("Dirac LAPW uses its four-component matrix operator, not the scalar local operator");
+        }
         return *local_op_;
     }
 
@@ -273,6 +374,11 @@ class Hamiltonian0
     {
         return hmt_[ia__];
     }
+
+    /// Atom-local Hamiltonian in scalar/collinear or total/z/x/y component order.
+    /// Includes the second-variation SOC operator in the spinor components.
+    std::complex<T>
+    hmt_component(int ia__, int i__, int j__, int s__, bool spin_orbit_only__ = false) const;
 
     auto const&
     veff_pw(int ig__, int ispn__ = 0) const
@@ -332,15 +438,49 @@ class Hamiltonian0
     void
     generate_pw_coefs(Potential const& potential__);
 
+    /// Physical Dirac H/O in two positive-energy PW blocks followed by full-j LOs.
+    /** Field gathers and atom contractions are performed once by the constructor on all context ranks.
+     *  This call is collective only on the supplied G+k communicator. It does not use scalar FV matrices. */
+    std::array<mdarray<std::complex<double>, 2>, 2>
+    dirac_matrices(fft::Gvec const& gkvec__) const;
+
+    /// Native Dirac dH at fixed radial basis and geometry, with no bare kinetic or overlap derivative.
+    /// Uses covectors prepared collectively by lapw_field_response(); collective only on G+k ranks.
+    mdarray<std::complex<double>, 2>
+    dirac_field_response(fft::Gvec const& gkvec__, lapw_hamiltonian_response_t const& response__) const;
+
+    /// Native Dirac dH/dO from radial functions and matching coefficients at fixed physical fields and geometry.
+    /// Atom covector derivatives are prepared on the context by lapw_radial_basis_response().
+    std::array<mdarray<std::complex<double>, 2>, 2>
+    dirac_radial_response(fft::Gvec const& gkvec__, std::vector<radial_basis_response_t> const& response__,
+                          std::vector<lapw_atom_basis_response_t> const& atoms__) const;
+
+    /// Moving native Dirac H/O at fixed radial functions and Fourier/atom field covectors.
+    /// Physical-field, sampling and radial-relaxation derivatives are separate contributions.
+    std::array<mdarray<std::complex<double>, 2>, 2>
+    dirac_geometry_response(fft::Gvec const& gkvec__, xc_geometry_direction_t const& direction__) const;
+
     /// Build atom-local dH/dS at fixed geometry and physical fields, without updating radial integrals.
+    /// Native Dirac returns local-field dH with empty o/overlap; dirac_radial_response() assembles complete H/O.
+    /// The SOC-only mode omits the overlap and all non-SOC terms.
     /// Collective on the context communicator, before looping over locally owned k-points.
     std::vector<lapw_atom_basis_response_t>
-    lapw_radial_basis_response(std::vector<radial_basis_response_t> const& response__) const;
+    lapw_radial_basis_response(std::vector<radial_basis_response_t> const& response__, bool spin_orbit_only__ = false,
+                               bool physical_overlap__ = false) const;
 
-    /// Prepare the Hartree/XC field contribution to dH without changing any ground-state fields.
+    /// Prepare the Hartree/XC field contribution to dH and the IORA dS without changing ground-state fields.
     /// Collective on the context communicator, before looping over locally owned k-points.
     lapw_hamiltonian_response_t
     lapw_field_response(Periodic_function<double> const& hartree__, lapw_xc_field_adjoint_t const& xc__) const;
+
+    /// ZORA/IORA mass-mask derivatives, collective on the context before local k-point loops.
+    lapw_interstitial_geometry_response_t
+    lapw_interstitial_geometry_response(xc_geometry_direction_t const& direction__) const;
+
+    /// Frozen magnetic Hamiltonian in total/z/x/y order, with a zero total component.
+    /// The SOC-only mode isolates the local spin-orbit operator.
+    lapw_hamiltonian_response_t
+    lapw_spin_fields(bool spin_orbit_only__ = false) const;
 };
 
 template <typename T>
@@ -615,7 +755,26 @@ class Hamiltonian_k
      *  \f]
      */
     void
-    set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+    set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+               bool physical_overlap__ = false) const;
+
+    /// Native full-j Dirac H/O, dimension 2*num_gkvec + mt_lo_basis_size, collective on the k-point.
+    void
+    set_dirac_h_o(la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Fixed-basis Dirac Hartree/XC dH in the native positive-energy PW/full-j LO order.
+    void
+    set_dirac_h_field_response(lapw_hamiltonian_response_t const& response__, la::dmatrix<std::complex<T>>& h__) const;
+
+    void
+    set_dirac_h_o_radial_response(std::vector<radial_basis_response_t> const& response__,
+                                  std::vector<lapw_atom_basis_response_t> const& atoms__,
+                                  la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+
+    /// Native full-j moving-basis response at fixed radial functions and field covectors.
+    void
+    set_dirac_h_o_geometry_response(xc_geometry_direction_t const& direction__, la::dmatrix<std::complex<T>>& h__,
+                                    la::dmatrix<std::complex<T>>& o__) const;
 
     /// Radial-basis response of the complete PW/LO matrices, including AW matching.
     /** Atom-local derivatives are prepared once by H0().lapw_radial_basis_response().
@@ -625,35 +784,43 @@ class Hamiltonian_k
     void
     set_fv_h_o_radial_response(int ispn__, std::vector<radial_basis_response_t> const& response__,
                                std::vector<lapw_atom_basis_response_t> const& atoms__,
-                               la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+                               la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                               bool spin_orbit_only__ = false) const;
 
     /// Basis, interstitial boundary and kinetic-metric contribution to the PW/LO geometry response.
     /** Radial functions, MT radii, local matrices and potential Fourier covectors stay fixed.
-     *  Physical-field derivatives are separate. Collective on the k-point communicator.
+     *  Physical-field derivatives are separate. ZORA/IORA require the mass-mask response
+     *  prepared collectively by Hamiltonian0. Collective on the k-point communicator.
      */
     void
     set_fv_h_o_geometry_response(int ispn__, xc_geometry_direction_t const& direction__,
-                                 la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+                                 la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                                 bool spin_orbit_only__                              = false,
+                                 lapw_interstitial_geometry_response_t const* mass__ = nullptr,
+                                 bool physical_overlap__                             = false) const;
 
     /// Hartree/XC field contribution to the complete PW/LO dH, at fixed basis and geometry.
-    /// Collective on the k-point communicator. The overlap has no field contribution.
+    /// For spinors, ispn__ selects a total/z/x/y Pauli component, not an up/down spin block.
+    /// Collective on the k-point communicator. An overlap output is required for an IORA mass response.
     void
     set_fv_h_field_response(int ispn__, lapw_hamiltonian_response_t const& response__,
-                            la::dmatrix<std::complex<T>>& h__) const;
+                            la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>* o__ = nullptr) const;
 
     /// Add interstitial contribution to apw-apw block of Hamiltonian and overlap.
     void
-    set_fv_h_o_it(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+    set_fv_h_o_it(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                  bool physical_overlap__ = false) const;
 
     /// Setup lo-lo block of Hamiltonian and overlap matrices.
     void
-    set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+    set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                     bool physical_overlap__ = false) const;
 
     /// Setup apw-lo and lo-apw blocks of LAPW Hamiltonian and overlap matrices.
     void
     set_fv_h_o_apw_lo(Atom const& atom, int ia, int isnp__, mdarray<std::complex<T>, 2>& alm_row,
                       mdarray<std::complex<T>, 2>& alm_col, mdarray<std::complex<T>, 2>& h,
-                      mdarray<std::complex<T>, 2>& o) const;
+                      mdarray<std::complex<T>, 2>& o, bool physical_overlap__ = false) const;
 
     /// Apply pseudopotential H and S operators to the wavefunctions.
     /** \tparam F    Type of the subspace matrix.

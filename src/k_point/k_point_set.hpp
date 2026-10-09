@@ -150,7 +150,7 @@ class K_point_set
     };
 
     /// Fixed-charge occupation response, including a fixed collinear spin moment.
-    /** Energy directions have shape {num_bands, num_spins}, in local k-point
+    /** Energy directions have shape {num_bands, num_spinors}, in local k-point
      *  order and replicated within each k-point communicator. Uses the current
      *  fp64 band energies, occupations and smearing convention. All calls are
      *  collective on the context communicator. The ground state is unchanged.
@@ -309,6 +309,12 @@ class K_point_set
 
     inline auto&
     ctx()
+    {
+        return ctx_;
+    }
+
+    inline auto const&
+    ctx() const
     {
         return ctx_;
     }

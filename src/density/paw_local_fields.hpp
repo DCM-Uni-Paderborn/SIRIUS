@@ -29,9 +29,8 @@ class PAW_local_fields
     static Atom_type const&
     checked_type(Atom_type const& type__)
     {
-        if (!type__.is_paw() || type__.spin_orbit_coupling() || type__.indexb().size() == 0 ||
-            type__.radial_grid().first() <= 0) {
-            RTE_THROW("local PAW fields require scalar partial waves on a positive radial grid");
+        if (!type__.is_paw() || type__.indexb().size() == 0 || type__.radial_grid().first() <= 0) {
+            RTE_THROW("local PAW fields require partial waves on a positive radial grid");
         }
         return type__;
     }
@@ -64,18 +63,21 @@ class PAW_local_fields
         , lmax_(2 * type_.indexr().lmax())
         , gaunt_(type_.indexr().lmax(), lmax_, type_.indexr().lmax(), SHT::gaunt_rrr)
         , tau_(type_.radial_grid(), type_.indexb(), ae_ ? type_.ae_paw_wfs_array() : type_.ps_paw_wfs_array(), lmax_,
-               radial_wave_function_t::r_times_R, radial_sizes(type_, ae_))
+               radial_wave_function_t::r_times_R, radial_sizes(type_, ae_), {}, type_.spin_orbit_coupling())
     {
     }
 
-    /// Return {rho, tau} in one total or two canonical spin channels.
+    /// Return {rho, tau} in total, up/down, or total/z/x/y components.
     std::array<std::vector<Flm>, 2>
     fields(mdarray<std::complex<double>, 3> const& dm__, bool include_core__ = true) const
     {
-        int n = type_.indexb().size(), ns = static_cast<int>(dm__.size(2));
-        if (dm__.size(0) != n || dm__.size(1) != n || (ns != 1 && ns != 2)) {
+        int n = type_.indexb().size(), blocks = static_cast<int>(dm__.size(2));
+        if (dm__.size(0) != n || dm__.size(1) != n || (blocks < 1 || blocks > 3) ||
+            (type_.spin_orbit_coupling() && blocks != 3)) {
             RTE_THROW("local PAW fields: incompatible density matrix");
         }
+        bool spinor      = blocks == 3;
+        int ns           = spinor ? 4 : blocks;
         auto const& grid = type_.radial_grid();
         std::array<std::vector<Flm>, 2> result;
         mdarray<std::complex<double>, 2> spin_dm({n, n});
@@ -88,11 +90,22 @@ class PAW_local_fields
             tau.zero();
             for (int j = 0; j < n; j++) {
                 for (int i = 0; i < n; i++) {
-                    spin_dm(i, j) = dm__(j, i, s);
+                    if (!spinor) {
+                        spin_dm(i, j) = dm__(j, i, s);
+                    } else if (s < 2) {
+                        spin_dm(i, j) = dm__(j, i, 0) + (1.0 - 2 * s) * dm__(j, i, 1);
+                    } else {
+                        // D_ud is not spatially Hermitian. Combine it with D_du,
+                        // then transpose the Pauli component for the tau contraction.
+                        auto ud = dm__(j, i, 2), du = std::conj(dm__(i, j, 2));
+                        spin_dm(i, j) = s == 2 ? ud + du : std::complex<double>(0, 1) * (ud - du);
+                    }
                 }
+            }
+            for (int j = 0; j < n; j++) {
                 for (int i = 0; i <= j; i++) {
                     for (auto const& g : gaunt_.gaunt_vector(type_.indexb(i).lm, type_.indexb(j).lm)) {
-                        double w = (i == j ? 1 : 2) * std::real(dm__(i, j, s)) * g.coef;
+                        double w = (i == j ? 1 : 2) * std::real(spin_dm(j, i)) * g.coef;
                         for (int ir = 0; ir < grid.num_points(); ir++) {
                             rho(g.lm3, ir) += w * rho_product(i, j, g.l3, ir);
                         }
@@ -100,7 +113,7 @@ class PAW_local_fields
                 }
             }
             tau_.add_density(spin_dm, tau);
-            if (include_core__) {
+            if (include_core__ && (!spinor || s == 0)) {
                 auto const& core = ae_ ? type_.paw_ae_core_charge_density() : type_.ps_core_charge_density();
                 if (ae_) {
                     if (core.size() != static_cast<size_t>(grid.num_points()) ||
@@ -112,10 +125,11 @@ class PAW_local_fields
                     type_.check_ps_core_kinetic_density();
                 }
                 for (int ir = 0; ir < grid.num_points(); ir++) {
-                    rho(0, ir) += (core.empty() ? 0 : core[ir]) / (ns * y00);
+                    double core_spins = spinor ? 1 : ns;
+                    rho(0, ir) += (core.empty() ? 0 : core[ir]) / (core_spins * y00);
                     double t = ae_ ? type_.paw_ae_core_kinetic_density()[ir]
                                    : (type_.has_ps_core_kinetic_density() ? type_.ps_core_kinetic_density()[ir] : 0);
-                    tau(0, ir) += t / (ns * y00);
+                    tau(0, ir) += t / (core_spins * y00);
                 }
             }
         }

@@ -28,6 +28,7 @@ template <typename T>
 r3::matrix<double>
 external_xc_stress(Simulation_context& ctx, Density const& density, Potential& potential, K_point_set const& ks)
 {
+    bool spinor      = ctx.num_mag_dims() == 3;
     auto geometry    = potential.external_xc_geometry(density);
     auto const& cell = ctx.unit_cell();
     r3::matrix<double> result;
@@ -54,13 +55,16 @@ external_xc_stress(Simulation_context& ctx, Density const& density, Potential& p
     double normalization{0};
     for (int ig = 0; ig < ctx.gvec().count(); ig++) {
         double multiplicity = ctx.gvec().reduced() && ctx.gvec().offset() + ig != 0 ? 2 : 1;
-        for (int j = 0; j < ctx.num_spins(); j++) {
+        for (int j = 0; j < ctx.num_mag_dims() + 1; j++) {
             auto rho = density.component(j).rg().f_pw_local(ig);
+            if (j == 0 && ctx.gvec().offset() + ig == 0) {
+                rho -= ctx.cfg().parameters().extra_charge() / cell.omega();
+            }
             if (cell.num_paw_atoms()) {
                 rho -= augmentation(ig, j);
             }
             auto v = j == 0 ? potential.xc_potential().rg().f_pw_local(ig)
-                            : potential.effective_magnetic_field(0).rg().f_pw_local(ig);
+                            : potential.effective_magnetic_field(j - 1).rg().f_pw_local(ig);
             normalization +=
                     multiplicity * std::real(std::conj(v) * rho +
                                              std::conj(potential.kinetic_potential().component(j).rg().f_pw_local(ig)) *
@@ -76,14 +80,11 @@ external_xc_stress(Simulation_context& ctx, Density const& density, Potential& p
     // -sum_nk f_nk w_k Re[(D_mu psi)* D_nu psi]. Contract on the same coarse
     // FFT grid as the variational kinetic-density operator.
     std::vector<Smooth_periodic_function<T>> vtau;
-    for (int s = 0; s < ctx.num_spins(); s++) {
+    for (int j = 0; j < ctx.num_mag_dims() + 1; j++) {
         vtau.emplace_back(ctx.spfft_coarse<T>(), ctx.gvec_coarse_fft_sptr());
         for (int ig = 0; ig < ctx.gvec_coarse().count(); ig++) {
-            int fine = ctx.gvec().gvec_base_mapping(ig);
-            auto t   = potential.kinetic_potential().scalar().rg().f_pw_local(fine);
-            if (ctx.num_spins() == 2) {
-                t += double(1 - 2 * s) * potential.kinetic_potential().vector(0).rg().f_pw_local(fine);
-            }
+            int fine                   = ctx.gvec().gvec_base_mapping(ig);
+            auto t                     = potential.kinetic_potential().component(j).rg().f_pw_local(fine);
             vtau.back().f_pw_local(ig) = static_cast<std::complex<T>>(t);
         }
         vtau.back().fft_transform(1);
@@ -95,27 +96,36 @@ external_xc_stress(Simulation_context& ctx, Density const& density, Potential& p
         auto const& gk = *kp->gkvec_fft_sptr();
         int nr         = fft.local_slice_size();
         std::vector<std::complex<T>> work(gk.count());
-        mdarray<std::complex<T>, 2> gradient({nr, 3});
-        for (int s = 0; s < ctx.num_spins(); s++) {
+        mdarray<std::complex<T>, 3> gradient({nr, 3, ctx.num_spinor_comp()});
+        for (int s = 0; s < ctx.num_spinors(); s++) {
             int nb = kp->num_occupied_bands(s);
             if (!nb) {
                 continue;
             }
-            wf::Wave_functions_fft<T> psi(kp->gkvec_fft_sptr(), kp->spinor_wave_functions(), wf::spin_index(s),
-                                          wf::band_range(0, nb), wf::shuffle_to::fft_layout);
-            for (int ib = 0; ib < psi.num_wf_local(); ib++) {
-                auto band = psi.spl_num_wf().global_index(ib);
-                auto phi  = psi.at(memory_t::host, 0, wf::band_index(ib));
-                for (int x = 0; x < 3; x++) {
-                    for (int ig = 0; ig < gk.count(); ig++) {
-                        work[ig] = std::complex<T>(0, static_cast<T>(gk.gkvec_cart(ig)[x])) * phi[ig];
-                    }
-                    fft.backward(reinterpret_cast<T const*>(work.data()), SPFFT_PU_HOST);
-                    auto ptr = fft.space_domain_data(SPFFT_PU_HOST);
-                    for (int ir = 0; ir < nr; ir++) {
-                        gradient(ir, x) = fft.type() == SPFFT_TRANS_R2C
-                                                  ? std::complex<T>(ptr[ir], 0)
-                                                  : reinterpret_cast<std::complex<T> const*>(ptr)[ir];
+            std::array<wf::Wave_functions_fft<T>, 2> psi;
+            for (int c = 0; c < ctx.num_spinor_comp(); c++) {
+                psi[c] = wf::Wave_functions_fft<T>(kp->gkvec_fft_sptr(), kp->spinor_wave_functions(),
+                                                   wf::spin_index(spinor ? c : s), wf::band_range(0, nb),
+                                                   wf::shuffle_to::fft_layout);
+                if (psi[c].on_device()) {
+                    psi[c].copy_to(memory_t::host);
+                }
+            }
+            for (int ib = 0; ib < psi[0].num_wf_local(); ib++) {
+                auto band = psi[0].spl_num_wf().global_index(ib);
+                for (int c = 0; c < ctx.num_spinor_comp(); c++) {
+                    auto phi = psi[c].at(memory_t::host, 0, wf::band_index(ib));
+                    for (int x = 0; x < 3; x++) {
+                        for (int ig = 0; ig < gk.count(); ig++) {
+                            work[ig] = std::complex<T>(0, static_cast<T>(gk.gkvec_cart(ig)[x])) * phi[ig];
+                        }
+                        fft.backward(reinterpret_cast<T const*>(work.data()), SPFFT_PU_HOST);
+                        auto ptr = fft.space_domain_data(SPFFT_PU_HOST);
+                        for (int ir = 0; ir < nr; ir++) {
+                            gradient(ir, x, c) = fft.type() == SPFFT_TRANS_R2C
+                                                         ? std::complex<T>(ptr[ir], 0)
+                                                         : reinterpret_cast<std::complex<T> const*>(ptr)[ir];
+                        }
                     }
                 }
                 double weight = kp->weight() * kp->band_occupancy(band, s) /
@@ -123,8 +133,26 @@ external_xc_stress(Simulation_context& ctx, Density const& density, Potential& p
                 for (int mu = 0; mu < 3; mu++) {
                     for (int nu = 0; nu < 3; nu++) {
                         for (int ir = 0; ir < nr; ir++) {
-                            metric(mu, nu) -= weight * vtau[s].value(ir) *
-                                              std::real(std::conj(gradient(ir, mu)) * gradient(ir, nu));
+                            auto up = std::conj(gradient(ir, mu, 0)) * gradient(ir, nu, 0);
+                            double value;
+                            if (spinor) {
+                                auto down    = std::conj(gradient(ir, mu, 1)) * gradient(ir, nu, 1);
+                                auto cross   = std::conj(gradient(ir, mu, 0)) * gradient(ir, nu, 1);
+                                auto reverse = std::conj(gradient(ir, mu, 1)) * gradient(ir, nu, 0);
+                                // Field4D order is scalar, z, x, y. The two off-diagonal
+                                // Pauli terms retain transverse spin and complex phases.
+                                value = vtau[0].value(ir) * std::real(up + down) +
+                                        vtau[1].value(ir) * std::real(up - down) +
+                                        vtau[2].value(ir) * std::real(cross + reverse) +
+                                        vtau[3].value(ir) * std::imag(cross - reverse);
+                            } else {
+                                double v = vtau[0].value(ir);
+                                if (ctx.num_spins() == 2) {
+                                    v += (1 - 2 * s) * vtau[1].value(ir);
+                                }
+                                value = v * std::real(up);
+                            }
+                            metric(mu, nu) -= weight * value;
                         }
                     }
                 }
@@ -360,7 +388,7 @@ Stress::calc_stress_core()
     stress_core_.zero();
 
     if (ctx_.cb().external_xc_) {
-        // Frozen AE core fields are differentiated by the point reconstruction.
+        // Frozen AE and pseudo-core fields are differentiated by the point reconstruction.
         return stress_core_;
     }
 
@@ -969,7 +997,11 @@ Stress::calc_stress_vloc()
         sdiag *= 2;
     }
     if (ctx_.comm().rank() == 0) {
-        sdiag += std::real(std::conj(density_.rho().rg().f_pw_local(0)) * v[0]);
+        auto rho = density_.rho().rg().f_pw_local(0);
+        if (ctx_.cb().external_xc_) {
+            rho -= ctx_.cfg().parameters().extra_charge() / ctx_.unit_cell().omega();
+        }
+        sdiag += std::real(std::conj(rho) * v[0]);
     }
 
     for (int mu : {0, 1, 2}) {

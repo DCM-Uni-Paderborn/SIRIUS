@@ -180,12 +180,13 @@ DFT_ground_state::check_external_xc_derivative(double step__)
         return check_lapw_xc_derivative(step__);
     }
 
+    bool spinor = ctx_.num_mag_dims() == 3;
     std::vector<std::vector<std::complex<double>>> saved;
     for (auto it : kset_.spl_num_kpoints()) {
         auto kp = kset_.get<double>(it.i);
         saved.emplace_back();
         for (int s = 0; s < ctx_.num_spins(); s++) {
-            for (int b = 0; b < kp->num_occupied_bands(s); b++) {
+            for (int b = 0; b < kp->num_occupied_bands(spinor ? 0 : s); b++) {
                 for (int ig = 0; ig < kp->gkvec().count(); ig++) {
                     saved.back().push_back(
                             kp->spinor_wave_functions().pw_coeffs(ig, wf::spin_index(s), wf::band_index(b)));
@@ -205,7 +206,7 @@ DFT_ground_state::check_external_xc_derivative(double step__)
             auto kp = kset_.get<double>(it.i);
             size_t index{0};
             for (int s = 0; s < ctx_.num_spins(); s++) {
-                for (int b = 0; b < kp->num_occupied_bands(s); b++) {
+                for (int b = 0; b < kp->num_occupied_bands(spinor ? 0 : s); b++) {
                     for (int ig = 0; ig < kp->gkvec().count(); ig++) {
                         auto g = kp->gkvec().gvec(gvec_index_t::local(ig));
                         auto c = saved[ik][index++];
@@ -244,16 +245,22 @@ DFT_ground_state::check_external_xc_derivative(double step__)
                     wf::Wave_functions<double> hphi(kp->gkvec_sptr(), wf::num_mag_dims(ctx_.num_mag_dims()),
                                                     wf::num_bands(ctx_.num_bands()), memory_t::host);
                     for (int s = 0; s < ctx_.num_spins(); s++) {
-                        int nb = kp->num_occupied_bands(s);
+                        int nb = kp->num_occupied_bands(spinor ? 0 : s);
                         if (nb == 0) {
                             continue;
                         }
-                        if (ctx_.gamma_point()) {
-                            Hk.apply_h_s<double>(wf::spin_range(s), wf::band_range(0, nb), kp->spinor_wave_functions(),
-                                                 &hphi, nullptr);
-                        } else {
-                            Hk.apply_h_s<std::complex<double>>(wf::spin_range(s), wf::band_range(0, nb),
-                                                               kp->spinor_wave_functions(), &hphi, nullptr);
+                        if (!spinor || s == 0) {
+                            auto psi_guard  = kp->spinor_wave_functions().memory_guard(ctx_.processing_unit_memory_t(),
+                                                                                       wf::copy_to::device);
+                            auto hphi_guard = hphi.memory_guard(ctx_.processing_unit_memory_t(), wf::copy_to::host);
+                            if (ctx_.gamma_point()) {
+                                Hk.apply_h_s<double>(wf::spin_range(s), wf::band_range(0, nb),
+                                                     kp->spinor_wave_functions(), &hphi, nullptr);
+                            } else {
+                                auto spins = spinor ? wf::spin_range(0, 2) : wf::spin_range(s);
+                                Hk.apply_h_s<std::complex<double>>(spins, wf::band_range(0, nb),
+                                                                   kp->spinor_wave_functions(), &hphi, nullptr);
+                            }
                         }
                         for (int b = 0; b < nb; b++) {
                             for (int ig = 0; ig < kp->gkvec().count(); ig++) {
@@ -263,7 +270,7 @@ DFT_ground_state::check_external_xc_derivative(double step__)
                                 auto d              = std::complex<double>(0, phase(g, direction)) * c;
                                 auto h              = hphi.pw_coeffs(ig, wf::spin_index(s), wf::band_index(b));
                                 double multiplicity = kp->gkvec().reduced() && dot(g, g) ? 2 : 1;
-                                derivative += 2 * kp->weight() * kp->band_occupancy(b, s) * multiplicity *
+                                derivative += 2 * kp->weight() * kp->band_occupancy(b, spinor ? 0 : s) * multiplicity *
                                               std::real(std::conj(d) * h);
                             }
                         }

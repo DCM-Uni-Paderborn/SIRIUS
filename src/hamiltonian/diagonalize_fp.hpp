@@ -498,7 +498,7 @@ diagonalize_fp_sv(Hamiltonian_k<double> const& Hk__, K_point<double>& kp__)
         /* compute <wf_i | h * wf_j> for up-dn block */
         wf::inner(ctx.spla_context(), mem, sr, kp__.fv_states(), br, hpsi[2], br, h, 0, nfv);
 
-        if (kp__.comm().size() == 1) {
+        if (ctx.blacs_grid().comm().size() == 1) {
             for (int i = 0; i < nfv; i++) {
                 for (int j = 0; j < nfv; j++) {
                     h(nfv + j, i) = std::conj(h(i, nfv + j));
@@ -582,13 +582,67 @@ diagonalize_fp_single_variation(Hamiltonian_k<T> const& Hk__, K_point<T>& kp__)
 }
 
 /// Diagonalize a full-potential LAPW Hamiltonian.
+inline void
+diagonalize_fp_dirac_exact(Hamiltonian_k<float> const&, K_point<float>&)
+{
+    RTE_THROW("Dirac LAPW diagonalization requires fp64");
+}
+
+inline void
+diagonalize_fp_dirac_exact(Hamiltonian_k<double> const& Hk__, K_point<double>& kp__)
+{
+    auto& ctx = Hk__.H0().ctx();
+    int n = 2 * kp__.num_gkvec() + ctx.unit_cell().mt_lo_basis_size(), nb = ctx.num_bands();
+    int invalid = nb < 1 || nb > n || ctx.cfg().control().use_second_variation() ||
+                  ctx.cfg().iterative_solver().type() != "exact";
+    kp__.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("Dirac LAPW requires an exact full-variational eigenproblem with enough basis functions");
+    }
+    auto& solver = ctx.gen_evp_solver();
+    int bs       = ctx.cyclic_block_size();
+    la::dmatrix<std::complex<double>> h(n, n, ctx.blacs_grid(), bs, bs, get_memory_pool(solver.host_memory_t()));
+    la::dmatrix<std::complex<double>> o(n, n, ctx.blacs_grid(), bs, bs, get_memory_pool(solver.host_memory_t()));
+    la::dmatrix<std::complex<double>> z(n, n, ctx.blacs_grid(), bs, bs, get_memory_pool(solver.host_memory_t()));
+    Hk__.set_dirac_h_o(h, o);
+    if (is_device_memory(solver.data_memory_t())) {
+        auto& pool = get_memory_pool(solver.data_memory_t());
+        h.allocate(pool);
+        o.allocate(pool);
+        z.allocate(pool);
+    }
+    std::vector<double> energies(nb);
+    int failed = solver.solve(n, nb, h, o, energies.data(), z) != 0;
+    kp__.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("failed to solve the positive-energy Dirac LAPW eigenproblem");
+    }
+    auto vectors = z.get_full_matrix();
+    // Share one gauge across serial solver replicas, including degenerate eigenspaces.
+    kp__.comm().bcast(vectors.at(memory_t::host), vectors.size(), 0);
+    kp__.comm().bcast(energies.data(), energies.size(), 0);
+    mdarray<std::complex<double>, 2> selected({n, nb});
+    for (int b = 0; b < nb; b++) {
+        invalid |= !std::isfinite(energies[b]);
+        kp__.band_energy(b, 0, energies[b]);
+        std::copy_n(vectors.at(memory_t::host, 0, b), n, selected.at(memory_t::host, 0, b));
+    }
+    kp__.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("nonfinite Dirac LAPW eigenvalues");
+    }
+    kp__.generate_dirac_wave_functions(selected);
+}
+
 template <typename T>
 inline void
 diagonalize_fp(Hamiltonian_k<T> const& Hk__, K_point<T>& kp__, double itsol_tol__)
 {
     auto& ctx = Hk__.H0().ctx();
     print_memory_usage(ctx.out(), FILE_LINE);
-    if (ctx.cfg().control().use_second_variation()) {
+    if (ctx.valence_relativity() == relativity_t::dirac) {
+        diagonalize_fp_dirac_exact(Hk__, kp__);
+    } else if (ctx.cfg().control().use_second_variation()) {
         /* solve non-magnetic Hamiltonian (so-called first variation) */
         auto& itso = ctx.cfg().iterative_solver();
         if (itso.type() == "exact") {

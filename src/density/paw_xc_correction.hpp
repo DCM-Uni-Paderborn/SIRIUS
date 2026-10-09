@@ -29,9 +29,8 @@ class PAW_xc_correction
     static Atom_type const&
     checked_type(Atom_type const& type__)
     {
-        if (!type__.is_paw() || type__.spin_orbit_coupling() || type__.indexb().size() == 0 ||
-            type__.radial_grid().first() <= 0) {
-            RTE_THROW("PAW XC correction requires scalar PAW partial waves on a positive radial grid");
+        if (!type__.is_paw() || type__.indexb().size() == 0 || type__.radial_grid().first() <= 0) {
+            RTE_THROW("PAW XC correction requires partial waves on a positive radial grid");
         }
         auto const& rho = type__.paw_ae_core_charge_density();
         if (rho.size() != static_cast<size_t>(type__.num_mt_points()) ||
@@ -74,29 +73,32 @@ class PAW_xc_correction
         return type_.radial_grid(std::min(last + 1, nr - 1));
     }
 
-    /// Return {rho corrections, tau corrections}, each with one total or two spin fields.
+    /// Return {rho, tau} corrections in total, up/down, or total/z/x/y components.
     /** dm__ uses SIRIUS's projector convention D_ij=sum_n f_n c_ni conj(c_nj).
      *  The closed-shell frozen core is split equally between the two collinear
-     *  channels. Fields are real-harmonic coefficients, without radial weights.
+     *  channels, or added only to the total component of a spinor density.
+     *  Fields are real-harmonic coefficients, without radial weights.
      *  A sampler may request valence-only corrections and interpolate the fixed
      *  core separately to avoid state-dependent cancellation in radial slopes.
      */
     std::array<std::vector<Flm>, 2>
     fields(mdarray<std::complex<double>, 3> const& dm__, bool include_core__ = true) const
     {
-        int ns           = static_cast<int>(dm__.size(2));
         auto result      = ae_.fields(dm__, false);
         auto pseudo      = ps_.fields(dm__, false);
+        int ns           = static_cast<int>(result[0].size());
+        bool spinor      = ns == 4;
         auto const& grid = type_.radial_grid();
         for (int s = 0; s < ns; s++) {
             auto& rho = result[0][s];
             auto& tau = result[1][s];
             rho -= pseudo[0][s];
             tau -= pseudo[1][s];
-            if (include_core__) {
+            if (include_core__ && (!spinor || s == 0)) {
                 for (int ir = 0; ir < grid.num_points(); ir++) {
-                    rho(0, ir) += type_.paw_ae_core_charge_density()[ir] / (ns * y00);
-                    tau(0, ir) += type_.paw_ae_core_kinetic_density()[ir] / (ns * y00);
+                    double core_spins = spinor ? 1 : ns;
+                    rho(0, ir) += type_.paw_ae_core_charge_density()[ir] / (core_spins * y00);
+                    tau(0, ir) += type_.paw_ae_core_kinetic_density()[ir] / (core_spins * y00);
                 }
             }
         }

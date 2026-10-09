@@ -237,7 +237,7 @@ class Density : public Field4D
     /// Fixed pseudo-core tau, excluded from valence mixing and electron counts.
     std::unique_ptr<Smooth_periodic_function<double>> tau_pseudo_core_;
 
-    /// Valence tau (plus core inside LAPW spheres) and its spin difference, mixed with rho/magnetization.
+    /// Scalar and spin-vector tau (plus core inside LAPW spheres), mixed with rho/magnetization.
     std::unique_ptr<Field4D> kinetic_density_;
 
     bool external_xc_registered_;
@@ -250,7 +250,8 @@ class Density : public Field4D
         PAW density of atoms. */
     std::unique_ptr<mixer::Mixer<Periodic_function<double>, Periodic_function<double>, Periodic_function<double>,
                                  Periodic_function<double>, density_matrix_t, PAW_density<double>, Hubbard_matrix,
-                                 Periodic_function<double>, Periodic_function<double>>>
+                                 Periodic_function<double>, Periodic_function<double>, Periodic_function<double>,
+                                 Periodic_function<double>>>
             mixer_;
 
     /// Core charge density.
@@ -340,6 +341,12 @@ class Density : public Field4D
                                     std::vector<radial_basis_response_t> const* radial__,
                                     xc_geometry_direction_t const* geometry__) const;
 
+    /// Build physical Dirac fields or their validated orbital/occupation response.
+    void
+    generate_dirac_valence(K_point_set const& ks__,
+                           std::vector<wf::Wave_functions<double>*> const* directions__ = nullptr,
+                           std::vector<mdarray<double, 2>> const* occupations__         = nullptr);
+
   public:
     /// External XC enables tau automatically; it can also be requested for orbital-field diagnostics.
     Density(Simulation_context& ctx__, bool kinetic_density__ = false);
@@ -379,7 +386,7 @@ class Density : public Field4D
     /// Generate charge density of core states
     /** Optional raw XC covectors {rho, tau} are in atom-symmetry-class order.
      *  They differentiate spin-summed spherical core fields, without extra radial
-     *  weights. Supplying them selects the nonrelativistic variational solver.
+     *  weights. Supplying them selects the NR/ZORA or native no-pair Dirac variational core solver.
      */
     void
     generate_core_charge_density(std::vector<std::vector<double>> const& vs__,
@@ -431,14 +438,15 @@ class Density : public Field4D
     /** Returns one total component for a nonmagnetic calculation, or separate
      *  up/down components for a collinear calculation, on the fine density grid
      *  in both real and reciprocal space. PAW augmentation, muffin-tin terms,
-     *  and core contributions are not included. Currently requires CPU orbitals
-     *  and FFTs. This does not enable a tau-dependent functional in the SCF loop.
+     *  and core contributions are not included. Scalar/collinear results are spin
+     *  channels; noncollinear results are scalar,z,x,y components. CPU/GPU orbitals
+     *  and FFTs are supported. This does not enable a tau-dependent functional in the SCF loop.
      */
     template <typename T>
     std::vector<Smooth_periodic_function<double>>
     generate_smooth_kinetic_density(K_point_set const& ks__) const;
 
-    /// Thomas-Fermi starting guess from the current physical charge and magnetization fields.
+    /// Thomas-Fermi starting guess, with a spin-covariant von-Weizsaecker term for tau-dependent XC.
     void
     initial_kinetic_density();
 
@@ -472,9 +480,9 @@ class Density : public Field4D
     }
 
     /// Muffin-tin valence tau from the current LAPW density matrix, in real spherical harmonics.
-    /** Returns total tau for a nonmagnetic calculation or separate up/down fields.
+    /** Returns total tau, separate up/down fields, or scalar/z/x/y components.
      *  Core states are excluded. The density matrix must already be accumulated
-     *  over bands and k-points. Noncollinear spinors are not yet supported.
+     *  over bands and k-points.
      */
     std::vector<Flm>
     generate_mt_valence_kinetic_density(int ia__) const;
@@ -482,6 +490,7 @@ class Density : public Field4D
     /// Replicated, unsymmetrized MT {rho, tau} variations per atom and spin.
     /** Holds PW/LO coefficients and occupations fixed. Includes AW matching, radial functions
      *  and the variational spin-unpolarized core response.
+     *  Noncollinear results use scalar/z/x/y components, with core fields only in the scalar component.
      *  The interstitial response is zero. Geometry, radial grids and the free-atom reference stay fixed.
      *  This is the basis contribution to a density response, not the self-consistent orbital response.
      */
@@ -490,10 +499,12 @@ class Density : public Field4D
 
     /// Unsymmetrized physical rho/tau response from matched LAPW orbital directions.
     /** Directions use the ground-state PW/AW/LO layout, in local k-point order.
+     *  At a fixed radial basis the orbital contraction supports scalar-relativistic
+     *  or NR/ZORA spinor states, without differentiating the relativistic mass.
      *  Geometry stays fixed. Optional radial responses add the
      *  basis/matching and core contributions at fixed independent PW/LO coefficients.
      *  Orbital directions must already use the unperturbed AW matching transformation.
-     *  Optional occupation directions have shape {num_bands, num_spins}, in local
+     *  Optional occupation directions have shape {num_bands, num_spinors}, in local
      *  k-point order, and include responses of currently unoccupied bands.
      *  The returned signed fields are linear-response data, not an SCF density;
      *  neither the input wave functions nor the ground-state fields are changed.
@@ -505,11 +516,15 @@ class Density : public Field4D
 
     /// Unsymmetrized valence rho/tau from signed coefficient density matrices.
     /** Matrices use the complete independent PW/LO ket/bra order, have shape
-     *  {gklo_basis_size, gklo_basis_size, num_spins}, and are replicated within
+     *  {gklo_basis_size, gklo_basis_size, num_spins} for scalar/collinear states
+     *  or four Hermitian total/z/x/y blocks for noncollinear states, where
+     *  P_y = i(P_up,down - P_down,up). Matrices are replicated within
      *  each k-point communicator in local k-point order. K-point weights are
      *  applied here. The geometry, radial functions and AW matching remain fixed;
      *  core fields and radial/matching responses must be supplied separately.
      *  The ground-state fields and orbitals are not changed.
+     *  Dirac matrices have one intrinsic block in two-positive-PW/full-j-LO order;
+     *  all four physical spinor components enter rho/tau and beta-Sigma magnetization.
      */
     std::unique_ptr<Density>
     lapw_density_matrix_fields(K_point_set& ks__,
@@ -527,7 +542,7 @@ class Density : public Field4D
 
     /// Geometry contribution at fixed independent PW/LO density matrices and radial functions.
     /** Returns only the field-map derivative. Includes cell normalization, the
-     *  reciprocal kinetic metric and AW matching. FFT fields use fixed fractional
+     *  reciprocal kinetic metric, AW matching and native Dirac PW spinors. FFT fields use fixed fractional
      *  coordinates; MT fields use fixed atom-local Cartesian coordinates and radii.
      *  Moving sampling points, the interstitial mask and radial/core relaxation are
      *  separate contributions. Directions are replicated over the context communicator
@@ -549,7 +564,7 @@ class Density : public Field4D
     generate_paw_valence_kinetic_density(int ia__) const;
 
     /// Local {rho, tau} PAW corrections for a joint reconstructed XC evaluation.
-    /** Each entry has one total or two collinear spin fields. Charge includes
+    /** Each entry has one total, two collinear spin fields, or scalar/z/x/y components. Charge includes
      *  AE-minus-PS and the explicit AE core; tau includes AE-minus-PS
      *  and explicit positive core tau. Combine with smooth pseudo-orbital
      *  charge and tau, WITHOUT Q augmentation or pseudo-core density. These are
@@ -992,7 +1007,7 @@ get_rho_up_dn(Density const& density__, double add_delta_rho_xc__ = 0.0, double 
 
     /* compute "up" and "dn" components and also check for negative values of density */
     double rhomin{0};
-    #pragma omp parallel for reduction(min:rhomin)
+    #pragma omp parallel for reduction(min : rhomin)
     for (int ir = 0; ir < num_points; ir++) {
         r3::vector<double> m;
         for (int j = 0; j < ctx.num_mag_dims(); j++) {

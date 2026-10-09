@@ -160,6 +160,24 @@ class bspline_basis
         return v;
     }
 
+    double
+    deriv2(int i__, int k__, double x__) const
+    {
+        if (k__ <= 2) {
+            return 0.0;
+        }
+        double v{0};
+        double d0 = knots_[i__ + k__ - 1] - knots_[i__];
+        if (d0 > 0) {
+            v += double(k__ - 1) / d0 * deriv(i__, k__ - 1, x__);
+        }
+        double d1 = knots_[i__ + k__] - knots_[i__ + 1];
+        if (d1 > 0) {
+            v -= double(k__ - 1) / d1 * deriv(i__ + 1, k__ - 1, x__);
+        }
+        return v;
+    }
+
   public:
     /// Constructor.
     bspline_basis()
@@ -172,8 +190,8 @@ class bspline_basis
     {
     }
 
-    /// Construct on a prescribed nondecreasing knot sequence, including repeated end knots.
-    bspline_basis(std::vector<double> knots__, int nq__, bool include_boundary__ = false)
+    /// Construct an evaluation-only basis on a prescribed knot sequence.
+    explicit bspline_basis(std::vector<double> knots__)
         : knots_(std::move(knots__))
     {
         if (knots_.size() < 2 * order ||
@@ -181,49 +199,62 @@ class bspline_basis
             !std::is_sorted(knots_.begin(), knots_.end()) || knots_.front() == knots_.back()) {
             RTE_THROW("bspline_basis: invalid knot sequence");
         }
+    }
+
+    /// Construct on a prescribed nondecreasing knot sequence, including repeated end knots.
+    bspline_basis(std::vector<double> knots__, int nq__, bool include_boundary__ = false, double origin_power__ = 1)
+        : bspline_basis(std::move(knots__))
+    {
+        if (!std::isfinite(origin_power__) || origin_power__ < 1) {
+            RTE_THROW("bspline_basis: invalid origin power");
+        }
         std::vector<double> xg;
         std::vector<double> wg;
         gauss_legendre_rule(nq__, xg, wg);
 
         int n = this->size() - (include_boundary__ ? 0 : 1);
-
+        struct interval_t
+        {
+            int first{0};
+            std::vector<double> r, w;
+            std::vector<std::vector<double>> values, derivatives;
+        };
+        std::vector<interval_t> intervals(knots_.size() - 1);
+        // Each nonzero overlap of two knot intervals is the same global interval.
+        for (int q = 0; q < static_cast<int>(intervals.size()); q++) {
+            double a = knot(q), b = knot(q + 1);
+            if (b <= a) {
+                continue;
+            }
+            auto& interval = intervals[q];
+            interval.first = std::max(0, q - order + 1);
+            int count      = std::max(0, std::min(n, q + 1) - interval.first);
+            interval.values.resize(count);
+            interval.derivatives.resize(count);
+            for (int iq = 0; iq < nq__; iq++) {
+                double r = 0.5 * ((b - a) * xg[iq] + (b + a));
+                double w = 0.5 * (b - a) * wg[iq];
+                if (a == 0 && origin_power__ != 1) {
+                    // r=b*t^p resolves integrable fractional powers at the nucleus.
+                    double t = 0.5 * (xg[iq] + 1);
+                    r        = b * std::pow(t, origin_power__);
+                    w        = 0.5 * b * origin_power__ * std::pow(t, origin_power__ - 1) * wg[iq];
+                }
+                interval.r.push_back(r);
+                interval.w.push_back(w);
+                for (int j = 0; j < count; j++) {
+                    interval.values[j].push_back((*this)(interval.first + j, r));
+                    interval.derivatives[j].push_back(deriv(interval.first + j, r));
+                }
+            }
+        }
         for (int i = 0; i < n; i++) {
             for (int ik = 0; ik < order; ik++) {
-                double ai = this->knot(i + ik);
-                double bi = this->knot(i + ik + 1);
-                if (bi <= ai) {
-                    continue;
-                }
-
-                for (int j = std::max(0, i - order + 1); j < std::min(n, i + order); j++) {
-                    for (int jk = 0; jk < order; jk++) {
-                        double a = std::max(ai, this->knot(j + jk));
-                        double b = std::min(bi, this->knot(j + jk + 1));
-                        if (b <= a) {
-                            continue;
-                        }
-
-                        bspline_basis_pair p;
-                        p.i = i;
-                        p.j = j;
-                        for (int iq = 0; iq < nq__; iq++) {
-                            double r = 0.5 * ((b - a) * xg[iq] + (b + a));
-                            double w = 0.5 * (b - a) * wg[iq];
-
-                            double Bi  = this->operator()(i, r);
-                            double dBi = this->deriv(i, r);
-                            double Bj  = this->operator()(j, r);
-                            double dBj = this->deriv(j, r);
-
-                            p.r.push_back(r);
-                            p.w.push_back(w);
-                            p.Bi.push_back(Bi);
-                            p.dBi.push_back(dBi);
-                            p.Bj.push_back(Bj);
-                            p.dBj.push_back(dBj);
-                        }
-                        basis_pairs_.push_back(p);
-                    }
+                auto const& interval = intervals[i + ik];
+                for (int j = 0; j < static_cast<int>(interval.values.size()); j++) {
+                    int offset = i - interval.first;
+                    basis_pairs_.push_back({i, interval.first + j, interval.w, interval.r, interval.values[offset],
+                                            interval.derivatives[offset], interval.values[j], interval.derivatives[j]});
                 }
             }
         }
@@ -269,6 +300,16 @@ class bspline_basis
             x__ = std::nextafter(x__, knots_.front());
         }
         return deriv(i__, order, x__);
+    }
+
+    /// Evaluate the second derivative, using the left-sided limit at the right boundary.
+    double
+    deriv2(int i__, double x__) const
+    {
+        if (x__ == knots_.back()) {
+            x__ = std::nextafter(x__, knots_.front());
+        }
+        return deriv2(i__, order, x__);
     }
 
     /// Number of knots.

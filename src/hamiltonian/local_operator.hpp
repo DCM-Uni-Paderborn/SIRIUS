@@ -231,7 +231,8 @@ class Local_operator
      */
     std::array<std::unique_ptr<Smooth_periodic_function<T>>, 6> veff_vec_;
 
-    std::array<std::unique_ptr<Smooth_periodic_function<T>>, 2> vtau_vec_;
+    // Spin channels for collinear PW, scalar/z/x/y components for spinors.
+    std::array<std::unique_ptr<Smooth_periodic_function<T>>, 4> vtau_vec_;
     std::array<T, 2> vtau0_{};
 
     /// Temporary array to store [V*phi](G)
@@ -303,7 +304,8 @@ class Local_operator
     void
     apply_fplapw(fft::spfft_transform_type<T>& spfftik__, std::shared_ptr<fft::Gvec_fft> gkvec_fft__,
                  wf::band_range b__, wf::Wave_functions<T>& phi__, wf::Wave_functions<T>* hphi__,
-                 wf::Wave_functions<T>* ophi__, wf::Wave_functions<T>* bzphi__, wf::Wave_functions<T>* bxyphi__);
+                 wf::Wave_functions<T>* ophi__, wf::Wave_functions<T>* bzphi__, wf::Wave_functions<T>* bxyphi__,
+                 bool conjugate_bxy__ = false);
 
     /// Apply magnetic field to the full-potential wave-functions.
     /** In case of collinear magnetism only Bz is applied to <tt>phi</tt> and stored in the first component of

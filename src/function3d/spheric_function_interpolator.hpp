@@ -8,6 +8,8 @@
 #define __SPHERIC_FUNCTION_INTERPOLATOR_HPP__
 
 #include "function3d/spheric_function.hpp"
+#include "radial/bspline.hpp"
+#include <optional>
 
 namespace sirius {
 
@@ -18,10 +20,16 @@ enum class spheric_inner_extension_t
     kinetic
 };
 
+enum class spheric_interpolation_t
+{
+    spline,
+    positive_spline
+};
+
 /// Sample an atom-local real-harmonic field and return derivatives to its radial samples.
 /** Coordinates are Cartesian displacements from the source atom, in bohr. The
  *  caller supplies the displacements for every contributing periodic image.
- *  Values and gradients use the same not-a-knot spline, without independent
+ *  By default, values and gradients use the same not-a-knot spline, without independent
  *  interpolation of precomputed gradients. An optional inner continuation uses
  *  r^p times a quadratic, matching value and the first two radial derivatives
  *  at the first sample. Charge multipoles use p=l. Positive kinetic density can
@@ -29,6 +37,12 @@ enum class spheric_inner_extension_t
  *  nonvanishing s/p dipole), so it uses p=max(l-1,0). This is a specified finite-
  *  grid continuation, not a substitute for setup/radial convergence. Exact
  *  nuclei remain excluded because cusp gradients need not have a unique limit.
+ *  Optional radial powers factor Coulomb singularities out of each multipole
+ *  before interpolation. Ordinary splines use a quadratic regular inner continuation.
+ *  Sampling, its transpose and geometry derivatives retain the same factors.
+ *  Positive B-spline sampling uses convex nodal weights and a C2 join to a
+ *  constant regular inner continuation. With a common Coulomb power it
+ *  preserves positivity at each angle without clipping.
  *  Outside-support truncation belongs to the reconstruction.
  */
 class Spheric_function_interpolator
@@ -38,7 +52,16 @@ class Spheric_function_interpolator
     int lmax_;
     std::vector<Spline<double>> radial_;
     spheric_inner_extension_t inner_;
+    spheric_interpolation_t interpolation_;
     std::vector<int> inner_power_;
+    std::vector<double> radial_power_;
+    std::optional<bspline_basis<4>> positive_basis_;
+    struct control_t
+    {
+        int left;
+        double fraction;
+    };
+    std::vector<control_t> positive_controls_;
 
     struct gradient_coupling_t
     {
@@ -107,15 +130,19 @@ class Spheric_function_interpolator
     };
 
     point_t
-    point(r3::vector<double> position__) const
+    point(r3::vector<double> position__, bool gradient__ = true) const
     {
         for (int x = 0; x < 3; x++) {
             if (!std::isfinite(position__[x])) {
                 RTE_THROW("spherical interpolation: nonfinite coordinate");
             }
         }
-        auto spherical = r3::spherical_coordinates(position__);
-        double r       = spherical[0];
+        auto spherical   = r3::spherical_coordinates(position__);
+        double r         = spherical[0];
+        double tolerance = 32 * std::numeric_limits<double>::epsilon() * std::max(1.0, grid_.last());
+        if (r > grid_.last() && r - grid_.last() <= tolerance) {
+            r = grid_.last();
+        }
         if ((r < grid_.first() && inner_ == spheric_inner_extension_t::none) || r > grid_.last() || r < 1e-12) {
             RTE_THROW("spherical interpolation: point outside radial support or at the nucleus");
         }
@@ -129,16 +156,31 @@ class Spheric_function_interpolator
                   r,
                   (1.0 / r) * position__,
                   std::vector<double>(n),
-                  mdarray<double, 2>({n, 3})};
+                  mdarray<double, 2>({gradient__ ? n : 0, 3})};
         sf::spherical_harmonics(lmax_, position__, p.harmonics.data());
-        sf::dRlm_dr(lmax_, position__, p.gradient);
+        if (gradient__) {
+            sf::dRlm_dr(lmax_, position__, p.gradient);
+        }
         return p;
     }
 
     // Weights on spline coefficients, shared by value/gradient evaluation and its exact transpose.
     std::array<std::array<double, 4>, 3>
-    radial_weights(point_t const& p__, int lm__) const
+    regular_radial_weights(point_t const& p__, int lm__) const
     {
+        if (interpolation_ == spheric_interpolation_t::positive_spline) {
+            if (p__.radius < grid_.first()) {
+                return {{{1, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}};
+            }
+            std::array<std::array<double, 4>, 3> weights{};
+            for (int j = 0; j < 4; j++) {
+                int i         = p__.segment + j;
+                weights[0][j] = (*positive_basis_)(i, p__.radius);
+                weights[1][j] = positive_basis_->deriv(i, p__.radius);
+                weights[2][j] = positive_basis_->deriv2(i, p__.radius);
+            }
+            return weights;
+        }
         double d = p__.dr;
         if (p__.radius >= grid_.first()) {
             return {{{1, d, d * d, d * d * d}, {0, 1, 2 * d, 3 * d * d}, {0, 0, 2, 6 * d}}};
@@ -160,39 +202,144 @@ class Spheric_function_interpolator
         return result;
     }
 
+    std::array<std::array<double, 4>, 3>
+    radial_weights(point_t const& p__, int lm__) const
+    {
+        auto weights = regular_radial_weights(p__, lm__);
+        double power = radial_power_[lm__];
+        if (power == 0) {
+            return weights;
+        }
+        double factor     = std::pow(p__.radius, power);
+        double derivative = power * factor / p__.radius;
+        double second     = power * (power - 1) * factor / (p__.radius * p__.radius);
+        for (int j = 0; j < 4; j++) {
+            double value = weights[0][j], first = weights[1][j];
+            weights[0][j] = factor * value;
+            weights[1][j] = factor * first + derivative * value;
+            weights[2][j] = factor * weights[2][j] + 2 * derivative * first + second * value;
+        }
+        return weights;
+    }
+
     Flm
     transpose_coefficients(mdarray<double, 3>& coeffs__) const
     {
         int n = static_cast<int>(radial_.size()), nr = grid_.num_points();
         Flm result(n, grid_);
+        result.zero();
         for (int lm = 0; lm < n; lm++) {
-            mdarray<double, 2> component({nr, 4}, &coeffs__(0, 0, lm));
-            auto values = radial_[lm].interpolation_adjoint(component);
+            std::vector<double> values(nr, 0);
+            if (interpolation_ == spheric_interpolation_t::positive_spline) {
+                for (int ir = 0; ir < nr - 1; ir++) {
+                    for (int j = 0; j < 4; j++) {
+                        auto const& c = positive_controls_[ir + j];
+                        values[c.left] += (1 - c.fraction) * coeffs__(ir, j, lm);
+                        values[c.left + 1] += c.fraction * coeffs__(ir, j, lm);
+                    }
+                }
+            } else {
+                mdarray<double, 2> component({nr, 4}, &coeffs__(0, 0, lm));
+                values = radial_[lm].interpolation_adjoint(component);
+            }
             for (int ir = 0; ir < nr; ir++) {
-                result(lm, ir) = values[ir];
+                result(lm, ir) = values[ir] * std::pow(grid_[ir], -radial_power_[lm]);
             }
         }
         return result;
     }
 
+    double
+    coefficient(point_t const& p__, int lm__, int j__) const
+    {
+        if (interpolation_ == spheric_interpolation_t::positive_spline) {
+            auto const& c = positive_controls_[p__.segment + j__];
+            return (1 - c.fraction) * radial_[lm__](c.left) + c.fraction * radial_[lm__](c.left + 1);
+        }
+        return radial_[lm__].coeffs()(p__.segment, j__);
+    }
+
   public:
     explicit Spheric_function_interpolator(Flm const& field__,
-                                           spheric_inner_extension_t inner__ = spheric_inner_extension_t::none)
+                                           spheric_inner_extension_t inner__       = spheric_inner_extension_t::none,
+                                           std::vector<double> radial_power__      = {},
+                                           spheric_interpolation_t interpolation__ = spheric_interpolation_t::spline)
         : grid_(field__.radial_grid())
         , lmax_(sf::lmax(field__.angular_domain_size()))
         , inner_(inner__)
+        , interpolation_(interpolation__)
         , inner_power_(sf::l_by_lm(lmax_))
+        , radial_power_(std::move(radial_power__))
     {
         if (grid_.num_points() < 4 || grid_.first() < 0 || sf::lmmax(lmax_) != field__.angular_domain_size()) {
             RTE_THROW("spherical interpolation: invalid grid or harmonic extent");
         }
+        bool factored = !radial_power_.empty();
+        if (factored &&
+            (radial_power_.size() != static_cast<size_t>(field__.angular_domain_size()) || grid_.first() <= 0 ||
+             !std::all_of(radial_power_.begin(), radial_power_.end(),
+                          [](double power) { return std::isfinite(power); }))) {
+            RTE_THROW("spherical interpolation: invalid radial powers");
+        }
+        radial_power_.resize(field__.angular_domain_size(), 0);
+        if (interpolation_ == spheric_interpolation_t::positive_spline) {
+            std::vector<double> knots(3, grid_.first());
+            for (int ir = 0; ir < grid_.num_points(); ir++) {
+                knots.push_back(grid_[ir]);
+            }
+            knots.insert(knots.end(), 3, grid_.last());
+            positive_basis_.emplace(std::move(knots));
+            for (int i = 0; i < positive_basis_->size(); i++) {
+                // Equal first controls give a C2 constant inner join, without extrapolating samples.
+                if (i < 3) {
+                    positive_controls_.push_back({0, 0});
+                    continue;
+                }
+                if (i == positive_basis_->size() - 1) {
+                    positive_controls_.push_back({grid_.num_points() - 2, 1});
+                    continue;
+                }
+                // Greville controls interpolate the regular nodal samples with convex weights.
+                double r =
+                        (positive_basis_->knot(i + 1) + positive_basis_->knot(i + 2) + positive_basis_->knot(i + 3)) /
+                        3;
+                int left        = r >= grid_.last() ? grid_.num_points() - 2 : grid_.index_of(r);
+                double fraction = (r - grid_[left]) / (grid_[left + 1] - grid_[left]);
+                positive_controls_.push_back({left, fraction});
+            }
+        }
         for (int lm = 0; lm < field__.angular_domain_size(); lm++) {
             radial_.push_back(field__.component(lm));
-            if (inner_ == spheric_inner_extension_t::kinetic) {
+            if (factored) {
+                inner_power_[lm] = 0;
+                for (int ir = 0; ir < grid_.num_points(); ir++) {
+                    radial_.back()(ir) *= std::pow(grid_[ir], -radial_power_[lm]);
+                }
+                if (interpolation_ == spheric_interpolation_t::spline) {
+                    radial_.back().interpolate();
+                }
+            } else if (inner_ == spheric_inner_extension_t::kinetic) {
                 inner_power_[lm] = std::max(0, inner_power_[lm] - 1);
             }
         }
         build_gradient_couplings();
+    }
+
+    /// Sample the field without computing unused spatial derivatives.
+    double
+    value(r3::vector<double> const& position__) const
+    {
+        auto p = point(position__, false);
+        double result{0};
+        for (int lm = 0; lm < static_cast<int>(radial_.size()); lm++) {
+            auto weights = radial_weights(p, lm);
+            double f{0};
+            for (int j = 0; j < 4; j++) {
+                f += weights[0][j] * coefficient(p, lm, j);
+            }
+            result += f * p.harmonics[lm];
+        }
+        return result;
     }
 
     /// Return {field, d(field)/dx, d(field)/dy, d(field)/dz}.
@@ -205,8 +352,8 @@ class Spheric_function_interpolator
             auto weights = radial_weights(p, lm);
             double f{0}, df{0};
             for (int j = 0; j < 4; j++) {
-                f += weights[0][j] * radial_[lm].coeffs()(p.segment, j);
-                df += weights[1][j] * radial_[lm].coeffs()(p.segment, j);
+                f += weights[0][j] * coefficient(p, lm, j);
+                df += weights[1][j] * coefficient(p, lm, j);
             }
             result[0] += f * p.harmonics[lm];
             for (int x = 0; x < 3; x++) {
@@ -259,7 +406,7 @@ class Spheric_function_interpolator
             auto weights = radial_weights(p, lm);
             for (int a = 0; a < 3; a++) {
                 for (int j = 0; j < 4; j++) {
-                    radial[lm][a] += weights[a][j] * radial_[lm].coeffs()(p.segment, j);
+                    radial[lm][a] += weights[a][j] * coefficient(p, lm, j);
                 }
             }
         }

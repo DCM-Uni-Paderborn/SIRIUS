@@ -20,7 +20,7 @@ test_paw_xc_correction(int ns__, bool compact__)
         "use_symmetry": false, "pw_cutoff": 6.0, "gk_cutoff": 1.0,
         "num_bands": 4, "xc_functionals": ["XC_LDA_X"]},
         "control": {"mpi_grid_dims": [1, 1], "processing_unit": "CPU", "verbosity": 0}})"_json;
-    conf["parameters"]["num_mag_dims"] = ns__ == 1 ? 0 : 1;
+    conf["parameters"]["num_mag_dims"] = ns__ - 1;
     Simulation_context ctx(conf);
     ctx.unit_cell().set_lattice_vectors({{1.7, 0, 0}, {0.3, 2, 0}, {0.2, -0.4, 2.2}});
     auto& type = ctx.unit_cell().add_atom_type("H");
@@ -85,23 +85,60 @@ test_paw_xc_correction(int ns__, bool compact__)
     PAW_xc_correction op(type);
     int n    = type.indexb().size();
     auto& dm = density.density_matrix(0);
-    std::vector<std::complex<double>> c(n), dc(n);
+    std::vector<std::complex<double>> c(n), dc(n), down(n), ddown(n);
     for (int i = 0; i < n; i++) {
-        c[i]  = {0.2 * std::cos(0.3 + i), 0.15 * std::sin(0.4 + 2 * i)};
-        dc[i] = {0.1 * std::sin(0.2 + i), -0.13 * std::cos(0.6 + 3 * i)};
+        c[i]     = {0.2 * std::cos(0.3 + i), 0.15 * std::sin(0.4 + 2 * i)};
+        dc[i]    = {0.1 * std::sin(0.2 + i), -0.13 * std::cos(0.6 + 3 * i)};
+        down[i]  = {0.13 * std::sin(0.7 + 2 * i), 0.11 * std::cos(0.2 + i)};
+        ddown[i] = {-0.09 * std::cos(0.3 + i), 0.07 * std::sin(0.9 + 3 * i)};
     }
     auto set_dm = [&](double step) {
         for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
             auto& atom_dm = density.density_matrix(ia);
-            for (int s = 0; s < ns__; s++) {
+            for (int s = 0; s < static_cast<int>(atom_dm.size(2)); s++) {
                 for (int j = 0; j < n; j++) {
                     for (int i = 0; i < n; i++) {
-                        atom_dm(i, j, s) = 0.8 / (s + 1) * (c[i] + step * (ia + 1) * dc[i]) *
-                                           std::conj(c[j] + step * (ia + 1) * dc[j]);
+                        auto const& left  = ns__ == 4 && s == 1 ? down : c;
+                        auto const& right = ns__ == 4 && s > 0 ? down : c;
+                        auto const& dl    = ns__ == 4 && s == 1 ? ddown : dc;
+                        auto const& dr    = ns__ == 4 && s > 0 ? ddown : dc;
+                        atom_dm(i, j, s)  = (ns__ == 4 ? 0.8 : 0.8 / (s + 1)) * (left[i] + step * (ia + 1) * dl[i]) *
+                                           std::conj(right[j] + step * (ia + 1) * dr[j]);
                     }
                 }
             }
         }
+    };
+    auto component_dm = [&](int ia, int i, int j, int s) {
+        auto const& d = density.density_matrix(ia);
+        if (ns__ != 4) {
+            return std::real(d(i, j, s));
+        }
+        if (s < 2) {
+            return std::real(d(i, j, 0) + (1.0 - 2 * s) * d(i, j, 1));
+        }
+        auto ud = d(i, j, 2), du = std::conj(d(j, i, 2));
+        return s == 2 ? std::real(ud + du) : -std::imag(ud - du);
+    };
+    auto projector_derivative = [&](mdarray<double, 3> const& matrix, int ia) {
+        double value{0};
+        for (int j = 0; j < n; j++) {
+            for (int i = 0; i < n; i++) {
+                if (ns__ == 4) {
+                    auto flip = std::complex<double>(matrix(i, j, 2), -matrix(i, j, 3));
+                    value +=
+                            1.6 * (ia + 1) *
+                            std::real(std::conj(dc[i]) * ((matrix(i, j, 0) + matrix(i, j, 1)) * c[j] + flip * down[j]) +
+                                      std::conj(ddown[i]) *
+                                              (std::conj(flip) * c[j] + (matrix(i, j, 0) - matrix(i, j, 1)) * down[j]));
+                } else {
+                    for (int s = 0; s < ns__; s++) {
+                        value += 1.6 / (s + 1) * (ia + 1) * std::real(std::conj(dc[i]) * matrix(i, j, s) * c[j]);
+                    }
+                }
+            }
+        }
+        return value;
     };
     int failures{0};
     Test_check check(failures, ctx.comm(),
@@ -130,8 +167,9 @@ test_paw_xc_correction(int ns__, bool compact__)
         for (int s = 0; s < ns__; s++) {
             for (int ir = 0; ir < nr; ir++) {
                 for (int lm = 0; lm < fields[0][s].angular_domain_size(); lm++) {
-                    double ref = density.paw_density().ae_density(0, ia)(lm, ir) -
-                                 density.paw_density().ps_density(0, ia)(lm, ir);
+                    int component = ns__ == 4 ? s : 0;
+                    double ref    = density.paw_density().ae_density(component, ia)(lm, ir) -
+                                 density.paw_density().ps_density(component, ia)(lm, ir);
                     if (ns__ == 2) {
                         ref = 0.5 * (ref + (1 - 2 * s) * (density.paw_density().ae_density(1, ia)(lm, ir) -
                                                           density.paw_density().ps_density(1, ia)(lm, ir)));
@@ -141,7 +179,7 @@ test_paw_xc_correction(int ns__, bool compact__)
                         for (int i = 0; i < n; i++) {
                             for (auto const& g : gaunt.gaunt_vector(type.indexb(i).lm, type.indexb(j).lm)) {
                                 if (g.lm3 == lm) {
-                                    ref += std::real(density.density_matrix(ia)(i, j, s)) * g.coef *
+                                    ref += component_dm(ia, i, j, s) * g.coef *
                                            type.q_radial_function(type.indexb(i).idxrf, type.indexb(j).idxrf,
                                                                   g.l3)(ir) /
                                            std::pow(type.radial_grid(ir), 2);
@@ -149,8 +187,8 @@ test_paw_xc_correction(int ns__, bool compact__)
                             }
                         }
                     }
-                    if (lm == 0) {
-                        ref += core_rho[ir] / (ns__ * y00);
+                    if (lm == 0 && (ns__ != 4 || s == 0)) {
+                        ref += core_rho[ir] / ((ns__ == 4 ? 1 : ns__) * y00);
                     }
                     error = std::max(error, std::abs(fields[0][s](lm, ir) - ref));
                 }
@@ -164,14 +202,57 @@ test_paw_xc_correction(int ns__, bool compact__)
         for (int ir = 0; ir < nr; ir++) {
             for (int lm = 0; lm < fields[1][s].angular_domain_size(); lm++) {
                 double ref = valence_tau[0][s](lm, ir) - valence_tau[1][s](lm, ir);
-                if (lm == 0) {
-                    ref += core_tau[ir] / (ns__ * y00);
+                if (lm == 0 && (ns__ != 4 || s == 0)) {
+                    ref += core_tau[ir] / ((ns__ == 4 ? 1 : ns__) * y00);
                 }
                 error = std::max(error, std::abs(fields[1][s](lm, ir) - ref));
             }
         }
     }
     check("positive core tau and no Q in tau", error, 2e-13);
+    if (ns__ == 4) {
+        auto valence = op.fields(dm, false);
+        error        = 0;
+        for (int f = 0; f < 2; f++) {
+            for (int s = 0; s < 4; s++) {
+                for (int ir = 0; ir < nr; ir++) {
+                    for (int lm = 0; lm < fields[f][s].angular_domain_size(); lm++) {
+                        double core = s == 0 && lm == 0 ? (f == 0 ? core_rho[ir] : core_tau[ir]) / y00 : 0;
+                        error       = std::max(error, std::abs(fields[f][s](lm, ir) - valence[f][s](lm, ir) - core));
+                    }
+                }
+            }
+        }
+        check("frozen core has no spin-vector components", error, 2e-13);
+        double angle = 0.71, a = std::cos(angle / 2), b = std::sin(angle / 2);
+        for (int j = 0; j < n; j++) {
+            for (int i = 0; i < n; i++) {
+                auto uu = 0.8 * c[i] * std::conj(c[j]), dd = 0.8 * down[i] * std::conj(down[j]);
+                auto ud = 0.8 * c[i] * std::conj(down[j]), du = 0.8 * down[i] * std::conj(c[j]);
+                dm(i, j, 0) = a * a * uu + b * b * dd - a * b * (ud + du);
+                dm(i, j, 1) = b * b * uu + a * a * dd + a * b * (ud + du);
+                dm(i, j, 2) = a * b * (uu - dd) + a * a * ud - b * b * du;
+            }
+        }
+        auto rotated = op.fields(dm);
+        error        = 0;
+        for (int f = 0; f < 2; f++) {
+            for (int ir = 0; ir < nr; ir++) {
+                for (int lm = 0; lm < fields[f][0].angular_domain_size(); lm++) {
+                    std::array<double, 4> ref{
+                            fields[f][0](lm, ir),
+                            std::cos(angle) * fields[f][1](lm, ir) - std::sin(angle) * fields[f][2](lm, ir),
+                            std::sin(angle) * fields[f][1](lm, ir) + std::cos(angle) * fields[f][2](lm, ir),
+                            fields[f][3](lm, ir)};
+                    for (int s = 0; s < 4; s++) {
+                        error = std::max(error, std::abs(rotated[f][s](lm, ir) - ref[s]));
+                    }
+                }
+            }
+        }
+        check("local rho and tau spin-rotation covariance", error, 2e-13);
+        set_dm(0);
+    }
     if (ns__ == 2) {
         mdarray<std::complex<double>, 3> total_dm({n, n, 1});
         for (int j = 0; j < n; j++) {
@@ -244,17 +325,18 @@ test_paw_xc_correction(int ns__, bool compact__)
     };
     derivatives_t derivatives;
     energy(0, &derivatives);
-    double analytic{0};
+    mdarray<double, 3> local_matrix({n, n, ns__});
     for (int s = 0; s < ns__; s++) {
         auto drho   = Spheric_function_interpolator(fields[0][s]).adjoint(displacements, derivatives[0][s]);
         auto dtau   = Spheric_function_interpolator(fields[1][s]).adjoint(displacements, derivatives[1][s]);
         auto matrix = op.matrix_elements(drho, dtau);
         for (int j = 0; j < n; j++) {
             for (int i = 0; i < n; i++) {
-                analytic += 2 * 0.8 / (s + 1) * std::real(std::conj(dc[i]) * matrix(i, j) * c[j]);
+                local_matrix(i, j, s) = matrix(i, j);
             }
         }
     }
+    double analytic = projector_derivative(local_matrix, 0);
     for (double step : {1e-4, 5e-5}) {
         double fd = (energy(step, nullptr) - energy(-step, nullptr)) / (2 * step);
         check("joint reconstructed energy/projector derivative", std::abs(analytic - fd), 2e-8);
@@ -375,13 +457,7 @@ test_paw_xc_correction(int ns__, bool compact__)
         periodic_energy(0, &matrices);
         double ad{0};
         for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
-            for (int s = 0; s < ns__; s++) {
-                for (int j = 0; j < n; j++) {
-                    for (int i = 0; i < n; i++) {
-                        ad += 2 * 0.8 / (s + 1) * (ia + 1) * std::real(std::conj(dc[i]) * matrices[ia](i, j, s) * c[j]);
-                    }
-                }
-            }
+            ad += projector_derivative(matrices[ia], ia);
         }
         for (double step : {1e-4, 5e-5}) {
             double fd = (periodic_energy(step, nullptr) - periodic_energy(-step, nullptr)) / (2 * step);
@@ -571,10 +647,14 @@ test_paw_xc_correction(int ns__, bool compact__)
                     }
                     for (int s = 0; s < ns__; s++) {
                         for (int ig = 0; ig < ctx.gvec().count(); ig++) {
-                            auto v = adjoint.rho[s].f_pw_local(ig) / double(ns__);
-                            host_potential.component(0).rg().f_pw_local(ig) += v;
-                            if (ns__ == 2) {
-                                host_potential.component(1).rg().f_pw_local(ig) += (1.0 - 2 * s) * v;
+                            if (ns__ == 4) {
+                                host_potential.component(s).rg().f_pw_local(ig) = adjoint.rho[s].f_pw_local(ig);
+                            } else {
+                                auto v = adjoint.rho[s].f_pw_local(ig) / double(ns__);
+                                host_potential.component(0).rg().f_pw_local(ig) += v;
+                                if (ns__ == 2) {
+                                    host_potential.component(1).rg().f_pw_local(ig) += (1.0 - 2 * s) * v;
+                                }
                             }
                         }
                     }
@@ -584,7 +664,7 @@ test_paw_xc_correction(int ns__, bool compact__)
                         for (int s = 0; s < ns__; s++) {
                             for (int j = 0; j < n; j++) {
                                 for (int i = 0; i < n; i++) {
-                                    double q = qmatrix(i, j, 0);
+                                    double q = qmatrix(i, j, ns__ == 4 ? s : 0);
                                     if (ns__ == 2) {
                                         q += (1 - 2 * s) * qmatrix(i, j, 1);
                                     }
@@ -602,14 +682,7 @@ test_paw_xc_correction(int ns__, bool compact__)
             joint_energy(0, &matrices, spurious_smooth_q);
             double value{0};
             for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
-                for (int s = 0; s < ns__; s++) {
-                    for (int j = 0; j < n; j++) {
-                        for (int i = 0; i < n; i++) {
-                            value += 2 * 0.8 / (s + 1) * (ia + 1) *
-                                     std::real(std::conj(dc[i]) * matrices[ia](i, j, s) * c[j]);
-                        }
-                    }
-                }
+                value += projector_derivative(matrices[ia], ia);
             }
             return value + (include_smooth_tau ? smooth_tau_derivative : 0);
         };
@@ -794,7 +867,7 @@ main(int argc, char** argv)
     if (argc == 2) {
         result += call_test("H PAW support", test_hydrogen_support, std::string(argv[1]));
     } else {
-        for (int ns : {1, 2}) {
+        for (int ns : {1, 2, 4}) {
             result += call_test("PAW XC correction", test_paw_xc_correction, ns, false);
             result += call_test("compact PAW XC correction", test_paw_xc_correction, ns, true);
         }

@@ -107,6 +107,16 @@ class angular_momentum
     {
         return s_;
     }
+
+    /// Dirac angular channel for j=l+/-1/2.
+    inline int
+    kappa() const
+    {
+        if (s_ == 0) {
+            RTE_THROW("Dirac kappa requires a spin-resolved angular momentum");
+        }
+        return s_ == 1 ? -l_ - 1 : l_;
+    }
 };
 
 inline bool
@@ -233,6 +243,20 @@ class radial_functions_index
         this->add(am__);
         /* set index of the local orbital */
         vrd_.back().idxlo = rf_lo_index(this->size() - offset_lo_ - 1);
+    }
+
+    /// Add both j branches of a local-orbital radial pair.
+    void
+    add_lo(angular_momentum am1__, angular_momentum am2__)
+    {
+        int first = this->size();
+        this->add(am1__, am2__);
+        if (offset_lo_ < 0) {
+            offset_lo_ = first;
+        }
+        for (int i = first; i < this->size(); i++) {
+            vrd_[i].idxlo = rf_lo_index(i - offset_lo_);
+        }
     }
 
     /// Add two component of the spinor radial function.

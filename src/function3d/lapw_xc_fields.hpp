@@ -17,7 +17,7 @@ struct lapw_xc_field_adjoint_t
     /// Already restricted to interstitial targets. Do not apply another sphere mask.
     std::vector<Smooth_periodic_function<double>> rho;
     std::vector<Smooth_periodic_function<double>> tau;
-    /// Raw radial-sample covectors {rho, tau}, in atom order and per spin.
+    /// Raw radial-sample covectors {rho, tau}, in atom order and per input field component.
     std::vector<std::array<std::vector<Flm>, 2>> local;
     /// Raw derivatives with respect to spin-summed core rho/tau radial values.
     std::vector<std::array<std::vector<double>, 2>> core;
@@ -29,6 +29,8 @@ struct lapw_xc_contractions_t
     double rho{0};
     double magnetic{0};
     double tau{0};
+    /// Interstitial part of rho + magnetic + tau, before atom-local contractions.
+    double interstitial{0};
 };
 
 } // namespace sirius

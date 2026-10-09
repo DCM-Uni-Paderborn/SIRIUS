@@ -63,6 +63,20 @@ K_point<T>::initialize()
     /* build a list of basis functions */
     generate_gklo_basis();
 
+    if (ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac) {
+        std::vector<int> num_mt_coeffs(unit_cell_.num_atoms());
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            num_mt_coeffs[ia] = unit_cell_.atom(ia).mt_basis_size();
+        }
+        spinor_wave_functions_ = std::make_unique<wf::Wave_functions<T>>(gkvec_, num_mt_coeffs, wf::num_mag_dims(3),
+                                                                         wf::num_bands(nst), ctx_.host_memory_t());
+        for (int s : {0, 1}) {
+            spinor_wave_functions_->zero(memory_t::host, wf::spin_index(s), wf::band_range(0, nst));
+        }
+        update();
+        return;
+    }
+
     if (ctx_.full_potential()) {
         /* allocate first-variational eigen vectors in slab distribution;
          * in case of full variation, fv_eigen_vectors_slab will be uses as a temporary working space
@@ -354,6 +368,7 @@ K_point<T>::generate_gkvec(double gk_cutoff__)
     splindex_block_cyclic<> spl_ngk_col(num_gkvec(), n_blocks(num_ranks_col_), block_id(rank_col_),
                                         ctx_.cyclic_block_size());
     num_gkvec_col_ = spl_ngk_col.local_size();
+
     mdarray<int, 2> gkvec_col({3, num_gkvec_col_});
 
     for (int rank = 0; rank < comm().size(); rank++) {
@@ -533,6 +548,7 @@ template <typename T>
 void
 K_point<T>::save(std::string const& name__, int id__) const
 {
+    int num_slots = ctx_.valence_relativity() == relativity_t::dirac ? 2 : ctx_.num_spins();
     std::unique_ptr<HDF5_tree> fout;
     /* rank 0 opens a file and writes common data */
     if (comm().rank() == 0) {
@@ -561,7 +577,7 @@ K_point<T>::save(std::string const& name__, int id__) const
         for (int i = 0; i < ctx_.num_bands(); i++) {
             out["K_point_set"][id__]["bands"].create_node(i);
             out["K_point_set"][id__]["bands"][i].create_node("spinor_wave_function");
-            for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+            for (int ispn = 0; ispn < num_slots; ispn++) {
                 out["K_point_set"][id__]["bands"][i]["spinor_wave_function"].create_node(ispn);
                 ///* new format */
                 //fout["K_point_set"][id__]["bands"][i].create_node(ispn);
@@ -571,7 +587,7 @@ K_point<T>::save(std::string const& name__, int id__) const
 
     /* store wave-functions */
     for (int i = 0; i < ctx_.num_bands(); i++) {
-        for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+        for (int ispn = 0; ispn < num_slots; ispn++) {
             /* gather wave-functions */
             auto wf = this->spinor_wave_functions().gather(wf::spin_index(ispn), wf::band_index(i));
             if (comm().rank() == 0) {
@@ -591,6 +607,7 @@ template <typename T>
 void
 K_point<T>::load(HDF5_tree h5in__)
 {
+    int num_slots = ctx_.valence_relativity() == relativity_t::dirac ? 2 : ctx_.num_spins();
     h5in__.read("band_energies", band_energies_);
     h5in__.read("band_occupancies", band_occupancies_);
     int num_gkvec_in;
@@ -610,7 +627,7 @@ K_point<T>::load(HDF5_tree h5in__)
     std::vector<std::complex<T>> tmp(num_gkvec());
 
     for (int i = 0; i < ctx_.num_bands(); i++) {
-        for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+        for (int ispn = 0; ispn < num_slots; ispn++) {
             /* gather wave-functions */
             std::vector<std::complex<T>> wf(num_gkvec() + unit_cell_.mt_aw_basis_size() +
                                             unit_cell_.mt_lo_basis_size());
@@ -732,6 +749,10 @@ K_point<T>::generate_gklo_basis()
                                         ctx_.cyclic_block_size());
     num_gkvec_col_ = spl_ngk_col.local_size();
 
+    if (ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac) {
+        // Full-j LOs belong to the Dirac basis, not to scalar (l,m) FV descriptors.
+        return;
+    }
     if (ctx_.full_potential()) {
         splindex_block_cyclic<> spl_nlo_row(num_gkvec() + unit_cell_.mt_lo_basis_size(), n_blocks(num_ranks_row_),
                                             block_id(rank_row_), ctx_.cyclic_block_size());

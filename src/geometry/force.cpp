@@ -41,108 +41,6 @@ Force::Force(Simulation_context& ctx__, Density& density__, Potential& potential
 {
 }
 
-double
-Force::lapw_radial_basis_derivative(std::vector<std::vector<double>> const& directions__,
-                                    std::vector<std::array<std::vector<double>, 2>> const& xc_directions__,
-                                    bool update_enu__)
-{
-    auto& uc    = ctx_.unit_cell();
-    int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
-                  ctx_.valence_relativity() != relativity_t::none || ctx_.so_correction() || ctx_.num_mag_dims() == 3 ||
-                  ctx_.hubbard_correction() ||
-                  (uc.num_core_electrons() != 0 && ctx_.core_relativity() != relativity_t::none) ||
-                  (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) ||
-                  directions__.size() != uc.num_atom_symmetry_classes() ||
-                  (!xc_directions__.empty() && xc_directions__.size() != directions__.size());
-    if (!invalid) {
-        for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
-            invalid |= directions__[ic].size() != uc.atom_symmetry_class(ic).atom_type().num_mt_points() ||
-                       !std::all_of(directions__[ic].begin(), directions__[ic].end(),
-                                    [](double x) { return std::isfinite(x); });
-            if (!xc_directions__.empty()) {
-                auto const& cls = uc.atom_symmetry_class(ic);
-                for (auto const& field : xc_directions__[ic]) {
-                    invalid |=
-                            !field.empty() &&
-                            (field.size() != directions__[ic].size() ||
-                             !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); }) ||
-                             (cls.atom_type().num_core_electrons() != 0 && cls.spherical_xc_derivatives()[0].empty()));
-                }
-            }
-        }
-    }
-    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
-    if (invalid) {
-        RTE_THROW("LAPW radial basis derivative requires nonrelativistic scalar/collinear valence states and valid "
-                  "directions");
-    }
-
-    // Differentiate the stored basis without updating its potential or energies.
-    Hamiltonian0<double> h0(potential_, false);
-    std::vector<radial_basis_response_t> response;
-    for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
-        response.push_back(uc.atom_symmetry_class(ic).radial_basis_potential_response(
-                directions__[ic], xc_directions__.empty() ? std::array<std::vector<double>, 2>{} : xc_directions__[ic],
-                update_enu__));
-    }
-    auto matrices = h0.lapw_radial_basis_response(response);
-
-    int ns = ctx_.num_spins();
-    double result{0};
-    for (auto it : kset_.spl_num_kpoints()) {
-        auto& kp = *kset_.get<double>(it.i);
-        Matching_coefficients matching(uc, kp.gkvec());
-        std::vector<mdarray<std::complex<double>, 2>> alm, dalm;
-        for (int ia = 0; ia < uc.num_atoms(); ia++) {
-            auto const& atom = uc.atom(ia);
-            std::array<index_range, 2> shape{kp.gkvec().count(), atom.type().mt_aw_basis_size()};
-            alm.emplace_back(shape);
-            dalm.emplace_back(shape);
-            matching.generate<false>(atom, alm.back());
-            matching.generate_potential_response<false>(atom, response[atom.symmetry_class().id()], dalm.back());
-        }
-        for (int s = 0; s < ns; s++) {
-            for (int band = 0; band < ctx_.num_bands(); band++) {
-                double weight = kp.weight() * kp.band_occupancy(band, s) / kp.comm().size();
-                if (weight == 0) {
-                    continue;
-                }
-                auto all   = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(band));
-                int offset = kp.gkvec().num_gvec();
-                for (int ia = 0; ia < uc.num_atoms(); ia++) {
-                    auto const& type = uc.atom(ia).type();
-                    int n = type.mt_basis_size(), naw = type.mt_aw_basis_size();
-                    std::vector<std::complex<double>> c(n), dc(n);
-                    for (int i = 0; i < naw; i++) {
-                        for (int ig = 0; ig < kp.gkvec().count(); ig++) {
-                            c[i] += alm[ia](ig, i) * all[kp.gkvec().offset() + ig];
-                            dc[i] += dalm[ia](ig, i) * all[kp.gkvec().offset() + ig];
-                        }
-                    }
-                    kp.comm().allreduce(c.data(), naw);
-                    kp.comm().allreduce(dc.data(), naw);
-                    for (int i = naw; i < n; i++) {
-                        c[i] = all[offset + i];
-                    }
-                    auto const& d = matrices[ia];
-                    double energy = kp.band_energy(band, s);
-                    for (int j = 0; j < n; j++) {
-                        for (int i = 0; i < n; i++) {
-                            result +=
-                                    weight * std::real(2.0 * std::conj(dc[i]) *
-                                                               (h0.hmt(ia)(i, j, s) - energy * d.overlap(i, j)) * c[j] +
-                                                       std::conj(c[i]) * (d.h(i, j, s) - energy * d.o(i, j)) * c[j]);
-                        }
-                    }
-                    offset += n;
-                }
-            }
-        }
-    }
-    ctx_.comm().allreduce(&result, 1);
-    return result;
-}
-
 void
 Force::calc_forces_dftd3()
 {
@@ -318,24 +216,27 @@ Force::calc_forces_total(bool add_scf_corr)
     calc_forces_dftd4();
 
     if (ctx_.full_potential()) {
-        calc_forces_rho();
-        calc_forces_hf();
-        calc_forces_ibs();
         std::unique_ptr<LAPW_response> response;
         if (ctx_.cb().external_xc_) {
             response = std::make_unique<LAPW_response>(kset_, density_, potential_);
+        } else {
+            calc_forces_rho();
+            calc_forces_hf();
+            calc_forces_ibs();
         }
         xc_geometry_direction_t direction(ctx_.unit_cell().num_atoms());
         for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
             for (int x : {0, 1, 2}) {
-                forces_total_(x, ia) = forces_ibs_(x, ia) + forces_hf_(x, ia) + forces_rho_(x, ia) + forces_xc_(x, ia);
                 if (response) {
                     // Differentiate the discrete free energy, including its self-consistent core and valence fields.
                     direction.atoms[ia][x] = 1;
-                    auto radial = response->radial_geometry_response(direction,
-                                                                     ctx_.cb().external_xc_response_tolerance_, 200);
+                    auto radial            = response->radial_geometry_response(direction,
+                                                                                ctx_.cb().external_xc_response_tolerance_, 200);
                     forces_total_(x, ia)   = -response->energy_geometry_derivative(direction, radial, xc_geometry);
                     direction.atoms[ia][x] = 0;
+                } else {
+                    forces_total_(x, ia) =
+                            forces_ibs_(x, ia) + forces_hf_(x, ia) + forces_rho_(x, ia) + forces_xc_(x, ia);
                 }
                 forces_total_(x, ia) += forces_dftd3_(x, ia) + forces_dftd4_(x, ia);
             }
@@ -628,8 +529,8 @@ Force::calc_forces_us()
                             v -= ispin == 0 ? potential_.xc_potential().rg().f_pw_local(igloc)
                                             : potential_.effective_magnetic_field(ispin - 1).rg().f_pw_local(igloc);
                         }
-                        auto z                   = std::complex<double>(0, -gvc[ivec]) *
-                                                   ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) * v;
+                        auto z = std::complex<double>(0, -gvc[ivec]) *
+                                 ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) * v;
                         v_tmp(ia, 2 * igloc)     = z.real();
                         v_tmp(ia, 2 * igloc + 1) = z.imag();
                     }
@@ -722,8 +623,8 @@ Force::calc_forces_core()
 
     forces_core_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
     forces_core_.zero();
-    // External PAW XC includes the AE core in its atom-local geometry derivative,
-    // not a pseudo-core density in the smooth XC field. NC NLCC is rejected.
+    // External XC differentiates the PAW AE core and NC pseudo core in its
+    // atom-local point reconstruction, not in the smooth Fourier field.
     if (ctx_.cb().external_xc_) {
         return forces_core_;
     }
@@ -1131,11 +1032,11 @@ Force::print_info(std::ostream& out__, int verbosity__)
 
     if (verbosity__ >= 2) {
         if (ctx_.full_potential()) {
-            print_forces("contribution from density", forces_rho());
-
-            print_forces("contribution from Hartree potential", forces_hf());
-
-            print_forces("contribution from IBS", forces_ibs());
+            if (!ctx_.cb().external_xc_) {
+                print_forces("contribution from density", forces_rho());
+                print_forces("contribution from Hartree potential", forces_hf());
+                print_forces("contribution from IBS", forces_ibs());
+            }
         } else {
             print_forces("ultrasoft contribution from Qij", forces_us());
 

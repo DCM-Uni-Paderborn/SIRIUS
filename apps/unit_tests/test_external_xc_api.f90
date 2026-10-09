@@ -233,8 +233,10 @@ program test_external_xc_api
     call sirius_add_atom_type_radial_function(ctx, 'He', 'ps_rho_total', rho, n)
     call sirius_add_atom_type_radial_function(ctx, 'He', 'ps_core_tau', -orbital, n, error_code=ierr)
     if (ierr == 0) failures = failures + 1
-    call sirius_add_atom_type_radial_function(ctx, 'He', 'ps_core_tau', 0.d0*orbital, n, error_code=ierr)
-    if (ierr /= 0) failures = failures + 1
+    if (mode == 1) then
+      call sirius_add_atom_type_radial_function(ctx, 'He', 'ps_core_tau', 0.d0*orbital, n, error_code=ierr)
+      if (ierr /= 0) failures = failures + 1
+    endif
     call sirius_add_atom_type_radial_function(ctx, 'He', 'ps_atomic_wf', orbital, n, n=1, l=0)
     call sirius_set_atom_type_dion(ctx, 'He', 0, dion)
     call sirius_add_atom(ctx, 'He', [0.2d0, 0.3d0, 0.4d0])

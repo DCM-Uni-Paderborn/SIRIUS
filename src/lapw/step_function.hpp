@@ -29,6 +29,17 @@ unit_step_function_form_factors(double R__, double g__)
     }
 }
 
+/// Derivative of the MT form factor with respect to the reciprocal-vector length, including its zero limit.
+inline double
+unit_step_function_form_factor_derivative(double R__, double g__)
+{
+    double z = R__ * g__;
+    if (std::abs(z) < 1e-3) {
+        return std::pow(R__, 4) * z * (-1.0 / 15 + z * z * (1.0 / 210 - z * z / 7560));
+    }
+    return R__ * R__ * std::sin(z) / (g__ * g__) - 3 * unit_step_function_form_factors(R__, g__) / g__;
+}
+
 /// Representation of the unit step function.
 struct step_function_t
 {
@@ -55,13 +66,9 @@ step_function_geometry_response(Unit_cell const& uc__, fft::Gvec const& gv__, md
             auto const& atom = uc__.atom(ia);
             auto r           = uc__.get_cartesian_coordinates(atom.position());
             r3::vector<double> dr{atoms__(0, ia), atoms__(1, ia), atoms__(2, ia)};
-            double R = atom.mt_radius(), z = R * length;
-            double f = unit_step_function_form_factors(R, length), df;
-            if (std::abs(z) < 1e-3) {
-                df = std::pow(R, 4) * z * (-1.0 / 15 + z * z * (1.0 / 210 - z * z / 7560)) * dlength;
-            } else {
-                df = (R * R * std::sin(z) / (length * length) - 3 * f / length) * dlength;
-            }
+            double R     = atom.mt_radius();
+            double f     = unit_step_function_form_factors(R, length);
+            double df    = unit_step_function_form_factor_derivative(R, length) * dlength;
             double phase = dot(g, dr) + dot(dg, r);
             result[ig] -= fourpi / uc__.omega() * std::exp(std::complex<double>(0, -dot(g, r))) *
                           (df - (trace + std::complex<double>(0, phase)) * f);

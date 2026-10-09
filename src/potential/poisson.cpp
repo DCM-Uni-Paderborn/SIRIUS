@@ -316,7 +316,7 @@ Potential::hartree_geometry_response(Periodic_function<double> const& density__,
                                      xc_geometry_direction_t const& direction__, bool include_nuclei__) const
 {
     validate_poisson_density(ctx_, density__);
-    int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU || ctx_.gvec().reduced() ||
+    int invalid = !ctx_.full_potential() || ctx_.gvec().reduced() ||
                   direction__.atoms.size() != static_cast<size_t>(unit_cell_.num_atoms());
     std::vector<double> values(direction__.lattice.begin(), direction__.lattice.end());
     values.push_back(include_nuclei__ ? 1 : 0);
@@ -328,7 +328,7 @@ Potential::hartree_geometry_response(Periodic_function<double> const& density__,
     }
     ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
     if (invalid) {
-        RTE_THROW("LAPW Hartree geometry response requires CPU fields and matching finite geometry directions");
+        RTE_THROW("LAPW Hartree geometry response requires unreduced fields and matching finite geometry directions");
     }
     auto root = values;
     ctx_.comm().bcast(root.data(), root.size(), 0);

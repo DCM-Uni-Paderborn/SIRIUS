@@ -19,6 +19,7 @@
 #include "density/augmentation_operator.hpp"
 #include "potential/potential.hpp"
 #include "beta_projectors/beta_projectors_base.hpp"
+#include "hamiltonian/non_local_operator.hpp"
 
 namespace sirius {
 
@@ -36,6 +37,24 @@ add_k_point_contribution_nonlocal(Potential& potential__, Beta_projectors_base<T
 
     if (uc.max_mt_basis_size() == 0) {
         return;
+    }
+
+    std::unique_ptr<D_operator<T>> soc_d;
+    std::unique_ptr<Q_operator<T>> soc_q;
+    if (ctx.so_correction()) {
+        if (ctx.num_mag_dims() != 3) {
+            RTE_THROW("SOC nonlocal derivatives require two-component spinors");
+        }
+        for (int iat = 0; iat < uc.num_atom_types(); iat++) {
+            auto const& type = uc.atom_type(iat);
+            if (type.spin_orbit_coupling() && type.augment() && !type.is_paw()) {
+                RTE_THROW("SOC nonlocal derivatives require norm-conserving or PAW pseudopotentials");
+            }
+        }
+        soc_d = std::make_unique<D_operator<T>>(potential__);
+        if (uc.augment()) {
+            soc_q = std::make_unique<Q_operator<T>>(ctx);
+        }
     }
 
     auto& bp = kp__.beta_projectors();
@@ -91,12 +110,8 @@ add_k_point_contribution_nonlocal(Potential& potential__, Beta_projectors_base<T
 
                     auto& d_mtrx = potential__.d_mtrx(ia);
 
-                    if (uc.atom(ia).type().spin_orbit_coupling()) {
-                        RTE_THROW("stress and forces with SO coupling are not upported");
-                    }
-
                     /* helper lambda to calculate for sum loop over bands for different beta_phi and dij combinations*/
-                    auto for_bnd = [&](int ibf, int jbf, std::complex<real_type<F>> dij, real_type<F> qij,
+                    auto for_bnd = [&](int ibf, int jbf, std::complex<real_type<F>> dij, std::complex<real_type<F>> qij,
                                        matrix<F>& beta_phi_chunk) {
                         /* gather everything = - 2  Re[ occ(k,n) weight(k) beta_phi*(i,n) [Dij - E(n)Qij]
                          * beta_base_phi(j,n) ]*/
@@ -104,7 +119,7 @@ add_k_point_contribution_nonlocal(Potential& potential__, Beta_projectors_base<T
                             int ibnd = spl_nbnd.global_index(ibnd_loc);
 
                             auto d1 = main_two_factor * kp__.band_occupancy(ibnd, ispn) * kp__.weight();
-                            auto z2 = dij - static_cast<real_type<F>>(kp__.band_energy(ibnd, ispn) * qij);
+                            auto z2 = dij - static_cast<real_type<F>>(kp__.band_energy(ibnd, ispn)) * qij;
                             auto z1 = z2 * std::conj(beta_phi_chunk(offs + jbf, ibnd)) *
                                       bp_base_phi_chunk(offs + ibf, ibnd);
 
@@ -119,6 +134,19 @@ add_k_point_contribution_nonlocal(Potential& potential__, Beta_projectors_base<T
                         int lm2    = uc.atom(ia).type().indexb(ibf).lm;
                         int idxrf2 = uc.atom(ia).type().indexb(ibf).idxrf;
                         for (int jbf = 0; jbf < nbf; jbf++) {
+                            if (uc.atom(ia).type().spin_orbit_coupling()) {
+                                // The differentiated overlap is not conjugated: use the transposed spin block.
+                                auto diagonal = soc_d->template value<std::complex<T>>(jbf, ibf, ispn, ia);
+                                auto transverse =
+                                        soc_d->template value<std::complex<T>>(jbf, ibf, ispn == 0 ? 3 : 2, ia);
+                                auto qdiagonal = soc_q ? soc_q->template value<std::complex<T>>(jbf, ibf, ispn, ia) : 0;
+                                auto qtransverse =
+                                        soc_q ? soc_q->template value<std::complex<T>>(jbf, ibf, ispn == 0 ? 3 : 2, ia)
+                                              : 0;
+                                for_bnd(ibf, jbf, diagonal, qdiagonal, beta_phi_chunks[ispn]);
+                                for_bnd(ibf, jbf, transverse, qtransverse, beta_phi_chunks[1 - ispn]);
+                                continue;
+                            }
                             int lm1    = uc.atom(ia).type().indexb(jbf).lm;
                             int idxrf1 = uc.atom(ia).type().indexb(jbf).idxrf;
 

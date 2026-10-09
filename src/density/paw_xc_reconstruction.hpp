@@ -11,10 +11,11 @@
 #include "density/paw_xc_correction.hpp"
 #include "function3d/spheric_function_interpolator.hpp"
 #include "function3d/xc_point_fields.hpp"
+#include <optional>
 
 namespace sirius {
 
-/// Sum PAW source/image corrections on a distributed, arbitrary XC point set.
+/// Sum PAW corrections and norm-conserving pseudo cores on an arbitrary XC point set.
 /** Each point belongs to exactly one context rank. Coordinates are Cartesian
  *  bohr and may lie outside the primitive cell. The density matrix is already
  *  accumulated over bands/k points and replicated, as in Density. This object
@@ -27,7 +28,8 @@ class PAW_xc_reconstruction
   private:
     struct source_t
     {
-        PAW_xc_correction op;
+        std::optional<PAW_xc_correction> op;
+        int atom;
         std::array<std::vector<Flm>, 2> fields;
         std::vector<Spheric_function_interpolator> rho;
         std::vector<Spheric_function_interpolator> tau;
@@ -36,19 +38,28 @@ class PAW_xc_reconstruction
         std::vector<r3::vector<double>> images;
         std::vector<int> targets;
 
-        source_t(Atom_type const& type__, mdarray<std::complex<double>, 3> const& dm__)
-            : op(type__)
-            , fields(op.fields(dm__, false))
+        source_t(int atom__, Atom_type const& type__, mdarray<std::complex<double>, 3> const& dm__, bool spinor__)
+            : atom(atom__)
         {
+            if (type__.is_paw()) {
+                op.emplace(type__);
+                fields = op->fields(dm__, false);
+            } else {
+                type__.check_ps_core_kinetic_density();
+            }
             for (size_t s = 0; s < fields[0].size(); s++) {
                 rho.emplace_back(fields[0][s], spheric_inner_extension_t::charge);
                 tau.emplace_back(fields[1][s], spheric_inner_extension_t::kinetic);
             }
             // Keep the frozen core out of state-dependent spline differences near the nucleus.
             Flm field(1, type__.radial_grid());
-            for (auto const* values : {&type__.paw_ae_core_charge_density(), &type__.paw_ae_core_kinetic_density()}) {
+            auto charge = type__.is_paw() ? type__.paw_ae_core_charge_density() : type__.ps_core_charge_density();
+            charge.resize(type__.num_mt_points(), 0);
+            auto const& kinetic =
+                    type__.is_paw() ? type__.paw_ae_core_kinetic_density() : type__.ps_core_kinetic_density();
+            for (auto const* values : std::array<std::vector<double> const*, 2>{&charge, &kinetic}) {
                 for (int ir = 0; ir < type__.num_mt_points(); ir++) {
-                    field(0, ir) = (*values)[ir] / (dm__.size(2) * y00);
+                    field(0, ir) = (*values)[ir] / ((spinor__ ? 1 : dm__.size(2)) * y00);
                 }
                 core.emplace_back(field, spheric_inner_extension_t::charge);
             }
@@ -63,7 +74,7 @@ class PAW_xc_reconstruction
     check_buffers(mdarray<double, 2> const& rho__, mdarray<double, 3> const& grad__,
                   mdarray<double, 2> const& tau__) const
     {
-        int ns     = ctx_.num_spins();
+        int ns     = ctx_.num_mag_dims() + 1;
         int failed = rho__.size(0) != num_points_ || rho__.size(1) != ns || grad__.size(0) != num_points_ ||
                      grad__.size(1) != 3 || grad__.size(2) != ns || tau__.size(0) != num_points_ || tau__.size(1) != ns;
         ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
@@ -80,17 +91,24 @@ class PAW_xc_reconstruction
         int failed{0};
         std::string message;
         try {
-            if (ctx_.full_potential() || ctx_.num_mag_dims() == 3 ||
-                points__.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-                RTE_THROW("PAW XC reconstruction requires scalar nonmagnetic/collinear PAW fields");
+            if (ctx_.full_potential() || points__.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                RTE_THROW("PAW XC reconstruction requires a pseudopotential context and a bounded point set");
             }
             auto const& uc = ctx_.unit_cell();
+            std::vector<int> atoms;
             for (int i = 0; i < uc.num_paw_atoms(); i++) {
-                int ia           = uc.paw_atom_index(paw_atom_index_t::global(i));
+                atoms.push_back(uc.paw_atom_index(paw_atom_index_t::global(i)));
+            }
+            for (int ia = 0; ia < uc.num_atoms(); ia++) {
+                if (!uc.atom(ia).type().is_paw() && uc.atom(ia).type().has_ps_core_kinetic_density()) {
+                    atoms.push_back(ia);
+                }
+            }
+            for (int ia : atoms) {
                 auto const& atom = uc.atom(ia);
-                sources_.emplace_back(atom.type(), density__.density_matrix(ia));
+                sources_.emplace_back(ia, atom.type(), density__.density_matrix(ia), ctx_.num_mag_dims() == 3);
                 auto& source   = sources_.back();
-                double support = source.op.support_radius();
+                double support = source.op ? source.op->support_radius() : atom.type().radial_grid().last();
                 auto limits    = r3::find_translations(support, uc.lattice_vectors());
                 for (int p = 0; p < num_points_; p++) {
                     auto displacement0 = points__[p] - r3::dot(uc.lattice_vectors(), atom.position());
@@ -148,7 +166,7 @@ class PAW_xc_reconstruction
         auto const& t = derivatives__.tau;
         check_buffers(r, g, t);
         int failed{0};
-        for (int s = 0; s < ctx_.num_spins(); s++) {
+        for (int s = 0; s < ctx_.num_mag_dims() + 1; s++) {
             for (int p = 0; p < num_points_; p++) {
                 failed |= !std::isfinite(r(p, s)) || !std::isfinite(t(p, s));
                 for (int x = 0; x < 3; x++) {
@@ -163,15 +181,21 @@ class PAW_xc_reconstruction
         xc_geometry_adjoint_t result(num_points_, ctx_.unit_cell().num_atoms());
         for (size_t i = 0; i < sources_.size(); i++) {
             auto const& source = sources_[i];
-            int ia             = ctx_.unit_cell().paw_atom_index(paw_atom_index_t::global(static_cast<int>(i)));
-            for (int s = 0; s < ctx_.num_spins(); s++) {
+            int ia             = source.atom;
+            // Frozen cores contribute only to the total spinor component.
+            for (int s = 0; s < ctx_.num_mag_dims() + 1; s++) {
                 for (size_t j = 0; j < source.targets.size(); j++) {
                     int p = source.targets[j];
                     std::array<double, 4> dr{r(p, s), g(p, 0, s), g(p, 1, s), g(p, 2, s)};
                     std::array<double, 4> dt{t(p, s), 0, 0, 0};
                     auto const& d = source.displacements[j];
-                    auto v        = source.rho[s].position_adjoint(d, dr) + source.tau[s].position_adjoint(d, dt) +
-                                    source.core[0].position_adjoint(d, dr) + source.core[1].position_adjoint(d, dt);
+                    r3::vector<double> v{0, 0, 0};
+                    if (ctx_.num_mag_dims() != 3 || s == 0) {
+                        v += source.core[0].position_adjoint(d, dr) + source.core[1].position_adjoint(d, dt);
+                    }
+                    if (source.op) {
+                        v += source.rho[s].position_adjoint(d, dr) + source.tau[s].position_adjoint(d, dt);
+                    }
                     result.points[p] += v;
                     for (int x = 0; x < 3; x++) {
                         result.atoms(x, ia) -= v[x];
@@ -196,17 +220,26 @@ class PAW_xc_reconstruction
     {
         check_buffers(rho__, grad__, tau__);
         for (auto const& source : sources_) {
-            for (int s = 0; s < ctx_.num_spins(); s++) {
+            for (int s = 0; s < ctx_.num_mag_dims() + 1; s++) {
                 for (size_t j = 0; j < source.targets.size(); j++) {
-                    int p         = source.targets[j];
-                    auto rho      = source.rho[s].value_gradient(source.displacements[j]);
-                    auto tau      = source.tau[s].value_gradient(source.displacements[j]);
-                    auto core_rho = source.core[0].value_gradient(source.displacements[j]);
-                    auto core_tau = source.core[1].value_gradient(source.displacements[j]);
-                    rho__(p, s) += rho[0] + core_rho[0];
-                    tau__(p, s) += tau[0] + core_tau[0];
+                    int p = source.targets[j];
+                    std::array<double, 4> core_rho{}, core_tau{};
+                    if (ctx_.num_mag_dims() != 3 || s == 0) {
+                        core_rho = source.core[0].value_gradient(source.displacements[j]);
+                        core_tau = source.core[1].value_gradient(source.displacements[j]);
+                    }
+                    if (source.op) {
+                        auto rho = source.rho[s].value_gradient(source.displacements[j]);
+                        auto tau = source.tau[s].value_gradient(source.displacements[j]);
+                        for (int x = 0; x < 4; x++) {
+                            core_rho[x] += rho[x];
+                        }
+                        core_tau[0] += tau[0];
+                    }
+                    rho__(p, s) += core_rho[0];
+                    tau__(p, s) += core_tau[0];
                     for (int x = 0; x < 3; x++) {
-                        grad__(p, x, s) += rho[x + 1] + core_rho[x + 1];
+                        grad__(p, x, s) += core_rho[x + 1];
                     }
                 }
             }
@@ -215,7 +248,7 @@ class PAW_xc_reconstruction
 
     /// Global projector matrices from raw, already-weighted energy covectors.
     /** Results follow unit_cell().paw_atoms(), with separate up/down matrices
-     *  for collinear spin. The smooth-field reverse operation is unchanged and
+     *  for collinear spin or total/z/x/y matrices for spinors. The smooth-field reverse operation is unchanged and
      *  must additionally return through its Fourier/interpolation and Q maps.
      */
     std::vector<mdarray<double, 3>>
@@ -226,10 +259,14 @@ class PAW_xc_reconstruction
         std::vector<mdarray<double, 3>> result;
         for (size_t i = 0; i < sources_.size(); i++) {
             auto const& source = sources_[i];
-            int ia             = ctx_.unit_cell().paw_atom_index(paw_atom_index_t::global(static_cast<int>(i)));
-            int n              = ctx_.unit_cell().atom(ia).type().indexb().size();
-            result.emplace_back(std::array<index_range, 3>{n, n, ctx_.num_spins()});
-            for (int s = 0; s < ctx_.num_spins(); s++) {
+            if (!source.op) {
+                continue;
+            }
+            int ia = source.atom;
+            int n  = ctx_.unit_cell().atom(ia).type().indexb().size();
+            int ns = ctx_.num_mag_dims() + 1;
+            result.emplace_back(std::array<index_range, 3>{n, n, ns});
+            for (int s = 0; s < ns; s++) {
                 std::vector<std::array<double, 4>> drho(source.targets.size()), dtau(source.targets.size());
                 for (size_t j = 0; j < source.targets.size(); j++) {
                     int p   = source.targets[j];
@@ -238,7 +275,7 @@ class PAW_xc_reconstruction
                 }
                 auto r      = source.rho[s].adjoint(source.displacements, drho);
                 auto t      = source.tau[s].adjoint(source.displacements, dtau);
-                auto matrix = source.op.matrix_elements(r, t);
+                auto matrix = source.op->matrix_elements(r, t);
                 for (int b = 0; b < n; b++) {
                     for (int a = 0; a < n; a++) {
                         result.back()(a, b, s) = matrix(a, b);

@@ -588,7 +588,8 @@
                     "default": "dirac",
                     "enum": [
                         "none",
-                        "dirac"
+                        "dirac",
+                        "zora"
                     ],
                     "title": "Type of core-states relativity in full-potential LAPW case."
                 },

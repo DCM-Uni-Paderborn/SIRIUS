@@ -10,7 +10,11 @@
 #include "dft/dft_ground_state.hpp"
 #include "dft/energy.hpp"
 #include "density/paw_xc_reconstruction.hpp"
+#include "function3d/smooth_periodic_function_sampler.hpp"
+#include "geometry/force.hpp"
+#include "geometry/stress.hpp"
 #include "hamiltonian/hamiltonian.hpp"
+#include "hamiltonian/initialize_subspace.hpp"
 
 using namespace sirius;
 
@@ -63,7 +67,8 @@ test_functional(Simulation_context const& ctx, xc_callback_input_t const& in, xc
 auto
 test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool parallel_fft = false, bool external = true,
              double fixed_mag = 0, bool paw = false, bool points = false, std::string smearing = "gaussian",
-             double extra_charge = 0, std::function<void(Simulation_context&)> setup = {})
+             double extra_charge = 0, std::function<void(Simulation_context&)> setup = {}, bool gpu = false,
+             bool soc = false)
 {
     auto conf                          = R"({"parameters": {
         "electronic_structure_method": "pseudopotential", "use_symmetry": false,
@@ -78,6 +83,8 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
     conf["parameters"]["smearing"]     = smearing;
     conf["parameters"]["extra_charge"] = extra_charge;
     conf["settings"]["tol_ne"]         = 1e-11;
+    conf["control"]["processing_unit"] = gpu ? "GPU" : "CPU";
+    conf["control"]["verification"]    = scf && exact ? 2 : 0;
     conf["iterative_solver"]["type"]   = exact ? "exact" : "davidson";
     if (!external) {
         conf["parameters"]["xc_functionals"] = {"XC_LDA_X"};
@@ -89,6 +96,7 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
     ctx->unit_cell().set_lattice_vectors({{8, 0, 0}, {0, 9, 0}, {0, 0, 10}});
     auto& type = ctx->unit_cell().add_atom_type("He");
     type.zn(2);
+    type.spin_orbit_coupling(soc);
     type.set_radial_grid(radial_grid_t::lin_exp, 400, paw ? 0.001 : 0.0, paw ? 3.0 : 20.0, 6);
     std::vector<double> v(400), rho(400), orbital(400);
     for (int ir = 0; ir < 400; ir++) {
@@ -105,24 +113,54 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
         std::vector<double> ae(400), ps(400), beta(400), q(400), core(400), core_tau(400), ps_core(400);
         for (int ir = 0; ir < 400; ir++) {
             double r     = type.radial_grid(ir);
-            ae[ir]       = r * std::exp(-r * r);
-            ps[ir]       = r * std::exp(-0.8 * r * r);
-            beta[ir]     = 0.2 * r * std::exp(-2 * r * r);
+            ae[ir]       = std::pow(r, soc ? 2 : 1) * std::exp(-r * r);
+            ps[ir]       = std::pow(r, soc ? 2 : 1) * std::exp(-0.8 * r * r);
+            beta[ir]     = 0.2 * std::pow(r, soc ? 2 : 1) * std::exp(-2 * r * r);
             q[ir]        = 0.05 * r * r * std::exp(-2 * r * r);
             core[ir]     = 0.02 * std::exp(-3 * r * r);
             core_tau[ir] = 0.03 * std::exp(-3 * r * r);
             ps_core[ir]  = 0.01 * std::exp(-2 * r * r);
         }
-        type.add_beta_radial_function(angular_momentum(0), beta);
-        type.add_ae_paw_wf(ae);
-        type.add_ps_paw_wf(ps);
-        type.add_q_radial_function(0, 0, 0, q);
+        int nbeta = soc ? 2 : 1;
+        for (int i = 0; i < nbeta; i++) {
+            type.add_beta_radial_function(soc ? angular_momentum(1, i == 0 ? -1 : 1) : angular_momentum(0), beta);
+            type.add_ae_paw_wf(ae);
+            type.add_ps_paw_wf(ps);
+        }
+        for (int j = 0; j < nbeta; j++) {
+            for (int i = 0; i <= j; i++) {
+                for (int l = 0; l <= (soc ? 2 : 0); l += 2) {
+                    auto radial = q;
+                    for (auto& v : radial) {
+                        v *= (1 + 0.4 * i + 0.2 * j) / (l + 1);
+                    }
+                    type.add_q_radial_function(i, j, l, radial);
+                }
+            }
+        }
         type.paw_ae_core_charge_density(core);
         type.paw_ae_core_kinetic_density(core_tau);
         type.ps_core_charge_density(ps_core);
-        type.paw_wf_occ({2});
-        matrix<double> dion({1, 1});
+        type.paw_wf_occ(std::vector<double>(nbeta, 2.0 / nbeta));
+        matrix<double> dion({nbeta, nbeta});
         dion.zero();
+        if (soc) {
+            dion(0, 0) = 0.7;
+            dion(1, 1) = -0.4;
+        }
+        type.d_mtrx_ion(dion);
+    } else if (soc) {
+        std::vector<double> beta(400);
+        for (int ir = 0; ir < 400; ir++) {
+            double r = type.radial_grid(ir);
+            beta[ir] = r * r * std::exp(-r * r);
+        }
+        type.add_beta_radial_function(angular_momentum(1, -1), beta);
+        type.add_beta_radial_function(angular_momentum(1, 1), beta);
+        matrix<double> dion({2, 2});
+        dion.zero();
+        dion(0, 0) = 0.7;
+        dion(1, 1) = -0.4;
         type.d_mtrx_ion(dion);
     } else {
         type.d_mtrx_ion(matrix<double>({0, 0}));
@@ -246,6 +284,8 @@ test_point_geometry(Simulation_context& ctx, Density const& density, Potential& 
     auto rho_hash       = density.rho().rg().hash_f_pw();
     auto potential_hash = potential.effective_potential().rg().hash_f_pw();
     auto derivative     = potential.external_xc_geometry(density);
+    Density displaced_density(ctx);
+    copy(density, displaced_density);
     check("geometry getter preserves density and potential",
           rho_hash == density.rho().rg().hash_f_pw() &&
                           potential_hash == potential.effective_potential().rg().hash_f_pw()
@@ -280,8 +320,15 @@ test_point_geometry(Simulation_context& ctx, Density const& density, Potential& 
             q->block_centres[0][component] += step;
         }
         ctx.cb().external_xc_points_ = q;
-        potential.generate(density, false, true);
-        return potential.energy_exc(density);
+        // Hold the physical smooth field fixed, not its volume-dependent background.
+        if (ctx.gvec().offset() == 0) {
+            displaced_density.rho().rg().f_pw_local(0) =
+                    density.rho().rg().f_pw_local(0) +
+                    ctx.cfg().parameters().extra_charge() * (1 / cell.det() - 1 / lattice.det());
+        }
+        displaced_density.rho().rg().fft_transform(1);
+        potential.generate(displaced_density, false, true);
+        return potential.energy_exc(displaced_density);
     };
     for (double step : {1e-4, 5e-5}) {
         double error{0};
@@ -342,10 +389,500 @@ test_point_geometry(Simulation_context& ctx, Density const& density, Potential& 
     return failures;
 }
 
-int
-test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bool paw = false)
+void
+set_test_core(Simulation_context& ctx)
 {
-    auto ctx = test_context(gamma, mag, false, false, parallel_fft, true, 0, paw, points);
+    auto& type = ctx.unit_cell().atom_type(0);
+    std::vector<double> charge(type.num_mt_points()), kinetic(charge.size());
+    for (int ir = 0; ir < type.num_mt_points(); ir++) {
+        double r    = type.radial_grid(ir);
+        charge[ir]  = 0.02 * std::exp(-3 * r * r);
+        kinetic[ir] = 0.03 * std::exp(-3 * r * r);
+    }
+    type.ps_core_charge_density(charge);
+    type.ps_core_kinetic_density(kinetic);
+}
+
+void
+check_spinor_eigensystem(Hamiltonian_k<double> const& hk, K_point<double>& kp, Test_check& check)
+{
+    auto& ctx = hk.H0().ctx();
+    int ng = kp.num_gkvec(), n = 2 * ng, nb = ctx.num_bands();
+    wf::Wave_functions<double> basis(kp.gkvec_sptr(), wf::num_mag_dims(3), wf::num_bands(n), memory_t::host);
+    wf::Wave_functions<double> hb(kp.gkvec_sptr(), wf::num_mag_dims(3), wf::num_bands(n), memory_t::host);
+    wf::Wave_functions<double> sb(kp.gkvec_sptr(), wf::num_mag_dims(3), wf::num_bands(n), memory_t::host);
+    for (int s = 0; s < 2; s++) {
+        basis.zero(memory_t::host, wf::spin_index(s), wf::band_range(0, n));
+        for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+            basis.pw_coeffs(ig, wf::spin_index(s), wf::band_index(s * ng + kp.gkvec().offset() + ig)) = 1;
+        }
+    }
+    {
+        auto bg = basis.memory_guard(ctx.processing_unit_memory_t(), wf::copy_to::device);
+        auto hg = hb.memory_guard(ctx.processing_unit_memory_t(), wf::copy_to::host);
+        auto sg = sb.memory_guard(ctx.processing_unit_memory_t(), wf::copy_to::host);
+        hk.apply_h_s<std::complex<double>>(wf::spin_range(0, 2), wf::band_range(0, n), basis, &hb, &sb);
+    }
+    // Assemble the complete spinor problem, independently of the Davidson subspace and preconditioner.
+    la::dmatrix<std::complex<double>> h(n, n), overlap(n, n), eigenvectors(n, n);
+    h.zero();
+    overlap.zero();
+    for (int b = 0; b < n; b++) {
+        for (int s = 0; s < 2; s++) {
+            for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                int row         = s * ng + kp.gkvec().offset() + ig;
+                h(row, b)       = hb.pw_coeffs(ig, wf::spin_index(s), wf::band_index(b));
+                overlap(row, b) = sb.pw_coeffs(ig, wf::spin_index(s), wf::band_index(b));
+            }
+        }
+    }
+    kp.gkvec().comm().allreduce(h.at(memory_t::host), n * n);
+    kp.gkvec().comm().allreduce(overlap.at(memory_t::host), n * n);
+    check("full spinor Hamiltonian Hermiticity", check_hermitian(h, n), 2e-12);
+    check("full spinor overlap Hermiticity", check_hermitian(overlap, n), 2e-12);
+    std::vector<double> exact(nb);
+    auto solver = la::Eigensolver_factory("lapack");
+    if (solver->solve(n, nb, h, overlap, exact.data(), eigenvectors)) {
+        RTE_THROW("dense spinor eigenproblem failed");
+    }
+    initialize_subspace<double, std::complex<double>>(hk, kp, ctx.unit_cell().num_ps_atomic_wf().first);
+    auto const& itso = ctx.cfg().iterative_solver();
+    auto result      = davidson<double, std::complex<double>, davidson_evp_t::hamiltonian>(
+            hk, kp, wf::num_bands(nb), wf::num_mag_dims(3), kp.spinor_wave_functions(), [](int, int) { return 1e-12; },
+            1e-8, 240, itso.locking(), itso.subspace_size(), false, itso.extra_ortho(), ctx.out(), 0);
+    check("spinor Davidson convergence", result.converged ? 0 : 1, 0);
+    double energy_error{0};
+    for (int b = 0; b < nb; b++) {
+        energy_error = std::max(energy_error, std::abs(result.eval(b, 0) - exact[b]));
+    }
+    check("spinor Davidson versus dense eigenvalues", energy_error, 2e-10);
+    {
+        auto pg = kp.spinor_wave_functions().memory_guard(ctx.processing_unit_memory_t(), wf::copy_to::device);
+        auto hg = hb.memory_guard(ctx.processing_unit_memory_t(), wf::copy_to::host);
+        auto sg = sb.memory_guard(ctx.processing_unit_memory_t(), wf::copy_to::host);
+        hk.apply_h_s<std::complex<double>>(wf::spin_range(0, 2), wf::band_range(0, nb), kp.spinor_wave_functions(), &hb,
+                                           &sb);
+    }
+    std::vector<double> residual(nb);
+    la::dmatrix<std::complex<double>> gram(nb, nb);
+    wf::inner(ctx.spla_context(), memory_t::host, wf::spin_range(0, 2), kp.spinor_wave_functions(),
+              wf::band_range(0, nb), sb, wf::band_range(0, nb), gram, 0, 0);
+    for (int b = 0; b < nb; b++) {
+        for (int s = 0; s < 2; s++) {
+            for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                residual[b] += std::norm(hb.pw_coeffs(ig, wf::spin_index(s), wf::band_index(b)) -
+                                         result.eval(b, 0) * sb.pw_coeffs(ig, wf::spin_index(s), wf::band_index(b)));
+            }
+        }
+    }
+    kp.gkvec().comm().allreduce(residual.data(), nb);
+    check("spinor eigenpair residual", std::sqrt(*std::max_element(residual.begin(), residual.end())), 2e-8);
+    check("spinor S-orthonormality", check_identity(gram, nb), 2e-12);
+    std::vector<double> iterative(nb);
+    for (int b = 0; b < nb; b++) {
+        iterative[b] = result.eval(b, 0);
+    }
+    check_wave_functions<double, std::complex<double>>(hk, kp.spinor_wave_functions(), wf::spin_range(0, 2),
+                                                       wf::band_range(0, nb), iterative.data());
+}
+
+int
+test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
+{
+    auto ctx = test_context(
+            false, 3, false, false, soc, true, 0, paw, true, "gaussian", charge,
+            [=](auto& c) {
+                c.cb().external_xc_spinor_ = true;
+                if (!paw) {
+                    set_test_core(c);
+                }
+                auto q = std::make_shared<xc_point_set_t>(*c.cb().external_xc_points_);
+                if (!q->coordinates.empty()) {
+                    q->coordinates[1] = {1.6 + c.unit_cell().atom_type(0).radial_grid(100), 2.7, 4.0};
+                }
+                c.cb().external_xc_points_ = std::move(q);
+            },
+            gpu, soc);
+    int failures{0};
+    Test_check check(failures, ctx->comm(),
+                     "spinor XC PAW=" + std::to_string(paw) + " SOC=" + std::to_string(soc) +
+                             " GPU=" + std::to_string(gpu) + " charge=" + std::to_string(charge));
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0.13, -0.17, 0.07}, 0.3);
+    ks.add_kpoint({-0.1, 0.09, 0.21}, 0.7);
+    ks.initialize();
+    auto coefficient = [](r3::vector<int> g, double angle, int s, bool derivative) {
+        auto a     = g == r3::vector<int>{2, 0, 0} ? std::complex<double>{1, 0} : std::complex<double>{0, 0};
+        auto b     = g == r3::vector<int>{0, 1, 0} ? std::polar(1.0, 0.4 + 0.7 * s) : std::complex<double>{0, 0};
+        auto scale = std::polar(std::sqrt(s == 0 ? 0.6 : 0.4), 0.9 * s);
+        return scale *
+               (derivative ? -std::sin(angle) * a + std::cos(angle) * b : std::cos(angle) * a + std::sin(angle) * b);
+    };
+    Density density(*ctx);
+    Potential potential(*ctx);
+    double core_error{0};
+    bool audit_core{true};
+    ctx->cb().external_xc_ = [&](Simulation_context const& c, auto const& in, auto& out) {
+        int nr = in.num_points;
+        if (in.num_spins != 4) {
+            RTE_THROW("spinor callback requires four components");
+        }
+        std::array<double, 4> moment{};
+        double volume{0}, energy{0};
+        for (int p = 0; p < nr; p++) {
+            volume += in.points->descriptor_weights[p];
+            for (int s = 0; s < 4; s++) {
+                moment[s] += in.points->descriptor_weights[p] * in.tau[p + nr * s];
+            }
+        }
+        c.comm().allreduce(moment.data(), 4);
+        c.comm().allreduce(&volume, 1);
+        double square = std::inner_product(moment.begin(), moment.end(), moment.begin(), 0.0);
+        for (int s = 0; s < 4; s++) {
+            for (int p = 0; p < nr; p++) {
+                int j    = p + nr * s;
+                double n = in.rho[j], t = in.tau[j], w = in.points->energy_weights[p];
+                double local = 0.7 * n * n + 0.3 * t * t + 0.2 * n * t;
+                out.vrho[j]  = w * (1.4 * n + 0.2 * t);
+                out.vtau[j]  = w * (0.6 * t + 0.2 * n) + in.points->descriptor_weights[p] * 0.4 * moment[s] / volume;
+                for (int x = 0; x < 3; x++) {
+                    int k = p + nr * (x + 3 * s);
+                    local += 0.1 * in.gradient[k] * in.gradient[k];
+                    out.vgradient[k] = w * 0.2 * in.gradient[k];
+                }
+                energy += w * local;
+                if (out.geometry) {
+                    out.geometry->energy_weights[p] += local;
+                    out.geometry->descriptor_weights[p] += 0.4 * moment[s] * t / volume;
+                    if (s == 0) {
+                        out.geometry->descriptor_weights[p] -= 0.2 * square / (volume * volume);
+                    }
+                }
+            }
+        }
+        c.comm().allreduce(&energy, 1);
+        out.energy = energy + 0.2 * square / volume;
+        if (!audit_core) {
+            return;
+        }
+        std::vector<r3::vector<double>> point;
+        if (nr > 1) {
+            point.push_back({in.points->coordinates[1][0], in.points->coordinates[1][1], in.points->coordinates[1][2]});
+        }
+        Smooth_periodic_function_sampler sampler(c.gvec(), point);
+        auto const& type = c.unit_cell().atom_type(0);
+        mdarray<std::complex<double>, 2> augmentation;
+        std::array<std::vector<Flm>, 2> local;
+        if (paw) {
+            augmentation = density.generate_rho_aug();
+            local        = density.generate_paw_xc_correction(0);
+        }
+        for (int s = 0; s < 4; s++) {
+            auto const& rho  = s == 0 ? density.rho() : density.mag(s - 1);
+            auto const& tau  = s == 0 ? density.kinetic_density().scalar() : density.kinetic_density().vector(s - 1);
+            auto sampled_rho = sampler.sample(rho.rg()), sampled_tau = sampler.sample(tau.rg());
+            std::vector<std::array<double, 4>> sampled_q;
+            if (paw) {
+                Smooth_periodic_function<double> q(c.spfft<double>(), c.gvec_fft_sptr());
+                for (int ig = 0; ig < c.gvec().count(); ig++) {
+                    q.f_pw_local(ig) = augmentation(ig, s);
+                }
+                sampled_q = sampler.sample(q);
+            }
+            if (nr > 1) {
+                double r = sampled_rho[0][0], t = sampled_tau[0][0];
+                if (s == 0) {
+                    r -= charge / c.unit_cell().omega();
+                }
+                if (paw) {
+                    auto position = point[0] - dot(c.unit_cell().lattice_vectors(), c.unit_cell().atom(0).position());
+                    r += Spheric_function_interpolator(local[0][s], spheric_inner_extension_t::charge)
+                                 .value_gradient(position)[0] -
+                         sampled_q[0][0];
+                    t += Spheric_function_interpolator(local[1][s], spheric_inner_extension_t::kinetic)
+                                 .value_gradient(position)[0];
+                }
+                core_error = std::max(core_error, std::abs(in.rho[1 + nr * s] - r -
+                                                           (!paw && s == 0 ? type.ps_core_charge_density()[100] : 0)));
+                core_error = std::max(core_error, std::abs(in.tau[1 + nr * s] - t -
+                                                           (!paw && s == 0 ? type.ps_core_kinetic_density()[100] : 0)));
+            }
+        }
+    };
+    auto ionic_energy = [&] {
+        double energy{0};
+        if (soc) {
+            auto const& type = ctx->unit_cell().atom_type(0);
+            auto const& dm   = density.density_matrix(0);
+            // The projector density matrix already includes the SOC angular rotation and k weights.
+            for (int xi = 0; xi < type.mt_basis_size(); xi++) {
+                int rf = type.indexb(xi).idxrf;
+                energy += type.d_mtrx_ion()(rf, rf) * std::real(dm(xi, xi, 0) + dm(xi, xi, 1));
+            }
+        }
+        return energy;
+    };
+    bool overlap_constraint{false};
+    auto evaluate = [&](double step) {
+        for (auto it : ks.spl_num_kpoints()) {
+            auto kp = ks.get<double>(it.i);
+            for (int ib = 0; ib < ctx->num_bands(); ib++) {
+                kp->band_occupancy(ib, 0, ib < 2 ? 1 - charge / 2 : 0);
+                for (int s = 0; s < 2; s++) {
+                    for (int ig = 0; ig < kp->gkvec().count(); ig++) {
+                        auto g = kp->gkvec().gvec(gvec_index_t::local(ig));
+                        kp->spinor_wave_functions().pw_coeffs(ig, wf::spin_index(s), wf::band_index(ib)) =
+                                ib == 0 ? coefficient(g, 0.37 + 0.1 * s + 0.05 * it.i + step, s, false)
+                                        : (ib == 1 && r3::dot(g, g) == 0
+                                                   ? std::polar(std::sqrt(s == 0 ? 0.3 : 0.7), -0.6 * s)
+                                                   : std::complex<double>{0, 0});
+                    }
+                }
+            }
+        }
+        ks.sync_band<double, sync_band_t::occupancy>();
+        density.generate<double>(ks, false, true, true);
+        potential.generate(density, false, true);
+        return density.kinetic_density().scalar().integrate().total + 0.5 * potential.energy_vha() +
+               energy_vloc(density, potential) + potential.energy_exc(density) + potential.ewald_energy() +
+               potential.PAW_total_energy(density) + ionic_energy() -
+               (overlap_constraint ? 0.37 * density.rho().integrate().total : 0);
+    };
+    double center = evaluate(0), derivative{0};
+    audit_core    = false;
+    check("joint point XC field derivative", check_external_xc_point_derivative(density), 2e-10);
+    auto callback          = ctx->cb().external_xc_;
+    ctx->cb().external_xc_ = [&](auto const& c, auto const& in, auto& out) {
+        callback(c, in, out);
+        for (int i = 0; i < in.num_points * in.num_spins; i++) {
+            out.vtau[i] += 1;
+        }
+    };
+    check("point XC derivative detects incorrect tau covectors",
+          check_external_xc_point_derivative(density) > 1e-6 ? 0 : 1, 0);
+    ctx->cb().external_xc_ = callback;
+    audit_core             = true;
+    if (soc) {
+        check("nonzero SOC projector energy", std::abs(ionic_energy()) > 1e-8 ? 0 : 1, 0);
+        D_operator<double> d(potential);
+        double mixing{0};
+        auto const& type = ctx->unit_cell().atom_type(0);
+        for (int i = 0; i < type.mt_basis_size(); i++) {
+            for (int j = 0; j < type.mt_basis_size(); j++) {
+                mixing = std::max(mixing, std::abs(d.value<std::complex<double>>(i, j, 2, 0)));
+            }
+        }
+        check("nonzero SOC spin mixing", mixing > 1e-3 ? 0 : 1, 0);
+        if (paw) {
+            Q_operator<double> q(*ctx);
+            double mixing{0};
+            for (int i = 0; i < type.mt_basis_size(); i++) {
+                for (int j = 0; j < type.mt_basis_size(); j++) {
+                    mixing = std::max(mixing, std::abs(q.value<std::complex<double>>(i, j, 2, 0)));
+                }
+            }
+            check("nonzero SOC overlap spin mixing", mixing > 1e-10 ? 0 : 1, 0);
+        }
+    }
+    Hamiltonian0<double> H0(potential, false);
+    for (auto it : ks.spl_num_kpoints()) {
+        auto kp = ks.get<double>(it.i);
+        auto Hk = H0(*kp);
+        wf::Wave_functions<double> hphi(kp->gkvec_sptr(), wf::num_mag_dims(3), wf::num_bands(2), memory_t::host);
+        {
+            auto psi_guard =
+                    kp->spinor_wave_functions().memory_guard(ctx->processing_unit_memory_t(), wf::copy_to::device);
+            auto hphi_guard = hphi.memory_guard(ctx->processing_unit_memory_t(), wf::copy_to::host);
+            Hk.apply_h_s<std::complex<double>>(wf::spin_range(0, 2), wf::band_range(0, 2), kp->spinor_wave_functions(),
+                                               &hphi, nullptr);
+        }
+        std::array<double, 2> expectation{};
+        for (int s = 0; s < 2; s++) {
+            for (int ig = 0; ig < kp->gkvec().count(); ig++) {
+                auto d = coefficient(kp->gkvec().gvec(gvec_index_t::local(ig)), 0.37 + 0.1 * s + 0.05 * it.i, s, true);
+                auto h = hphi.pw_coeffs(ig, wf::spin_index(s), wf::band_index(0));
+                auto psi = kp->spinor_wave_functions().pw_coeffs(ig, wf::spin_index(s), wf::band_index(0));
+                derivative += 2 * kp->weight() * kp->band_occupancy(0, 0) * std::real(std::conj(d) * h);
+                expectation[0] += std::real(std::conj(psi) * h);
+                expectation[1] += std::real(
+                        std::conj(kp->spinor_wave_functions().pw_coeffs(ig, wf::spin_index(s), wf::band_index(1))) *
+                        hphi.pw_coeffs(ig, wf::spin_index(s), wf::band_index(1)));
+            }
+        }
+        kp->comm().allreduce(expectation.data(), 2);
+        for (int ib = 0; ib < 2; ib++) {
+            kp->band_energy(ib, 0, expectation[ib]);
+        }
+    }
+    ctx->comm().allreduce(&derivative, 1);
+    ks.sync_band<double, sync_band_t::energy>();
+    check("spinor total-energy double counting", std::abs(ks_energy(*ctx, ks, density, potential) - center), 2e-10);
+    for (double h : {1e-4, 5e-5}) {
+        check("spinor orbital derivative", std::abs((evaluate(h) - evaluate(-h)) / (2 * h) - derivative), 2e-8);
+    }
+    ctx->comm().allreduce<double, mpi::op_t::max>(&core_error, 1);
+    check("reconstructed spinor fields exclude Q and retain the scalar core", core_error, 2e-12);
+    ctx->cb().external_xc_spinor_ = false;
+    check.reject("legacy callback rejects spinor fields", [&] { validate_external_xc_context(*ctx); });
+    ctx->cb().external_xc_spinor_ = true;
+    if (soc && paw) {
+        auto& type = ctx->unit_cell().atom_type(0);
+        type.is_paw(false);
+        check.reject("external ultrasoft SOC requires PAW reconstruction", [&] { validate_external_xc_context(*ctx); });
+        type.is_paw(true);
+    }
+    Stress stress(*ctx, density, potential, ks);
+    check.reject("spinor stress requires geometry callbacks", [&] { stress.calc_stress_xc(); });
+    audit_core                      = false;
+    ctx->cb().external_xc_geometry_ = ctx->cb().external_xc_;
+    ctx->cb().external_xc_pullback_ = [](auto const& c, auto const& q, auto const& d, auto& out) {
+        auto inverse = r3::inverse(c.unit_cell().lattice_vectors());
+        for (size_t p = 0; p < q.coordinates.size(); p++) {
+            auto fractional =
+                    dot(inverse, r3::vector<double>(q.coordinates[p][0], q.coordinates[p][1], q.coordinates[p][2]));
+            double weights =
+                    d.energy_weights[p] * q.energy_weights[p] + d.descriptor_weights[p] * q.descriptor_weights[p];
+            for (int x = 0; x < 3; x++) {
+                for (int j = 0; j < 3; j++) {
+                    out.lattice[x + 3 * j] += d.coordinates[p][x] * fractional[j] + weights * inverse(j, x);
+                }
+            }
+        }
+        for (auto const& centre : d.block_centres) {
+            for (int x = 0; x < 3; x++) {
+                out.atoms[0][x] += centre[x];
+            }
+        }
+        c.comm().allreduce(out.atoms[0].data(), 3);
+        c.comm().allreduce(out.lattice.data(), 9);
+    };
+    // Geometry stencils keep coefficients fixed. A common, nonzero SOC multiplier
+    // tests the full spinor overlap response via the independent charge integral.
+    overlap_constraint = paw && soc;
+    if (paw) {
+        for (auto it : ks.spl_num_kpoints()) {
+            auto kp = ks.get<double>(it.i);
+            for (int ib = 0; ib < ctx->num_bands(); ib++) {
+                kp->band_energy(ib, 0, overlap_constraint && ib < 2 ? 0.37 : 0);
+            }
+        }
+        ks.sync_band<double, sync_band_t::energy>();
+    }
+    center        = evaluate(0);
+    auto exact    = stress.calc_stress_xc();
+    auto total    = stress.calc_stress_total();
+    auto lattice  = ctx->unit_cell().lattice_vectors();
+    auto original = ctx->cb().external_xc_points_;
+    double volume = ctx->unit_cell().omega(), xc = potential.energy_exc(density);
+    // Keep fractional PW coefficients and occupations fixed: test every strain
+    // component without SCF, including transverse tau and frozen scalar core fields.
+    auto strained_energy = [&](int mu, int nu, double step) {
+        auto cell = lattice;
+        for (int j = 0; j < 3; j++) {
+            cell(mu, j) += step * lattice(nu, j);
+        }
+        auto deformation = dot(cell, r3::inverse(lattice));
+        ctx->unit_cell().set_lattice_vectors(cell);
+        ctx->update();
+        ks.update();
+        density.update();
+        potential.update();
+        auto q                = std::make_shared<xc_point_set_t>(*ctx);
+        q->coordinates        = original->coordinates;
+        q->block_centres      = original->block_centres;
+        q->block_sizes        = original->block_sizes;
+        q->energy_weights     = original->energy_weights;
+        q->descriptor_weights = original->descriptor_weights;
+        for (auto* coordinates : {&q->coordinates, &q->block_centres}) {
+            for (auto& point : *coordinates) {
+                auto r = dot(deformation, r3::vector<double>(point[0], point[1], point[2]));
+                point  = {r[0], r[1], r[2]};
+            }
+        }
+        for (size_t p = 0; p < q->coordinates.size(); p++) {
+            q->energy_weights[p] *= cell.det() / volume;
+            q->descriptor_weights[p] *= cell.det() / volume;
+        }
+        ctx->cb().external_xc_points_ = std::move(q);
+        double energy                 = evaluate(0);
+        return std::array<double, 2>{potential.energy_exc(density), energy};
+    };
+    for (double h : {1e-4, 5e-5}) {
+        std::array<double, 2> error{};
+        for (int mu = 0; mu < 3; mu++) {
+            for (int nu = 0; nu < 3; nu++) {
+                auto plus = strained_energy(mu, nu, h), minus = strained_energy(mu, nu, -h);
+                error[0] = std::max(error[0], std::abs((plus[0] - minus[0]) / (2 * h) - volume * exact(mu, nu)));
+                error[1] = std::max(error[1], std::abs((plus[1] - minus[1]) / (2 * h) - volume * total(mu, nu)));
+            }
+        }
+        // PAW projector response belongs to the nonlocal stress component;
+        // only the full tensor contains every contribution to the energy derivative.
+        if (!paw) {
+            check("spinor XC strain derivative", error[0], 2e-8);
+        }
+        check("spinor total strain derivative", error[1], 2e-6);
+    }
+    check("spinor strain test restores energy", std::abs(strained_energy(0, 0, 0)[0] - xc), 2e-12);
+    Force force(*ctx, density, potential, ks);
+    auto const& f = force.calc_forces_total(false);
+    std::array<double, 3> exact_force{f(0, 0), f(1, 0), f(2, 0)};
+    auto position         = ctx->unit_cell().atom(0).position();
+    auto displaced_energy = [&](int axis, double step) {
+        r3::vector<double> shift{0, 0, 0};
+        shift[axis] = step;
+        ctx->unit_cell().atom(0).set_position(position + dot(r3::inverse(lattice), shift));
+        ctx->update();
+        ks.update();
+        density.update();
+        potential.update();
+        auto q                = std::make_shared<xc_point_set_t>(*ctx);
+        q->coordinates        = original->coordinates;
+        q->block_centres      = original->block_centres;
+        q->block_sizes        = original->block_sizes;
+        q->energy_weights     = original->energy_weights;
+        q->descriptor_weights = original->descriptor_weights;
+        for (auto& centre : q->block_centres) {
+            centre[axis] += step;
+        }
+        ctx->cb().external_xc_points_ = std::move(q);
+        return evaluate(0);
+    };
+    for (double h : {1e-4, 5e-5}) {
+        double error{0};
+        for (int axis = 0; axis < 3; axis++) {
+            double plus = displaced_energy(axis, h), minus = displaced_energy(axis, -h);
+            error = std::max(error, std::abs((plus - minus) / (2 * h) + exact_force[axis]));
+        }
+        check("spinor total force derivative", error, 2e-8);
+    }
+    check("spinor force test restores energy", std::abs(displaced_energy(0, 0) - center), 2e-12);
+    if (soc) {
+        Hamiltonian0<double> h0(potential, false);
+        for (auto it : ks.spl_num_kpoints()) {
+            auto kp = ks.get<double>(it.i);
+            check_spinor_eigensystem(h0(*kp), *kp, check);
+        }
+    }
+    return failures;
+}
+
+int
+test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, bool nlcc, bool gpu, double charge)
+{
+    auto core = [=](Simulation_context& ctx) {
+        if (nlcc) {
+            set_test_core(ctx);
+            auto const& type = ctx.unit_cell().atom_type(0);
+            auto quadrature  = std::make_shared<xc_point_set_t>(*ctx.cb().external_xc_points_);
+            if (!quadrature->coordinates.empty()) {
+                quadrature->coordinates[1] = {1.6 + type.radial_grid(100), 2.7, 4.0};
+            }
+            ctx.cb().external_xc_points_ = std::move(quadrature);
+        }
+    };
+    auto ctx =
+            test_context(gamma, mag, false, false, parallel_fft, true, 0, paw, points, "gaussian", charge, core, gpu);
     K_point_set ks(*ctx);
     if (gamma) {
         ks.add_kpoint({0, 0, 0}, 1);
@@ -370,7 +907,7 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
             auto& psi = kp->spinor_wave_functions();
             for (int s = 0; s < ctx->num_spins(); s++) {
                 for (int ib = 0; ib < ctx->num_bands(); ib++) {
-                    kp->band_occupancy(ib, s, ib == 0 ? (mag ? (s == 0 ? 1.2 : 0.8) : 2.0) : 0);
+                    kp->band_occupancy(ib, s, ib == 0 ? (mag ? (s == 0 ? 1.2 : 0.8) : 2.0) * (1 - charge / 2) : 0);
                     for (int ig = 0; ig < kp->gkvec().count(); ig++) {
                         auto g = kp->gkvec().gvec(gvec_index_t::local(ig));
                         psi.pw_coeffs(ig, wf::spin_index(s), wf::band_index(ib)) =
@@ -391,12 +928,14 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
                energy_vloc(density, potential) + potential.energy_exc(density) + potential.ewald_energy() +
                potential.PAW_total_energy(density);
     };
-    std::vector<double> input_rho;
-    if (paw) {
+    std::vector<double> input_rho, input_tau;
+    if (paw || nlcc || charge != 0) {
         ctx->cb().external_xc_ = [&](auto const& c, auto const& in, auto& out) {
             input_rho.resize(in.num_points * in.num_spins);
+            input_tau.resize(input_rho.size());
             for (size_t i = 0; i < input_rho.size(); i++) {
                 input_rho[i] = in.rho[i];
+                input_tau[i] = in.tau[i];
             }
             test_functional(c, in, out);
         };
@@ -410,12 +949,17 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
         auto Hk = H0(*kp);
         wf::Wave_functions<double> hphi(kp->gkvec_sptr(), wf::num_mag_dims(mag), wf::num_bands(1), memory_t::host);
         for (int s = 0; s < ctx->num_spins(); s++) {
-            if (gamma) {
-                Hk.apply_h_s<double>(wf::spin_range(s), wf::band_range(0, 1), kp->spinor_wave_functions(), &hphi,
-                                     nullptr);
-            } else {
-                Hk.apply_h_s<std::complex<double>>(wf::spin_range(s), wf::band_range(0, 1), kp->spinor_wave_functions(),
-                                                   &hphi, nullptr);
+            {
+                auto psi_guard =
+                        kp->spinor_wave_functions().memory_guard(ctx->processing_unit_memory_t(), wf::copy_to::device);
+                auto hphi_guard = hphi.memory_guard(ctx->processing_unit_memory_t(), wf::copy_to::host);
+                if (gamma) {
+                    Hk.apply_h_s<double>(wf::spin_range(s), wf::band_range(0, 1), kp->spinor_wave_functions(), &hphi,
+                                         nullptr);
+                } else {
+                    Hk.apply_h_s<std::complex<double>>(wf::spin_range(s), wf::band_range(0, 1),
+                                                       kp->spinor_wave_functions(), &hphi, nullptr);
+                }
             }
             double expectation{0};
             for (int ig = 0; ig < kp->gkvec().count(); ig++) {
@@ -437,7 +981,8 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
     Test_check check(failures, ctx->comm(),
                      "gamma=" + std::to_string(gamma) + " mag=" + std::to_string(mag) +
                              " parallel FFT=" + std::to_string(parallel_fft) + " points=" + std::to_string(points) +
-                             " PAW=" + std::to_string(paw));
+                             " PAW=" + std::to_string(paw) + " NLCC=" + std::to_string(nlcc) +
+                             " GPU=" + std::to_string(gpu) + " charge=" + std::to_string(charge));
     {
         double saved_energy = potential.energy_vha();
         auto response       = potential.hartree_response(density.rho());
@@ -456,9 +1001,22 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
         check("smooth Hartree response and zero-G gauge", error, 2e-13);
         check("Hartree response preserves energy", std::abs(potential.energy_vha() - saved_energy), 0);
     }
-    if (paw) {
-        auto const& coordinates = ctx->cb().external_xc_points_->coordinates;
-        int np                  = static_cast<int>(coordinates.size());
+    if (paw || nlcc || charge != 0) {
+        std::vector<std::array<double, 3>> coordinates;
+        if (points) {
+            coordinates = ctx->cb().external_xc_points_->coordinates;
+        } else {
+            auto const& fft = ctx->spfft<double>();
+            for (int z = 0; z < fft.local_z_length(); z++) {
+                for (int y = 0; y < fft.dim_y(); y++) {
+                    for (int x = 0; x < fft.dim_x(); x++) {
+                        coordinates.push_back({8.0 * x / fft.dim_x(), 9.0 * y / fft.dim_y(),
+                                               10.0 * (z + fft.local_z_offset()) / fft.dim_z()});
+                    }
+                }
+            }
+        }
+        int np = static_cast<int>(coordinates.size());
         mdarray<double, 2> rho({np, ctx->num_spins()}), tau({np, ctx->num_spins()});
         mdarray<double, 3> gradient({np, 3, ctx->num_spins()});
         rho.zero();
@@ -470,7 +1028,7 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
         }
         // Direct orbital density is independent of the host's Fourier Q augmentation.
         for (int s = 0; s < ctx->num_spins(); s++) {
-            double occupation = mag ? (s == 0 ? 1.2 : 0.8) : 2;
+            double occupation = (mag ? (s == 0 ? 1.2 : 0.8) : 2) * (1 - charge / 2);
             for (int p = 0; p < np; p++) {
                 double ax = fourpi * points[p][0] / 8, by = twopi * points[p][1] / 9 + 0.4;
                 auto a = gamma ? std::complex<double>(std::sqrt(2.0) * std::cos(ax)) : std::polar(1.0, ax);
@@ -483,7 +1041,27 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
                 }
             }
         }
-        PAW_xc_reconstruction(density, points).add_to(rho, gradient, tau);
+        if (nlcc) {
+            Smooth_periodic_function_sampler sampler(ctx->gvec(), points);
+            auto scalar      = sampler.sample(density.kinetic_density().scalar().rg());
+            auto vector      = sampler.sample(density.kinetic_density().vector(0).rg());
+            auto const& type = ctx->unit_cell().atom_type(0);
+            double error{0};
+            if (np > 1) {
+                for (int s = 0; s < ctx->num_spins(); s++) {
+                    error          = std::max(error, std::abs(input_rho[1 + np * s] - rho(1, s) -
+                                                              type.ps_core_charge_density()[100] / ctx->num_spins()));
+                    double valence = (scalar[1][0] + (1 - 2 * s) * vector[1][0]) / 2;
+                    error          = std::max(error, std::abs(input_tau[1 + np * s] - valence -
+                                                              type.ps_core_kinetic_density()[100] / ctx->num_spins()));
+                }
+            }
+            ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
+            check("independently supplied NLCC charge and tau", error, 2e-12);
+        }
+        if (paw || nlcc) {
+            PAW_xc_reconstruction(density, points).add_to(rho, gradient, tau);
+        }
         double error{0};
         for (size_t i = 0; i < rho.size(); i++) {
             error = std::max(error, std::abs(rho[i] - input_rho[i]));
@@ -492,6 +1070,11 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
         check("physical XC charge excludes compensation", error, 2e-12);
     }
     check("total-energy double counting", std::abs(ks_energy(*ctx, ks, density, potential) - center), 2e-10);
+    if (!paw) {
+        check("kinetic-energy contraction",
+              std::abs(energy_kin(*ctx, ks, density, potential) - density.kinetic_density().scalar().integrate().total),
+              2e-10);
+    }
     double h  = 1e-4;
     double fd = (evaluate(h) - evaluate(-h)) / (2 * h);
     check("full orbital derivative", std::abs(fd - derivative), 2e-8);
@@ -646,12 +1229,28 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points = false, bo
 }
 
 int
-test_external_scf(bool exact, bool external, bool paw = false)
+test_external_nlcc()
+{
+    int failures = test_external_xc(false, 1, mpi::Communicator::world().size() > 1, true, false, true, false, 0);
+    Test_check check(failures, mpi::Communicator::world());
+    check.reject("NLCC without setup kinetic density", [] {
+        auto ctx = test_context(false, 1, false, false, false, true, 0, false, true);
+        if (ctx->comm().rank() == 0) {
+            auto& type = ctx->unit_cell().atom_type(0);
+            type.ps_core_charge_density(std::vector<double>(type.num_mt_points(), 0.02));
+        }
+        Density density(*ctx);
+    });
+    return failures;
+}
+
+int
+test_external_scf(bool exact, bool external, bool paw, bool gpu, double* total = nullptr)
 {
     bool points = external && (exact || paw);
     bool gamma  = paw && !exact;
     int mag     = paw && !exact ? 1 : 0;
-    auto ctx    = test_context(gamma, mag, true, exact, false, external, 0, paw, points);
+    auto ctx    = test_context(gamma, mag, true, exact, false, external, 0, paw, points, "gaussian", 0, {}, gpu);
     if (mag) {
         ctx->unit_cell().atom(0).set_vector_field({0, 0, 0.5});
     }
@@ -745,21 +1344,27 @@ test_external_scf(bool exact, bool external, bool paw = false)
     potential.generate(density, false, true);
     double direct = gs.energy_kin_sum_pw() + 0.5 * potential.energy_vha() + energy_vloc(density, potential) +
                     potential.energy_exc(density) + potential.ewald_energy() + potential.PAW_total_energy(density);
-    double error  = std::abs(ks_energy(*ctx, ks, density, potential) - direct);
+    double error = std::abs(ks_energy(*ctx, ks, density, potential) - direct);
+    if (total) {
+        *total = direct;
+    }
     if (ctx->comm().rank() == 0) {
         std::cout << (external ? "external XC " : "LibXC ") << (exact ? "exact" : "Davidson") << " PAW=" << paw
-                  << " SCF converged=" << converged << " direct-energy difference=" << error << '\n';
+                  << " GPU=" << gpu << " SCF converged=" << converged << " direct-energy difference=" << error << '\n';
     }
     return failures + (!converged || !std::isfinite(error) || error > 1e-7);
 }
 
 int
-test_external_geometry(bool paw, int mag, bool strain, bool gamma)
+test_external_geometry(bool paw, int mag, bool strain, bool gamma, bool nlcc, bool gpu, double charge)
 {
     auto calculate = [&](double displacement, bool get_force) {
         std::array<double, 3> direction{0.7, -0.4, 0.2};
         r3::matrix<double> deformation{{0.3, 0.1, -0.07}, {0.1, -0.2, 0.06}, {-0.07, 0.06, 0.15}};
         auto setup = [&](Simulation_context& ctx) {
+            if (nlcc) {
+                set_test_core(ctx);
+            }
             if (gamma) {
                 ctx.cfg().mixer().beta(0.2);
             }
@@ -830,7 +1435,7 @@ test_external_geometry(bool paw, int mag, bool strain, bool gamma)
             };
         };
         auto ctx = test_context(gamma, mag, true, !gamma, strain && !gamma, true, mag ? 0.6 : 0, paw, false, "gaussian",
-                                0, setup);
+                                charge, setup, gpu);
         K_point_set ks(*ctx);
         if (gamma) {
             ks.add_kpoint({0, 0, 0}, 1);
@@ -892,8 +1497,8 @@ test_external_geometry(bool paw, int mag, bool strain, bool gamma)
         double error = std::abs(fd - centre[1]);
         if (mpi::Communicator::world().rank() == 0) {
             std::cout << "External XC " << (strain ? "strain" : "force") << " PAW=" << paw << " spin=" << mag
-                      << " gamma=" << gamma << " h=" << h << " derivative=" << centre[1] << " FD=" << fd
-                      << " error=" << error << '\n';
+                      << " gamma=" << gamma << " NLCC=" << nlcc << " GPU=" << gpu << " charge=" << charge << " h=" << h
+                      << " derivative=" << centre[1] << " FD=" << fd << " error=" << error << '\n';
         }
         failures += !std::isfinite(error) || error > 2e-6;
     }
@@ -983,15 +1588,80 @@ main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
+    if (argc == 2 && (std::string(argv[1]) == "spinor" || std::string(argv[1]) == "spinor-gpu" ||
+                      std::string(argv[1]) == "spinor-paw" || std::string(argv[1]) == "spinor-paw-gpu" ||
+                      std::string(argv[1]) == "spinor-soc" || std::string(argv[1]) == "spinor-soc-gpu" ||
+                      std::string(argv[1]) == "spinor-paw-soc" || std::string(argv[1]) == "spinor-paw-soc-gpu")) {
+        std::string mode(argv[1]);
+        result += call_test("external spinor XC", test_spinor_xc, mode.find("gpu") != std::string::npos,
+                            mode.find("paw") != std::string::npos, mode.find("soc") != std::string::npos, 0);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    if (argc == 2 && std::string(argv[1]) == "gpu") {
+#if defined(SIRIUS_GPU)
+        bool parallel = mpi::Communicator::world().size() > 1;
+        result += call_test("GPU external XC", test_external_xc, true, 0, false, false, false, false, true, 0);
+        result += call_test("GPU PAW point XC", test_external_xc, false, 1, parallel, true, true, false, true, 0);
+        result += call_test("GPU NLCC point XC", test_external_xc, false, 1, false, true, false, true, true, 0);
+        result += call_test("GPU exact LibXC SCF", test_external_scf, true, false, false, true, nullptr);
+        result += call_test("CPU/GPU SCF agreement", [] {
+            int failures{0};
+            Test_check check(failures, mpi::Communicator::world());
+            for (bool paw : {false, true}) {
+                double cpu{0}, gpu{0};
+                failures += test_external_scf(false, true, paw, false, &cpu);
+                failures += test_external_scf(false, true, paw, true, &gpu);
+                check("CPU/GPU total energy PAW=" + std::to_string(paw), std::abs(cpu - gpu), 5e-8);
+            }
+            return failures;
+        });
+#else
+        result = 1;
+#endif
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    if (argc == 2 && std::string(argv[1]) == "nlcc") {
+        result += call_test("external nonlinear core correction", test_external_nlcc);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    if (argc == 2 && (std::string(argv[1]) == "charged" || std::string(argv[1]) == "charged-gpu")) {
+        bool gpu      = std::string(argv[1]) == "charged-gpu";
+        bool parallel = mpi::Communicator::world().size() > 1;
+        result += call_test("charged FFT XC", test_external_xc, true, 0, false, false, false, false, gpu, 0.25);
+        result +=
+                call_test("charged NLCC point XC", test_external_xc, false, 1, parallel, true, false, true, gpu, -0.25);
+        result += call_test("charged PAW point XC", test_external_xc, false, 1, parallel, true, true, false, gpu, 0.25);
+        result += call_test("charged spinor SOC XC", test_spinor_xc, gpu, false, true, 0.25);
+        result += call_test("charged PAW spinor SOC XC", test_spinor_xc, gpu, true, true, 0.25);
+        result += call_test("charged PW stress", test_external_geometry, false, 0, true, true, false, gpu, 0.25);
+        result += call_test("charged PAW stress", test_external_geometry, true, 1, true, false, false, gpu, -0.25);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    if (argc == 2 && (std::string(argv[1]) == "gpu-geometry" || std::string(argv[1]) == "core-geometry")) {
+        bool gpu  = std::string(argv[1]) == "gpu-geometry";
+        bool nlcc = !gpu;
+        result += call_test("external NC forces", test_external_geometry, false, 0, false, false, nlcc, gpu, 0);
+        result += call_test("external NC stress", test_external_geometry, false, 0, true, true, nlcc, gpu, 0);
+        if (gpu) {
+            result += call_test("GPU PAW forces", test_external_geometry, true, 1, false, false, false, true, 0);
+            result += call_test("GPU PAW stress", test_external_geometry, true, 1, true, false, false, true, 0);
+        }
+        sirius::finalize();
+        return std::min(result, 1);
+    }
     if (argc == 2 && std::string(argv[1]) == "forces") {
-        result += call_test("external PW forces", test_external_geometry, false, 0, false, false);
-        result += call_test("external PAW forces", test_external_geometry, true, 1, false, false);
+        result += call_test("external PW forces", test_external_geometry, false, 0, false, false, false, false, 0);
+        result += call_test("external PAW forces", test_external_geometry, true, 1, false, false, false, false, 0);
         sirius::finalize();
         return std::min(result, 1);
     }
     if (argc == 2 && std::string(argv[1]) == "stress") {
-        result += call_test("external PW stress", test_external_geometry, false, 0, true, true);
-        result += call_test("external PAW stress", test_external_geometry, true, 1, true, false);
+        result += call_test("external PW stress", test_external_geometry, false, 0, true, true, false, false, 0);
+        result += call_test("external PAW stress", test_external_geometry, true, 1, true, false, false, false, 0);
         sirius::finalize();
         return std::min(result, 1);
     }
@@ -1002,35 +1672,42 @@ main(int argc, char** argv)
     }
     for (bool gamma : {false, true}) {
         for (int mag : {0, 1}) {
-            result += call_test("external XC energy and operator", test_external_xc, gamma, mag, false, false, false);
+            result += call_test("external XC energy and operator", test_external_xc, gamma, mag, false, false, false,
+                                false, false, gamma && !mag ? 0.25 : 0);
             if (gamma != mag) {
-                result += call_test("external XC point quadrature", test_external_xc, gamma, mag, false, true, false);
+                result += call_test("external XC point quadrature", test_external_xc, gamma, mag, false, true, false,
+                                    false, false, 0);
             } else {
                 result += call_test("external PAW XC energy and operator", test_external_xc, gamma, mag, false, true,
-                                    true);
+                                    true, false, false, gamma ? -0.25 : 0);
             }
             if (mpi::Communicator::world().size() > 1 && gamma != mag) {
-                result += call_test("external XC distributed FFT", test_external_xc, gamma, mag, true, false, false);
+                result += call_test("external XC distributed FFT", test_external_xc, gamma, mag, true, false, false,
+                                    false, false, 0);
                 if (!gamma && mag == 1) {
                     result += call_test("point geometry with distributed FFT", test_external_xc, gamma, mag, true, true,
-                                        false);
+                                        false, false, false, 0);
                 }
-                result += call_test("external PAW XC distributed FFT", test_external_xc, gamma, mag, true, true, true);
+                result += call_test("external PAW XC distributed FFT", test_external_xc, gamma, mag, true, true, true,
+                                    false, false, 0);
             }
         }
     }
+    result += call_test("external nonlinear core correction", test_external_nlcc);
+    result += call_test("external spinor SOC", test_spinor_xc, false, false, true, 0);
+    result += call_test("external PAW spinor SOC", test_spinor_xc, false, true, true, 0);
     for (bool external : {false, true}) {
         for (bool exact : {false, true}) {
-            result += call_test("SCF energy accounting", test_external_scf, exact, external, false);
+            result += call_test("SCF energy accounting", test_external_scf, exact, external, false, false, nullptr);
         }
     }
     for (bool exact : {false, true}) {
-        result += call_test("PAW SCF energy accounting", test_external_scf, exact, true, true);
+        result += call_test("PAW SCF energy accounting", test_external_scf, exact, true, true, false, nullptr);
     }
-    result += call_test("external PW forces", test_external_geometry, false, 0, false, false);
-    result += call_test("external PAW forces", test_external_geometry, true, 1, false, false);
-    result += call_test("external PW stress", test_external_geometry, false, 0, true, true);
-    result += call_test("external PAW stress", test_external_geometry, true, 1, true, false);
+    result += call_test("external PW forces", test_external_geometry, false, 0, false, false, false, false, 0);
+    result += call_test("external PAW forces", test_external_geometry, true, 1, false, false, false, false, 0);
+    result += call_test("external PW stress", test_external_geometry, false, 0, true, true, false, false, 0);
+    result += call_test("external PAW stress", test_external_geometry, true, 1, true, false, false, false, 0);
     for (double moment : {2.0, -2.0, 1.2}) {
         result += call_test("fixed-spin occupations", test_occupancy, 1, "gaussian", 2.0, moment);
     }

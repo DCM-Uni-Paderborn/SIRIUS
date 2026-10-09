@@ -19,6 +19,10 @@ namespace sirius {
 void
 check_xc_potential(Density const& rho__)
 {
+    if (rho__.ctx().cb().external_xc_ && rho__.ctx().cb().external_xc_points_) {
+        check_external_xc_point_derivative(rho__);
+        return;
+    }
     Potential p0(const_cast<Simulation_context&>(rho__.ctx()));
     p0.generate(rho__, rho__.ctx().use_symmetry(), true);
 

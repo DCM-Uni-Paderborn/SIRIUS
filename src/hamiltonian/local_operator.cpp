@@ -156,39 +156,46 @@ Local_operator<T>::Local_operator(Simulation_context const& ctx__, fft::spfft_tr
 
     if (auto const* d = potential__.lapw_xc_derivatives()) {
         // First-variation scalar and magnetic components, with no second MT mask.
-        for (int j = 0; j < ctx_.num_spins(); j++) {
+        bool spinor = ctx_.num_mag_dims() == 3;
+        for (int j = 0; j < (spinor ? 4 : ctx_.num_spins()); j++) {
             vtau_vec_[j] = std::make_unique<Smooth_periodic_function<T>>(fft_coarse__, gvec_coarse_p__);
             for (int ig = 0; ig < gvec_coarse_p_->gvec().count(); ig++) {
                 int fine = ctx_.gvec().gvec_base_mapping(ig);
                 std::complex<double> v{0}, t{0};
-                for (int s = 0; s < ctx_.num_spins(); s++) {
-                    double factor = double(j == 0 ? 1 : 1 - 2 * s) / ctx_.num_spins();
-                    v += factor * d->rho[s].f_pw_local(fine);
-                    t += factor * d->tau[s].f_pw_local(fine);
+                for (int s = 0; s < (spinor ? 1 : ctx_.num_spins()); s++) {
+                    double factor = spinor ? 1.0 : double(j == 0 ? 1 : 1 - 2 * s) / ctx_.num_spins();
+                    v += factor * d->rho[spinor ? j : s].f_pw_local(fine);
+                    t += factor * d->tau[spinor ? j : s].f_pw_local(fine);
                 }
                 veff_vec_[j]->f_pw_local(ig) += static_cast<std::complex<T>>(v);
                 vtau_vec_[j]->f_pw_local(ig) = static_cast<std::complex<T>>(t);
             }
-            v0_[j]    = veff_vec_[j]->f_0().real();
-            vtau0_[j] = vtau_vec_[j]->f_0().real();
+            if (j < 2) {
+                v0_[j]    = veff_vec_[j]->f_0().real();
+                vtau0_[j] = vtau_vec_[j]->f_0().real();
+            }
             veff_vec_[j]->fft_transform(1);
             vtau_vec_[j]->fft_transform(1);
         }
     } else if (potential__.has_kinetic_potential()) {
         // Weighted adjoint of the coarse-to-fine kinetic-density Fourier map.
-        for (int s = 0; s < ctx_.num_spins(); s++) {
+        bool spinor = ctx_.num_mag_dims() == 3;
+        for (int s = 0; s < (spinor ? 4 : ctx_.num_spins()); s++) {
             vtau_vec_[s]  = std::make_unique<Smooth_periodic_function<T>>(fft_coarse__, gvec_coarse_p__);
-            auto const& t = potential__.kinetic_potential().scalar().rg();
+            auto const& t = potential__.kinetic_potential().component(spinor ? s : 0).rg();
             for (int ig = 0; ig < gvec_coarse_p_->gvec().count(); ig++) {
                 int fine = t.gvec().gvec_base_mapping(ig);
                 auto v   = t.f_pw_local(fine);
-                if (ctx_.num_spins() == 2) {
+                if (!spinor && ctx_.num_spins() == 2) {
                     v += double(1 - 2 * s) * potential__.kinetic_potential().vector(0).rg().f_pw_local(fine);
                 }
                 vtau_vec_[s]->f_pw_local(ig) = static_cast<std::complex<T>>(v);
             }
-            vtau0_[s] = vtau_vec_[s]->f_0().real();
             vtau_vec_[s]->fft_transform(1);
+        }
+        for (int s = 0; s < ctx_.num_spins(); s++) {
+            vtau0_[s] = spinor ? (vtau_vec_[0]->f_0() + T(1 - 2 * s) * vtau_vec_[1]->f_0()).real()
+                               : vtau_vec_[s]->f_0().real();
         }
     }
 
@@ -439,6 +446,9 @@ Local_operator<T>::apply_h(fft::spfft_transform_type<T>& spfftk__, std::shared_p
 
     std::unique_ptr<wf::Kinetic_density_operator<T>> tau_op;
     if (vtau_vec_[0]) {
+        if (ctx_.num_mag_dims() == 3 && spins__.size() != 2) {
+            RTE_THROW("spinor kinetic potential requires both spin components");
+        }
         tau_op = std::make_unique<wf::Kinetic_density_operator<T>>(spfftk__, *gkvec_fft__);
     }
     PROFILE_START("sirius::Local_operator::apply_h|bands");
@@ -512,11 +522,37 @@ Local_operator<T>::apply_h(fft::spfft_transform_type<T>& spfftk__, std::shared_p
             vphi_to_G();
             /* add kinetic energy */
             add_to_hphi(spins__.begin().get(), wf::band_index(i));
-            if (tau_op) {
+        }
+    }
+    if (tau_op) {
+        // Stage each band block once. The ordinary GPU Hamiltonian has already updated hphi.
+        for (auto s = spins__.begin(); s != spins__.end(); s++) {
+            if (phi_fft[s.get()].on_device()) {
+                phi_fft[s.get()].copy_to(memory_t::host);
+            }
+            if (hphi_fft[s.get()].on_device()) {
+                hphi_fft[s.get()].copy_to(memory_t::host);
+            }
+        }
+        for (int i = 0; i < spl_num_wf.local_size(); i++) {
+            if (ctx_.num_mag_dims() == 3) {
+                tau_op->add_spinor_potential(
+                        {vtau_vec_[0]->values().at(memory_t::host), vtau_vec_[1]->values().at(memory_t::host),
+                         vtau_vec_[2]->values().at(memory_t::host), vtau_vec_[3]->values().at(memory_t::host)},
+                        {phi_fft[0].at(memory_t::host, 0, wf::band_index(i)),
+                         phi_fft[1].at(memory_t::host, 0, wf::band_index(i))},
+                        {hphi_fft[0].at(memory_t::host, 0, wf::band_index(i)),
+                         hphi_fft[1].at(memory_t::host, 0, wf::band_index(i))});
+            } else {
                 int s = spins__.begin().get();
                 tau_op->add_potential(vtau_vec_[s]->values().at(memory_t::host),
                                       phi_fft[s].at(memory_t::host, 0, wf::band_index(i)),
                                       hphi_fft[s].at(memory_t::host, 0, wf::band_index(i)));
+            }
+        }
+        for (auto s = spins__.begin(); s != spins__.end(); s++) {
+            if (hphi_fft[s.get()].on_device()) {
+                hphi_fft[s.get()].copy_to(memory_t::device);
             }
         }
     }
@@ -530,7 +566,7 @@ void
 Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::shared_ptr<fft::Gvec_fft> gkvec_fft__,
                                 wf::band_range b__, wf::Wave_functions<T>& phi__, wf::Wave_functions<T>* hphi__,
                                 wf::Wave_functions<T>* ophi__, wf::Wave_functions<T>* bzphi__,
-                                wf::Wave_functions<T>* bxyphi__)
+                                wf::Wave_functions<T>* bxyphi__, bool conjugate_bxy__)
 {
     PROFILE("sirius::Local_operator::apply_h_o");
 
@@ -630,11 +666,11 @@ Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::sha
         }
 
         if (bxyphi__) {
-            mul_by_veff(spfftk__, reinterpret_cast<T*>(phi_r), veff_vec_, 2, spfft_buf);
+            mul_by_veff(spfftk__, reinterpret_cast<T*>(phi_r), veff_vec_, conjugate_bxy__ ? 3 : 2, spfft_buf);
 
             auto mem = wf_fft[3].on_device() ? memory_t::device : memory_t::host;
 
-            /* phi(r) * (Bx(r) - iBy(r)) -> bxyphi(G) */
+            /* phi(r) * (Bx(r) -/+ iBy(r)) -> bxyphi(G) */
             spfftk__.forward(spfft_pu, wf_fft[3].pw_coeffs_spfft(mem, wf::band_index(j)), SPFFT_FULL_SCALING);
         }
 
@@ -694,7 +730,18 @@ Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::sha
                 }
             } // x
         }
-        if (kinetic) {
+    }
+    if (kinetic) {
+        // Stage the completed GPU operators once, then add tau through host-buffer SpFFT transforms.
+        if (phi_fft.on_device()) {
+            phi_fft.copy_to(memory_t::host);
+        }
+        for (int i : {0, 2, 3}) {
+            if (wf_fft[i].on_device()) {
+                wf_fft[i].copy_to(memory_t::host);
+            }
+        }
+        for (int j = 0; j < spl_num_wf.local_size(); j++) {
             auto const* phi = phi_fft.at(memory_t::host, 0, wf::band_index(j));
             if (hphi__) {
                 kinetic->add_potential(vtau_vec_[0]->values().at(memory_t::host), phi,
@@ -703,6 +750,17 @@ Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::sha
             if (bzphi__ && vtau_vec_[1]) {
                 kinetic->add_potential(vtau_vec_[1]->values().at(memory_t::host), phi,
                                        wf_fft[2].at(memory_t::host, 0, wf::band_index(j)));
+            }
+            if (bxyphi__ && vtau_vec_[2] && vtau_vec_[3]) {
+                auto out = wf_fft[3].at(memory_t::host, 0, wf::band_index(j));
+                kinetic->add_potential(vtau_vec_[2]->values().at(memory_t::host), phi, out);
+                kinetic->add_potential(vtau_vec_[3]->values().at(memory_t::host), phi, out,
+                                       std::complex<T>(0, conjugate_bxy__ ? 1 : -1));
+            }
+        }
+        for (int i : {0, 2, 3}) {
+            if (wf_fft[i].on_device()) {
+                wf_fft[i].copy_to(memory_t::device);
             }
         }
     }

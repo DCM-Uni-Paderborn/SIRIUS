@@ -72,7 +72,13 @@ set_tests_properties(test_paw_xc_correction_h_setup PROPERTIES
 
 set_tests_properties(test_kinetic_density test_spheric_kinetic_density test_spheric_interpolation test_smooth_periodic_sampling test_paw_xc_correction test_lapw_xc_field_map test_lapw_external_xc test_core_kinetic_density test_external_xc PROPERTIES
   TIMEOUT 60 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
-set_tests_properties(test_lapw_external_xc PROPERTIES TIMEOUT 120)
+add_test(NAME test_lapw_external_xc_dirac COMMAND test_lapw_external_xc dirac-response)
+set_tests_properties(test_lapw_external_xc test_lapw_external_xc_dirac PROPERTIES TIMEOUT 120)
+set_tests_properties(test_lapw_external_xc_dirac PROPERTIES
+  ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+add_test(NAME test_lapw_relativistic_basis COMMAND test_lapw_external_xc relativistic-basis)
+set_tests_properties(test_lapw_relativistic_basis PROPERTIES
+  TIMEOUT 120 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 add_test(NAME test_lapw_external_xc_force COMMAND test_lapw_external_xc force-response)
 set_tests_properties(test_lapw_external_xc_force PROPERTIES
   TIMEOUT 600 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
@@ -91,6 +97,7 @@ if(MPIEXEC_EXECUTABLE)
     add_mpi_unit_test(${name}_mpi ${name} 60)
   endforeach()
   set_tests_properties(test_lapw_external_xc_mpi PROPERTIES TIMEOUT 120)
+  add_mpi_unit_test(test_lapw_external_xc_dirac_mpi test_lapw_external_xc 180 dirac-response)
 endif()
 
 if(SIRIUS_CREATE_FORTRAN_BINDINGS)

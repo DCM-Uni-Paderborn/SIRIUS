@@ -526,7 +526,7 @@ K_point_set::find_band_occupancies()
     /* set band occupancies */
     auto f = smearing::occupancy(ctx_.smearing(), ctx_.smearing_width());
     for (auto it : spl_num_kpoints_) {
-        for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+        for (int ispn = 0; ispn < ctx_.num_spinors(); ispn++) {
             #pragma omp parallel for
             for (int j = 0; j < ctx_.num_bands(); j++) {
                 auto o = f(this->energy_fermi_[ispn] - this->get<T>(it.i)->band_energy(j, ispn)) * ctx_.max_occupancy();
@@ -541,7 +541,7 @@ K_point_set::find_band_occupancies()
     band_gap_ = 0.0;
 
     int nve = static_cast<int>(ne_target + 1e-12);
-    if (ctx_.num_spins() == 2 || (std::abs(nve - ne_target) < 1e-12 && nve % 2 == 0)) {
+    if (ctx_.max_occupancy() == 1 || (std::abs(nve - ne_target) < 1e-12 && nve % 2 == 0)) {
         /* find band gap */
         std::vector<std::pair<double, double>> eband(ctx_.num_bands() * ctx_.num_spinors());
 
@@ -564,11 +564,9 @@ K_point_set::find_band_occupancies()
         std::sort(eband.begin(), eband.end());
 
         int ist = nve;
-        if (ctx_.num_spins() == 1) {
-            ist /= 2;
-        }
+        ist /= ctx_.max_occupancy();
 
-        if (eband[ist].first > eband[ist - 1].second) {
+        if (ist > 0 && ist < static_cast<int>(eband.size()) && eband[ist].first > eband[ist - 1].second) {
             band_gap_ = eband[ist].first - eband[ist - 1].second;
         }
     }
@@ -578,7 +576,7 @@ K_point_set::find_band_occupancies()
 K_point_set::occupation_response_t
 K_point_set::band_occupation_response(std::vector<mdarray<double, 2>> const& energy_directions__) const
 {
-    int ns = ctx_.num_spins(), nb = ctx_.num_bands();
+    int ns = ctx_.num_spinors(), nb = ctx_.num_bands();
     double ne       = ctx_.unit_cell().num_valence_electrons() - ctx_.cfg().parameters().extra_charge();
     bool fixed_spin = ns == 2 && std::abs(ctx_.cfg().parameters().fixed_mag()) > 1e-10;
     bool filled     = ns == 1 && std::abs(nb * ctx_.max_occupancy() - ne) < 1e-10;
@@ -587,7 +585,7 @@ K_point_set::band_occupation_response(std::vector<mdarray<double, 2>> const& ene
     if (fixed_spin) {
         target = {(ne + ctx_.cfg().parameters().fixed_mag()) / 2, (ne - ctx_.cfg().parameters().fixed_mag()) / 2};
     }
-    int invalid = !initialized_ || ctx_.num_mag_dims() == 3 || ctx_.cfg().parameters().precision_wf() != "fp64" ||
+    int invalid = !initialized_ || ctx_.cfg().parameters().precision_wf() != "fp64" ||
                   static_cast<bool>(ctx_.band_occ_callback()) || !std::isfinite(ne) || ne < 0 ||
                   (!filled && ne > nb * ns * ctx_.max_occupancy()) ||
                   energy_directions__.size() != spl_num_kpoints_.local_size() ||
@@ -622,10 +620,18 @@ K_point_set::band_occupation_response(std::vector<mdarray<double, 2>> const& ene
     }
     ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
     if (invalid) {
-        RTE_THROW("occupation response requires initialized scalar/collinear fp64 bands and finite energy directions");
+        RTE_THROW("occupation response requires initialized fp64 bands and finite energy directions");
     }
     auto f  = smearing::occupancy(ctx_.smearing(), ctx_.smearing_width());
     auto df = smearing::delta(ctx_.smearing(), ctx_.smearing_width());
+    // Center the weighted reduction so a common potential shift is retained exactly.
+    double origin = std::numeric_limits<double>::infinity();
+    for (auto const& direction : energy_directions__) {
+        for (double value : direction) {
+            origin = std::min(origin, value);
+        }
+    }
+    ctx_.comm().allreduce<double, mpi::op_t::min>(&origin, 1);
     occupation_response_t result;
     result.fermi.fill(0);
     std::array<double, 8> sums{};
@@ -652,7 +658,7 @@ K_point_set::band_occupation_response(std::vector<mdarray<double, 2>> const& ene
                 invalid |= !std::isfinite(slopes(b, s)) ||
                            std::abs(expected - kp.band_occupancy(b, s)) > 1e-11 * ctx_.max_occupancy();
                 sums[channel] += weight * slopes(b, s);
-                sums[2 + channel] += weight * slopes(b, s) * d(b, s);
+                sums[2 + channel] += weight * slopes(b, s) * (d(b, s) - origin);
                 sums[4 + channel] += weight * std::abs(slopes(b, s));
                 sums[6 + channel] += weight * kp.band_occupancy(b, s);
             }
@@ -669,7 +675,7 @@ K_point_set::band_occupation_response(std::vector<mdarray<double, 2>> const& ene
         }
         if (sums[4 + channel] != 0) {
             invalid |= std::abs(sums[channel]) <= 64 * std::numeric_limits<double>::epsilon() * sums[4 + channel];
-            result.fermi[channel] = sums[2 + channel] / sums[channel];
+            result.fermi[channel] = origin + sums[2 + channel] / sums[channel];
             invalid |= !std::isfinite(result.fermi[channel]);
         }
     }
