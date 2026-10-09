@@ -4140,7 +4140,7 @@ test_lapw_cell_response(int mag, bool core, bool spin_orbit, std::string device,
     bool dirac        = relativity == "dirac";
     bool spinor       = mag == 3 && !dirac;
     bool forces       = mag == 3 || relativity != "none";
-    int radial_points = core && core_relativity == "dirac" ? 321 : 0;
+    int radial_points = core && core_relativity != "none" ? 321 : 0;
     auto calculate    = [&](double step, int component, bool differentiate) {
         r3::matrix<double> strain;
         if (component == 0) {
