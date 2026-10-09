@@ -69,10 +69,8 @@ xc_point_set_t::validate(Simulation_context const& ctx__) const
     }
 }
 
-namespace {
-
 std::array<std::vector<Smooth_periodic_function<double>>, 2>
-external_smooth_fields(Simulation_context const& ctx, Density const& density)
+external_xc_smooth_fields(Simulation_context const& ctx, Density const& density)
 {
     mdarray<std::complex<double>, 2> augmentation;
     if (ctx.unit_cell().num_paw_atoms()) {
@@ -115,6 +113,8 @@ external_smooth_fields(Simulation_context const& ctx, Density const& density)
     }
     return fields;
 }
+
+namespace {
 
 void
 evaluate_external_xc(Simulation_context const& ctx, xc_callback_input_t const& input, xc_callback_output_t& output)
@@ -350,7 +350,7 @@ check_external_xc_point_derivative(Density const& density__)
     for (auto const& r : q.coordinates) {
         points.emplace_back(r[0], r[1], r[2]);
     }
-    auto smooth = external_smooth_fields(ctx, density__);
+    auto smooth = external_xc_smooth_fields(ctx, density__);
     auto fields = ctx.full_potential() ? LAPW_xc_field_map(density__, points).sample(smooth[0], smooth[1])
                                        : PAW_xc_field_map(density__, points).sample(smooth[0], smooth[1]);
     int nr = static_cast<int>(points.size()), ns = ctx.num_mag_dims() + 1;
@@ -416,7 +416,7 @@ Potential::xc_external_points(Density const& density__)
     }
     int nr      = static_cast<int>(points.size());
     int ns      = ctx_.num_mag_dims() + 1;
-    auto smooth = external_smooth_fields(ctx_, density__);
+    auto smooth = external_xc_smooth_fields(ctx_, density__);
     auto& rho   = smooth[0];
     auto& tau   = smooth[1];
     xc_point_fields_t derivatives(nr, ns);
@@ -560,8 +560,8 @@ Potential::lapw_external_xc_response(Density const& density__, Density const& de
         points.emplace_back(r[0], r[1], r[2]);
     }
     LAPW_xc_field_map map(density__, points), direction_map(density_response__, points);
-    auto smooth           = external_smooth_fields(ctx_, density__);
-    auto smooth_direction = external_smooth_fields(ctx_, density_response__);
+    auto smooth           = external_xc_smooth_fields(ctx_, density__);
+    auto smooth_direction = external_xc_smooth_fields(ctx_, density_response__);
     auto fields           = map.sample(smooth[0], smooth[1]);
     auto direction        = direction_map.sample(smooth_direction[0], smooth_direction[1]);
     int nf                = ctx_.num_mag_dims() + 1;
@@ -684,7 +684,7 @@ Potential::lapw_external_xc_geometry_response(Density const& density__,
         point_directions.emplace_back(r[0], r[1], r[2]);
     }
     LAPW_xc_field_map map(density__, points);
-    auto smooth = external_smooth_fields(ctx_, density__);
+    auto smooth = external_xc_smooth_fields(ctx_, density__);
     auto fields = map.sample(smooth[0], smooth[1]);
     auto direction =
             map.geometry_response(smooth[0], smooth[1], point_directions, atom_directions__, lattice_direction__);
@@ -758,188 +758,6 @@ Potential::lapw_external_xc_geometry_response(Density const& density__,
     return result;
 }
 
-std::array<double, 2>
-Potential::check_external_xc_point_hessian(Density const& density__, double step__) const
-{
-    int invalid = !ctx_.full_potential() || !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_geometry_ ||
-                  !ctx_.cb().external_xc_geometry_response_ || &density__.ctx() != &ctx_ ||
-                  !density__.has_kinetic_density() || !std::isfinite(step__) || step__ <= 0;
-    double hmin = step__, hmax = step__;
-    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
-    ctx_.comm().allreduce<double, mpi::op_t::min>(&hmin, 1);
-    ctx_.comm().allreduce<double, mpi::op_t::max>(&hmax, 1);
-    if (invalid || hmin != hmax) {
-        RTE_THROW("point Hessian check requires matching LAPW fields, joint callbacks and a common positive step");
-    }
-    validate_external_xc_context(ctx_);
-    auto const& q = *ctx_.cb().external_xc_points_;
-    int nr = static_cast<int>(q.coordinates.size()), ns = ctx_.num_mag_dims() + 1;
-    std::vector<r3::vector<double>> points;
-    for (auto const& r : q.coordinates) {
-        points.emplace_back(r[0], r[1], r[2]);
-    }
-    LAPW_xc_field_map map(density__, points);
-    auto smooth = external_smooth_fields(ctx_, density__);
-    auto fields = map.sample(smooth[0], smooth[1]);
-    xc_point_fields_t direction(nr, ns), response(nr, ns), plus(nr, ns), minus(nr, ns), shifted(nr, ns);
-    xc_point_derivatives_t geometry(q), hgeometry(q), pgeometry(q), mgeometry(q);
-    for (size_t i = 0; i < fields.rho.size(); i++) {
-        direction.rho[i] = 0.07 * fields.rho[i];
-        direction.tau[i] = -0.11 * fields.tau[i];
-    }
-    for (size_t i = 0; i < fields.gradient.size(); i++) {
-        direction.gradient[i] = 0.03 * fields.gradient[i];
-    }
-    for (int i = 0; i < nr; i++) {
-        geometry.energy_weights[i]     = 0.02 * q.energy_weights[i];
-        geometry.descriptor_weights[i] = 0.03 * q.descriptor_weights[i] * std::cos(0.31 * i);
-        for (int x = 0; x < 3; x++) {
-            geometry.coordinates[i][x] = 0.04 * std::sin(0.23 * (i + x + 1));
-        }
-    }
-    for (size_t i = 0; i < q.block_centres.size(); i++) {
-        for (int x = 0; x < 3; x++) {
-            geometry.block_centres[i][x] = 0.03 * std::cos(0.17 * (i + x + 1));
-        }
-    }
-    if (ctx_.cb().external_xc_quadrature_direction_) {
-        xc_geometry_direction_t host(ctx_.unit_cell().num_atoms());
-        for (size_t ia = 0; ia < host.atoms.size(); ia++) {
-            for (int x = 0; x < 3; x++) {
-                host.atoms[ia][x] = 0.04 * std::sin(0.23 * (ia + x + 1));
-            }
-        }
-        for (size_t i = 0; i < host.lattice.size(); i++) {
-            host.lattice[i] = 0.02 * std::cos(0.17 * (i + 1));
-        }
-        // Keep independent point variations as well, to resolve symmetry-cancelled Hessian blocks.
-        auto tangent = external_xc_quadrature_direction(host);
-        for (int p = 0; p < nr; p++) {
-            geometry.energy_weights[p] += tangent.energy_weights[p];
-            geometry.descriptor_weights[p] += tangent.descriptor_weights[p];
-            for (int x = 0; x < 3; x++) {
-                geometry.coordinates[p][x] += tangent.coordinates[p][x];
-            }
-        }
-        for (size_t b = 0; b < q.block_centres.size(); b++) {
-            for (int x = 0; x < 3; x++) {
-                geometry.block_centres[b][x] += tangent.block_centres[b][x];
-            }
-        }
-    }
-    response.rho.zero();
-    response.gradient.zero();
-    response.tau.zero();
-    xc_callback_input_t input{
-            nr, ns, 0, fields.rho.at(memory_t::host), fields.gradient.at(memory_t::host), fields.tau.at(memory_t::host),
-            &q};
-    xc_callback_direction_t d{direction.rho.at(memory_t::host), direction.gradient.at(memory_t::host),
-                              direction.tau.at(memory_t::host), &geometry};
-    xc_callback_response_t out{response.rho.at(memory_t::host), response.gradient.at(memory_t::host),
-                               response.tau.at(memory_t::host), &hgeometry};
-    external_xc_point_response(input, d, out);
-    std::array<double, 2> result{};
-    std::vector<double> previous;
-    for (int k = 0; k < 3; k++) {
-        double h      = std::ldexp(step__, -k);
-        auto evaluate = [&](double sign, xc_point_fields_t& f, xc_point_derivatives_t& g) {
-            auto displaced = q;
-            for (int i = 0; i < nr; i++) {
-                displaced.energy_weights[i] += sign * h * geometry.energy_weights[i];
-                displaced.descriptor_weights[i] += sign * h * geometry.descriptor_weights[i];
-                for (int x = 0; x < 3; x++) {
-                    displaced.coordinates[i][x] += sign * h * geometry.coordinates[i][x];
-                }
-            }
-            for (size_t i = 0; i < q.block_centres.size(); i++) {
-                for (int x = 0; x < 3; x++) {
-                    displaced.block_centres[i][x] += sign * h * geometry.block_centres[i][x];
-                }
-            }
-            for (size_t i = 0; i < fields.rho.size(); i++) {
-                shifted.rho[i] = fields.rho[i] + sign * h * direction.rho[i];
-                shifted.tau[i] = fields.tau[i] + sign * h * direction.tau[i];
-            }
-            for (size_t i = 0; i < fields.gradient.size(); i++) {
-                shifted.gradient[i] = fields.gradient[i] + sign * h * direction.gradient[i];
-            }
-            f.rho.zero();
-            f.gradient.zero();
-            f.tau.zero();
-            g = xc_point_derivatives_t(q);
-            xc_callback_input_t base{nr,
-                                     ns,
-                                     0,
-                                     shifted.rho.at(memory_t::host),
-                                     shifted.gradient.at(memory_t::host),
-                                     shifted.tau.at(memory_t::host),
-                                     &displaced};
-            xc_callback_output_t v{0, f.rho.at(memory_t::host), f.gradient.at(memory_t::host), f.tau.at(memory_t::host),
-                                   &g};
-            int failed{0};
-            try {
-                ctx_.cb().external_xc_geometry_(ctx_, base, v);
-            } catch (std::exception const&) {
-                failed = 1;
-            }
-            ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
-            if (failed) {
-                RTE_THROW("XC geometry callback failed during point Hessian check");
-            }
-        };
-        evaluate(1, plus, pgeometry);
-        evaluate(-1, minus, mgeometry);
-        size_t cursor{0};
-        auto compare = [&](char const* label, auto const& r, auto const& p, auto const& m) {
-            double error{0}, peak{0};
-            for (size_t i = 0; i < r.size(); i++) {
-                auto fd = (p[i] - m[i]) / (2 * h);
-                // The h and h/2 stencils give a fourth-order response check.
-                auto e = k ? std::abs(r[i] - (4 * fd - previous[cursor]) / 3) : 0;
-                if (k) {
-                    previous[cursor] = fd;
-                } else {
-                    previous.push_back(fd);
-                }
-                cursor++;
-                if (!std::isfinite(e) || !std::isfinite(r[i])) {
-                    error = std::numeric_limits<double>::infinity();
-                } else {
-                    error = std::max(error, e);
-                    peak  = std::max(peak, std::abs(r[i]));
-                }
-            }
-            ctx_.comm().allreduce<double, mpi::op_t::max>(&error, 1);
-            ctx_.comm().allreduce<double, mpi::op_t::max>(&peak, 1);
-            if (k) {
-                result[k - 1] = std::max(result[k - 1], error / std::max(1e-12, peak));
-                if (ctx_.verbosity() >= 2 && ctx_.comm().rank() == 0) {
-                    ctx_.out() << "Point Hessian " << label << " h=" << h << " error=" << error << " peak=" << peak
-                               << '\n';
-                }
-            }
-        };
-        compare("rho", response.rho, plus.rho, minus.rho);
-        compare("gradient", response.gradient, plus.gradient, minus.gradient);
-        compare("tau", response.tau, plus.tau, minus.tau);
-        compare("energy weights", hgeometry.energy_weights, pgeometry.energy_weights, mgeometry.energy_weights);
-        compare("descriptor weights", hgeometry.descriptor_weights, pgeometry.descriptor_weights,
-                mgeometry.descriptor_weights);
-        auto flatten = [](auto const& v) {
-            std::vector<double> result;
-            for (auto const& r : v) {
-                result.insert(result.end(), r.begin(), r.end());
-            }
-            return result;
-        };
-        compare("coordinates", flatten(hgeometry.coordinates), flatten(pgeometry.coordinates),
-                flatten(mgeometry.coordinates));
-        compare("centres", flatten(hgeometry.block_centres), flatten(pgeometry.block_centres),
-                flatten(mgeometry.block_centres));
-    }
-    return result;
-}
-
 xc_geometry_derivatives_t
 Potential::external_xc_geometry(Density const& density__) const
 {
@@ -956,7 +774,7 @@ Potential::external_xc_geometry(Density const& density__) const
     for (auto const& r : quadrature.coordinates) {
         points.emplace_back(r[0], r[1], r[2]);
     }
-    auto smooth = external_smooth_fields(ctx_, density__);
+    auto smooth = external_xc_smooth_fields(ctx_, density__);
     xc_point_derivatives_t geometry(quadrature);
     auto evaluate = [&](auto const& map) {
         auto fields = map.sample(smooth[0], smooth[1]);

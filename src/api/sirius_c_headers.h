@@ -924,59 +924,6 @@ void
 sirius_check_scf_density(void* const* gs_handler__, int* error_code__);
 
 /*
-sirius_check_external_xc_derivative:
-  doc: Check the external XC orbital derivative at fixed geometry and occupations, restoring the input state.
-  arguments:
-    gs_handler:
-      type: gs_handler
-      attr: in, required
-      doc: Initialized ground-state handler with fp64 NC, PAW or FP-LAPW orbitals on CPU/GPU and an external XC evaluator. Spinors require four-component point-XC registration. FP-LAPW supports scalar-relativistic or native Dirac radial functions, with SOC in NR/ZORA second variation.
-    step:
-      type: double
-      attr: in, required
-      doc: Positive phase-rotation step, identical on all context ranks.
-    derivatives:
-      type: double
-      attr: out, required, dimension(3, 2)
-      doc: Hamiltonian derivative and central differences at step and step/2 for two orbital rotations. LAPW tests PW/AW and LO coefficients separately at fixed radial basis and core states.
-    error_code:
-      type: int
-      attr: out, optional
-      doc: Error code.
-*/
-void
-sirius_check_external_xc_derivative(void* const* gs_handler__, double const* step__, double* derivatives__,
-                                    int* error_code__);
-
-/*
-sirius_check_external_xc_response:
-  doc: >-
-    Check the external LAPW XC response without changing the ground state.
-    With joint Hessian and point-geometry callbacks, also check the seven independent point-input
-    covectors under simultaneous field and quadrature variations. This does not
-    check the complete host force or stress response.
-  arguments:
-    gs_handler:
-      type: gs_handler
-      attr: in, required
-      doc: Ground-state handler with a point XC response callback.
-    step:
-      type: double
-      attr: in, required
-      doc: Positive field-variation step, identical on all context ranks.
-    errors:
-      type: double
-      attr: out, required, dimension(2)
-      doc: Relative maximum XC, spherical-potential and enabled point-input response errors using fourth-order stencils at step and step/2.
-    error_code:
-      type: int
-      attr: out, optional
-      doc: Error code.
-*/
-void
-sirius_check_external_xc_response(void* const* gs_handler__, double const* step__, double* errors__, int* error_code__);
-
-/*
 sirius_update_ground_state:
   doc: Update a ground state object after change of atomic coordinates or lattice vectors.
   arguments:

@@ -5,6 +5,7 @@
 
 #include <sirius.hpp>
 #include <testing.hpp>
+#include "xc_derivative_checks.hpp"
 #include "dft/dft_ground_state.hpp"
 
 using namespace sirius;
@@ -151,7 +152,7 @@ test_lapw_meta(int mag, bool distributed, bool second, bool core, bool scf)
                 kinetic + potential.energy_exc(density) + 0.5 * potential.energy_vha() + energy_enuc(*ctx, potential);
         check("kinetic-energy identity", std::abs(kinetic - energy_kin(*ctx, ks, density, potential)), 2e-7);
         check("total-energy identity", std::abs(direct - ks_energy(*ctx, ks, density, potential)), 2e-7);
-        for (auto const& d : gs.check_lapw_xc_derivative(1e-4)) {
+        for (auto const& d : testing::check_lapw_xc_derivative(gs, 1e-4)) {
             check("PW/LO orbital derivative at h", std::abs(d[0] - d[1]), 2e-7);
             check("PW/LO orbital derivative at h/2", std::abs(d[0] - d[2]), 2e-7);
         }

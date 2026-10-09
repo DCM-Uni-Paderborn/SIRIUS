@@ -51,6 +51,14 @@ end interface
 
 contains
 
+!> Borrow the C API handle. It remains owned by the ground-state wrapper.
+function sirius_get_ground_state_handle(handler) result(res)
+    implicit none
+    type(sirius_ground_state_handler), intent(in) :: handler
+    type(C_PTR) :: res
+    res = handler%handler_ptr_
+end function sirius_get_ground_state_handle
+
 !> Internal function that adds trailing null character to the string to make it C-style.
 function string_f2c(f_string) result(res)
     implicit none
@@ -1965,93 +1973,6 @@ error_code_ptr = C_LOC(error_code)
 endif
 call sirius_check_scf_density_aux(gs_handler_ptr,error_code_ptr)
 end subroutine sirius_check_scf_density
-
-!
-!> @brief Check the external XC orbital derivative at fixed geometry and occupations, restoring the input state.
-!> @param [in] gs_handler Initialized ground-state handler with fp64 NC, PAW or FP-LAPW orbitals on CPU/GPU and an external XC evaluator. Spinors require four-component point-XC registration. FP-LAPW supports scalar-relativistic or native Dirac radial functions, with SOC in NR/ZORA second variation.
-!> @param [in] step Positive phase-rotation step, identical on all context ranks.
-!> @param [out] derivatives Hamiltonian derivative and central differences at step and step/2 for two orbital rotations. LAPW tests PW/AW and LO coefficients separately at fixed radial basis and core states.
-!> @param [out] error_code Error code.
-subroutine sirius_check_external_xc_derivative(gs_handler,step,derivatives,error_code)
-implicit none
-!
-type(sirius_ground_state_handler), target, intent(in) :: gs_handler
-real(8), target, intent(in) :: step
-real(8), target, intent(out) :: derivatives(3, 2)
-integer, optional, target, intent(out) :: error_code
-!
-type(C_PTR) :: gs_handler_ptr
-type(C_PTR) :: step_ptr
-type(C_PTR) :: derivatives_ptr
-type(C_PTR) :: error_code_ptr
-!
-interface
-subroutine sirius_check_external_xc_derivative_aux(gs_handler,step,derivatives,error_code)&
-&bind(C, name="sirius_check_external_xc_derivative")
-use, intrinsic :: ISO_C_BINDING
-type(C_PTR), value :: gs_handler
-type(C_PTR), value :: step
-type(C_PTR), value :: derivatives
-type(C_PTR), value :: error_code
-end subroutine
-end interface
-!
-gs_handler_ptr = C_NULL_PTR
-gs_handler_ptr = C_LOC(gs_handler%handler_ptr_)
-step_ptr = C_NULL_PTR
-step_ptr = C_LOC(step)
-derivatives_ptr = C_NULL_PTR
-derivatives_ptr = C_LOC(derivatives)
-error_code_ptr = C_NULL_PTR
-if (present(error_code)) then
-error_code_ptr = C_LOC(error_code)
-endif
-call sirius_check_external_xc_derivative_aux(gs_handler_ptr,step_ptr,derivatives_ptr,&
-&error_code_ptr)
-end subroutine sirius_check_external_xc_derivative
-
-!
-!> @brief Check the external LAPW XC response without changing the ground state. With joint Hessian and point-geometry callbacks, also check the seven independent point-input covectors under simultaneous field and quadrature variations. This does not check the complete host force or stress response.
-!> @param [in] gs_handler Ground-state handler with a point XC response callback.
-!> @param [in] step Positive field-variation step, identical on all context ranks.
-!> @param [out] errors Relative maximum XC, spherical-potential and enabled point-input response errors using fourth-order stencils at step and step/2.
-!> @param [out] error_code Error code.
-subroutine sirius_check_external_xc_response(gs_handler,step,errors,error_code)
-implicit none
-!
-type(sirius_ground_state_handler), target, intent(in) :: gs_handler
-real(8), target, intent(in) :: step
-real(8), target, intent(out) :: errors(2)
-integer, optional, target, intent(out) :: error_code
-!
-type(C_PTR) :: gs_handler_ptr
-type(C_PTR) :: step_ptr
-type(C_PTR) :: errors_ptr
-type(C_PTR) :: error_code_ptr
-!
-interface
-subroutine sirius_check_external_xc_response_aux(gs_handler,step,errors,error_code)&
-&bind(C, name="sirius_check_external_xc_response")
-use, intrinsic :: ISO_C_BINDING
-type(C_PTR), value :: gs_handler
-type(C_PTR), value :: step
-type(C_PTR), value :: errors
-type(C_PTR), value :: error_code
-end subroutine
-end interface
-!
-gs_handler_ptr = C_NULL_PTR
-gs_handler_ptr = C_LOC(gs_handler%handler_ptr_)
-step_ptr = C_NULL_PTR
-step_ptr = C_LOC(step)
-errors_ptr = C_NULL_PTR
-errors_ptr = C_LOC(errors)
-error_code_ptr = C_NULL_PTR
-if (present(error_code)) then
-error_code_ptr = C_LOC(error_code)
-endif
-call sirius_check_external_xc_response_aux(gs_handler_ptr,step_ptr,errors_ptr,error_code_ptr)
-end subroutine sirius_check_external_xc_response
 
 !
 !> @brief Update a ground state object after change of atomic coordinates or lattice vectors.

@@ -426,6 +426,14 @@ end interface
 
 contains
 
+!> Borrow the C API handle. It remains owned by the ground-state wrapper.
+function sirius_get_ground_state_handle(handler) result(res)
+    implicit none
+    type(sirius_ground_state_handler), intent(in) :: handler
+    type(C_PTR) :: res
+    res = handler%handler_ptr_
+end function sirius_get_ground_state_handle
+
 !> Internal function that adds trailing null character to the string to make it C-style.
 function string_f2c(f_string) result(res)
     implicit none

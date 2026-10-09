@@ -32,6 +32,10 @@ check_xc_potential(Density const& rho__);
 double
 check_external_xc_point_derivative(Density const& density__);
 
+/// Smooth rho/tau components supplied to the reconstructed point-field maps.
+std::array<std::vector<Smooth_periodic_function<double>>, 2>
+external_xc_smooth_fields(Simulation_context const& ctx__, Density const& density__);
+
 double
 xc_mt(Radial_grid<double> const& rgrid__, SHT const& sht__, std::vector<XC_functional> const& xc_func__,
       int num_mag_dims__, std::vector<Flm const*> rho__, std::vector<Flm*> vxc__, Flm* exc__, bool use_lalp__);
@@ -337,10 +341,6 @@ class Potential : public Field4D
     void
     external_xc_point_response(xc_callback_input_t const& input__, xc_callback_direction_t const& direction__,
                                xc_callback_response_t& output__) const;
-
-    /// Finite-difference check of all seven independent point-input Hessian blocks.
-    std::array<double, 2>
-    check_external_xc_point_hessian(Density const& density__, double step__) const;
 
     /// Fixed-geometry LAPW XC covector response to physical rho/tau field variations.
     /** Applies the external XC Hessian and the discrete field-map adjoint.

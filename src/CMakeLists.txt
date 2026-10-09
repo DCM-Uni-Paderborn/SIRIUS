@@ -36,7 +36,6 @@ set(_SOURCES
   "density/augmentation_operator.cpp"
   "density/occupation_matrix.cpp"
   "dft/dft_ground_state.cpp"
-  "dft/check_lapw_xc_derivative.cpp"
   "dft/lapw_response.cpp"
   "dft/energy.cpp"
   "dft/smearing.cpp"
@@ -200,7 +199,8 @@ install(TARGETS sirius_cxx
   EXPORT sirius_cxx_targets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-  INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius_cxx")
+  INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius/src"
+                       "${CMAKE_INSTALL_INCLUDEDIR}/sirius")
 install(EXPORT sirius_cxx_targets
   FILE sirius_cxxTargets.cmake
   NAMESPACE sirius::

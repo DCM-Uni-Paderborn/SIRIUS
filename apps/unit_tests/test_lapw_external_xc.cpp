@@ -5,6 +5,7 @@
 
 #include <sirius.hpp>
 #include <testing.hpp>
+#include "xc_derivative_checks.hpp"
 #include "dft/dft_ground_state.hpp"
 #include "dft/lapw_response.hpp"
 #include "hamiltonian/diagonalize.hpp"
@@ -2252,12 +2253,12 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                   std::abs(c.rho + c.magnetic + c.tau - 2 * potential.energy_exc(density)), 2e-11);
         };
         energy_check();
-        for (auto const& values : gs.check_external_xc_derivative(1e-4)) {
+        for (auto const& values : testing::check_external_xc_derivative(gs, 1e-4)) {
             check("spinor PW/AW/LO orbital derivative", std::abs(values[0] - values[1]), 2e-8);
             check("spinor orbital derivative at halved step", std::abs(values[0] - values[2]), 6e-9);
         }
         // This quadratic fixture has a linear response; a larger core stencil avoids cancellation.
-        for (double error : gs.check_lapw_xc_response(core ? 1e-2 : 1e-3)) {
+        for (double error : testing::check_lapw_xc_response(gs, core ? 1e-2 : 1e-3)) {
             check("four-component LAPW callback response", error, 1e-8);
         }
         ctx->unit_cell().generate_radial_functions(ctx->out());
@@ -2758,7 +2759,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         ctx->cb().external_xc_response_          = functional_response;
         ctx->cb().external_xc_geometry_          = functional;
         ctx->cb().external_xc_geometry_response_ = true;
-        auto point_errors                        = potential.check_external_xc_point_hessian(density, 1e-3);
+        auto point_errors = sirius::testing::check_external_xc_point_hessian(potential, density, 1e-3);
         check("joint field/quadrature Hessian matches raw covector finite differences",
               std::max(point_errors[0], point_errors[1]), 2e-8);
         auto original_quadrature = ctx->cb().external_xc_points_;
@@ -3034,7 +3035,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         check("orbital diagnostic preserves ground-state energy", std::abs(gs.total_energy() - saved_energy), 0);
         check("orbital diagnostic preserves ground-state XC", std::abs(potential.energy_exc(density) - saved_exc), 0);
     };
-    auto derivatives = gs.check_external_xc_derivative(1e-4);
+    auto derivatives = testing::check_external_xc_derivative(gs, 1e-4);
     for (int direction = 0; direction < 2; direction++) {
         auto const& values = derivatives[direction];
         check(direction == 0 ? "matched PW/AW orbital derivative" : "local-orbital derivative",
@@ -3044,7 +3045,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     }
     verify_restored();
     // The quadratic fixture permits a wider core stencil without truncation error.
-    for (double error : gs.check_lapw_xc_response(core ? 1e-2 : 1e-3)) {
+    for (double error : testing::check_lapw_xc_response(gs, core ? 1e-2 : 1e-3)) {
         check("field-response diagnostic", error, 1e-8);
     }
     verify_restored();
@@ -3055,7 +3056,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             throw std::runtime_error("deliberate LAPW derivative-check callback failure");
         }
     };
-    check.reject("orbital diagnostic propagates callback failure", [&] { gs.check_external_xc_derivative(1e-4); });
+    check.reject("orbital diagnostic propagates callback failure",
+                 [&] { testing::check_external_xc_derivative(gs, 1e-4); });
     verify_restored();
     potential.generate(density, false, true);
     check("orbital diagnostic restores evaluator", evaluations == 3 ? 0 : 1, 0);
@@ -3065,7 +3067,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             out.vtau[j] = 0;
         }
     };
-    auto incomplete = gs.check_external_xc_derivative(1e-4);
+    auto incomplete = testing::check_external_xc_derivative(gs, 1e-4);
     double missing_tau{0};
     for (auto const& values : incomplete) {
         missing_tau = std::max(missing_tau, std::abs(values[0] - values[2]));
@@ -4966,11 +4968,11 @@ test_lapw_dirac_xc(int mag, bool distributed_fft, std::string device)
     auto c = potential.lapw_xc_contractions(density);
     check("Dirac callback Euler identity", std::abs(c.rho + c.magnetic + c.tau - 2 * potential.energy_exc(density)),
           2e-10);
-    for (auto const& values : gs.check_external_xc_derivative(1e-4)) {
+    for (auto const& values : testing::check_external_xc_derivative(gs, 1e-4)) {
         check("Dirac PW/full-j LO orbital derivative", std::abs(values[0] - values[1]), 2e-8);
         check("Dirac orbital derivative at halved step", std::abs(values[0] - values[2]), 6e-9);
     }
-    for (double error : gs.check_lapw_xc_response(1e-3)) {
+    for (double error : testing::check_lapw_xc_response(gs, 1e-3)) {
         check("Dirac point-field and Hamiltonian response", error, 1e-8);
     }
     Density direction(*ctx);
@@ -5096,11 +5098,11 @@ test_lapw_gpu(int mag, bool distributed_fft, bool spin_orbit = false)
             }
             check("CPU/GPU density, tau and XC energy", error / std::max(1.0, peak), 1e-10);
         }
-        for (auto const& values : gs.check_external_xc_derivative(1e-4)) {
+        for (auto const& values : testing::check_external_xc_derivative(gs, 1e-4)) {
             check("PW/AW/LO orbital derivative", std::abs(values[0] - values[1]), 2e-8);
             check("orbital derivative at halved step", std::abs(values[0] - values[2]), 6e-9);
         }
-        for (double error : gs.check_lapw_xc_response(1e-3)) {
+        for (double error : testing::check_lapw_xc_response(gs, 1e-3)) {
             check("field and point response", error, 1e-8);
         }
         // Exercise GPU diagonalization and MT operators without imposing SCF convergence.

@@ -1,3 +1,34 @@
+# Derivative drivers are test support, not part of the production libraries.
+add_library(sirius_testing STATIC check_external_xc_derivative.cpp check_lapw_xc_derivative.cpp)
+target_link_libraries(sirius_testing PUBLIC sirius_cxx)
+target_include_directories(sirius_testing PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+set_target_properties(sirius_testing PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(SIRIUS_CREATE_FORTRAN_BINDINGS)
+  target_sources(sirius_testing PRIVATE sirius_testing.f90)
+  target_link_libraries(sirius_testing PRIVATE sirius)
+  target_include_directories(sirius_testing PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/sirius>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/sirius/testing>)
+  set_target_properties(sirius_testing PROPERTIES
+    Fortran_MODULE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/mod_files")
+  install(TARGETS sirius_testing EXPORT sirius_testing_targets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT testing)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/mod_files/sirius_testing.mod"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius" COMPONENT testing)
+  install(FILES xc_derivative_checks.hpp
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius/testing" COMPONENT testing)
+  install(EXPORT sirius_testing_targets FILE siriusTestingTargets.cmake
+    NAMESPACE sirius:: DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius_testing" COMPONENT testing)
+  configure_package_config_file("${PROJECT_SOURCE_DIR}/cmake/sirius_testingConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/sirius_testingConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius_testing")
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius_testingConfig.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius_testing" COMPONENT testing)
+endif()
+
 set(unit_tests "test_init;test_nan;test_ylm;test_rlm;test_sinx_cosx;test_gvec;test_fft_correctness_1;\
 test_fft_correctness_2;test_fft_correctness_3;test_rlm_deriv;test_spline_1;\
 test_spline_2;test_rot_ylm;test_linalg;test_wf_ortho_1;test_serialize;test_mempool;test_sim_ctx;test_roundoff;\
@@ -39,6 +70,9 @@ add_test(NAME test_meta_gga_paw COMMAND test_meta_gga --paw)
 set_tests_properties(test_meta_gga_paw PROPERTIES TIMEOUT 120 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 add_executable(test_lapw_meta_gga test_lapw_meta_gga.cpp)
 target_link_libraries(test_lapw_meta_gga PRIVATE sirius_cxx)
+foreach(name test_external_xc test_lapw_external_xc test_lapw_meta_gga)
+  target_link_libraries(${name} PRIVATE sirius_testing)
+endforeach()
 add_test(NAME test_lapw_meta_gga COMMAND test_lapw_meta_gga)
 set_tests_properties(test_lapw_meta_gga PROPERTIES
   TIMEOUT 120 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
@@ -63,6 +97,7 @@ set_tests_properties(test_paw_xc_correction_h_setup PROPERTIES
 
 set_tests_properties(test_kinetic_density test_spheric_kinetic_density test_spheric_interpolation test_smooth_periodic_sampling test_paw_xc_correction test_lapw_xc_field_map test_lapw_external_xc test_core_kinetic_density test_external_xc PROPERTIES
   TIMEOUT 60 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+set_tests_properties(test_external_xc PROPERTIES TIMEOUT 300)
 add_test(NAME test_lapw_external_xc_dirac COMMAND test_lapw_external_xc dirac-response)
 set_tests_properties(test_lapw_external_xc test_lapw_external_xc_dirac PROPERTIES TIMEOUT 120)
 set_tests_properties(test_lapw_external_xc_dirac PROPERTIES
@@ -88,6 +123,7 @@ if(MPIEXEC_EXECUTABLE)
     add_mpi_unit_test(${name}_mpi ${name} 60)
   endforeach()
   set_tests_properties(test_lapw_external_xc_mpi PROPERTIES TIMEOUT 120)
+  set_tests_properties(test_external_xc_mpi PROPERTIES TIMEOUT 300)
   add_mpi_unit_test(test_lapw_external_xc_dirac_mpi test_lapw_external_xc 180 dirac-response)
 endif()
 

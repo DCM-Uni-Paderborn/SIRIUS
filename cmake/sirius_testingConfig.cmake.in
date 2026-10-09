@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(sirius CONFIG)
+find_dependency(sirius_cxx CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/siriusTestingTargets.cmake")
+check_required_components(sirius_testing)

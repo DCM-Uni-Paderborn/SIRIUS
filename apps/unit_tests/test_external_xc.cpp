@@ -5,6 +5,7 @@
 
 #include <sirius.hpp>
 #include <testing.hpp>
+#include "xc_derivative_checks.hpp"
 #include <chrono>
 #include <filesystem>
 #include "dft/dft_ground_state.hpp"
@@ -1130,13 +1131,16 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
               0);
     };
     for (double bad_step : {0.0, -0.1, std::numeric_limits<double>::quiet_NaN()}) {
-        check.reject("diagnostic rejects invalid step", [&] { diagnostic.check_external_xc_derivative(bad_step); });
+        check.reject("diagnostic rejects invalid step",
+                     [&] { testing::check_external_xc_derivative(diagnostic, bad_step); });
     }
     if (ctx->comm().size() > 1) {
         check.reject("diagnostic rejects inconsistent step",
-                     [&] { diagnostic.check_external_xc_derivative(ctx->comm().rank() == 0 ? 0.001 : 0.002); });
+                     [&] {
+                         testing::check_external_xc_derivative(diagnostic, ctx->comm().rank() == 0 ? 0.001 : 0.002);
+                     });
     }
-    auto derivatives = diagnostic.check_external_xc_derivative(1e-4);
+    auto derivatives = testing::check_external_xc_derivative(diagnostic, 1e-4);
     for (auto const& values : derivatives) {
         check("XC diagnostic derivative", std::abs(values[0] - values[1]), 2e-8);
         check("XC diagnostic halved step", std::abs(values[0] - values[2]), 6e-9);
@@ -1149,7 +1153,8 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
             throw std::runtime_error("deliberate derivative-check callback failure");
         }
     };
-    check.reject("diagnostic propagates callback failure", [&] { diagnostic.check_external_xc_derivative(1e-4); });
+    check.reject("diagnostic propagates callback failure",
+                 [&] { testing::check_external_xc_derivative(diagnostic, 1e-4); });
     verify_restored();
     diagnostic.potential().generate(diagnostic.density(), false, true);
     check("diagnostic restores evaluator", evaluations == 3 ? 0 : 1, 0);
@@ -1164,7 +1169,7 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
                 out.vtau[j] = 0;
             }
         };
-        auto incomplete = diagnostic.check_external_xc_derivative(1e-4);
+        auto incomplete = testing::check_external_xc_derivative(diagnostic, 1e-4);
         double missing_tau{0};
         for (auto const& values : incomplete) {
             missing_tau = std::max(missing_tau, std::abs(values[0] - values[2]));
