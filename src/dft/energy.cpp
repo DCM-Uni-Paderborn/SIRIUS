@@ -127,8 +127,9 @@ double
 energy_veff(Density const& density, Potential const& potential)
 {
     potential.require_xc_energy();
-    double energy = sirius::inner(density.rho(), potential.effective_potential()) +
-                    potential.lapw_xc_contractions(density).rho - potential.external_xc_background_contraction();
+    double energy   = sirius::inner(density.rho(), potential.effective_potential()) +
+                      potential.lapw_xc_contractions(density).rho - potential.external_xc_background_contraction() +
+                      potential.energy_external_augmentation(density);
     auto const& ctx = density.ctx();
     if (ctx.cb().external_xc_ && !ctx.full_potential() && ctx.cfg().parameters().extra_charge() != 0) {
         // Hartree has zero G=0; the remaining background is the local PP term.

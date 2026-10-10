@@ -247,7 +247,7 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
         double displacement = 0, double pw_cutoff = 5.0, bool simple_radial_integrals = false, int auto_enu = 0,
         std::string smearing = "", bool moving_core_grid = false, std::string processing_unit = "CPU",
         bool spin_orbit = false, std::string valence_relativity = "none", bool external_scalar = false,
-        std::string core_relativity = "", int radial_points = 0)
+        std::string core_relativity = "", int radial_points = 0, bool symmetry = false)
 {
     auto config                               = R"({"parameters": {
         "electronic_structure_method": "full_potential_lapwlo", "use_symmetry": false,
@@ -400,8 +400,53 @@ context(int mag, bool distributed_fft, bool second_variation, bool core = false,
         ctx->cb().external_xc_response_ = functional_response;
         ctx->cb().external_xc_spinor_   = mag == 3;
     }
+    if (symmetry) {
+        ctx->cfg().parameters().use_symmetry(true);
+        ctx->unit_cell().set_lattice_vectors({{6, 0, 0}, {0, 6, 0}, {0, 0, 6}});
+        ctx->unit_cell().atom(0).set_position({0, 0, 0});
+        auto q = std::make_shared<xc_point_set_t>(*ctx);
+        if (ctx->comm().rank() == 0) {
+            q->block_centres = {{0, 0, 0}};
+            q->block_sizes   = {12};
+            for (double r : {1.1, 2.3}) {
+                for (int x = 0; x < 3; x++) {
+                    for (int sign : {-1, 1}) {
+                        std::array<double, 3> p{};
+                        p[x] = sign * r;
+                        q->coordinates.push_back(p);
+                        q->energy_weights.push_back(216.0 / 12);
+                        q->descriptor_weights.push_back(216.0 / 12);
+                    }
+                }
+            }
+        }
+        ctx->cb().external_xc_points_ = q;
+    }
     ctx->initialize();
     return ctx;
+}
+
+int
+test_lapw_point_symmetry()
+{
+    auto ctx = context(0, false, false, false, false, 0, 5.0, false, 0, "", false, "CPU", false, "none", false, "none",
+                       0, true);
+    K_point_set ks(*ctx);
+    ks.add_kpoint({0, 0, 0}, 1);
+    ks.initialize();
+    DFT_ground_state gs(ks);
+    gs.initial_state();
+    int failures{0};
+    Test_check check(failures, ctx->comm());
+    check("symmetry-projected LAPW point fields", check_external_xc_point_derivative(gs.density()), 2e-10);
+    for (auto const& values : testing::check_external_xc_derivative(gs, 1e-4)) {
+        check("symmetry-projected LAPW orbital derivative", std::abs(values[0] - values[1]), 2e-8);
+        check("symmetry-projected LAPW halved-step derivative", std::abs(values[0] - values[2]), 6e-9);
+    }
+    for (double error : testing::check_lapw_xc_response(gs, 1e-3)) {
+        check("symmetry-projected LAPW XC response", error, 1e-8);
+    }
+    return failures;
 }
 
 std::vector<std::complex<double>>
@@ -5188,6 +5233,9 @@ int
 run_tests(int argc, char** argv)
 {
     std::string mode = argc > 1 ? argv[1] : "";
+    if (mode == "symmetry") {
+        return call_test("symmetry-projected LAPW XC", test_lapw_point_symmetry);
+    }
     bool distributed = mpi::Communicator::world().size() > 1;
     int result{0};
     if (mode == "dirac") {

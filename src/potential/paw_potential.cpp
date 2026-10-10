@@ -168,29 +168,8 @@ Potential::generate_PAW_effective_potential(Density const& density)
     // The joint nonlocal XC energy is evaluated once on reconstructed fields.
     // Its local matrix derivatives supplement the electrostatic PAW terms.
     if (ctx_.cb().external_xc_) {
-        if (external_paw_d_mtrx_.size() != d_mtrx_paw_.size()) {
-            RTE_THROW("external PAW XC matrices are missing for the current potential");
-        }
         for (int i = 0; i < unit_cell_.num_paw_atoms(); i++) {
-            auto const& x = external_paw_d_mtrx_[i];
-            auto& d       = d_mtrx_paw_[i];
-            if (x.size(0) != d.size(0) || x.size(1) != d.size(1) || x.size(2) != ctx_.num_mag_dims() + 1) {
-                RTE_THROW("external PAW XC matrix components do not match the potential");
-            }
-            for (int j = 0; j < static_cast<int>(d.size(1)); j++) {
-                for (int k = 0; k < static_cast<int>(d.size(0)); k++) {
-                    if (ctx_.num_mag_dims() == 3) {
-                        for (int s = 0; s < 4; s++) {
-                            d(k, j, s) += x(k, j, s);
-                        }
-                    } else {
-                        d(k, j, 0) += ctx_.num_spins() == 1 ? x(k, j, 0) : 0.5 * (x(k, j, 0) + x(k, j, 1));
-                        if (ctx_.num_spins() == 2) {
-                            d(k, j, 1) += 0.5 * (x(k, j, 0) - x(k, j, 1));
-                        }
-                    }
-                }
-            }
+            add_external_projector_d_mtrx(unit_cell_.paw_atom_index(paw_atom_index_t::global(i)), d_mtrx_paw_[i]);
         }
     }
 

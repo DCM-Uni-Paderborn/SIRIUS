@@ -18,10 +18,61 @@
 # OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import json
+import hashlib
 import math
 import sys
 import re
 import xml.etree.ElementTree as ET
+
+
+def add_kinetic_augmentation(pp_dict, upf_text, data_file):
+    """Import independent generator-supplied ultrasoft augmentation, not inferred from Q.
+
+    The JSON contains upf_sha256 and kinetic_augmentation. Each channel has
+    zero-based i/j, angular_momentum, and radial_function (r^2 T including 1/2)
+    on the UPF radial grid. All allowed channels, including zeros, are required.
+    For NLCC it also supplies core_kinetic_density in bohr^-5 without r^2.
+    """
+    pp = pp_dict['pseudo_potential']
+    header = pp['header']
+    if header['pseudo_type'] != 'US' or not header['is_ultrasoft']:
+        raise ValueError('Kinetic augmentation requires a non-PAW ultrasoft pseudopotential')
+    with open(data_file) as fh:
+        data = json.load(fh)
+    if data.get('upf_sha256') != hashlib.sha256(upf_text.encode('utf-8')).hexdigest():
+        raise ValueError('Kinetic augmentation does not match this UPF dataset')
+    grid = pp['radial_grid']
+    if not grid or grid[0] <= 0:
+        raise ValueError('Ultrasoft reconstruction requires a positive radial grid')
+    projectors = pp['beta_projectors']
+    expected = {(i, j, l) for j, b in enumerate(projectors) for i, a in enumerate(projectors[:j + 1])
+                for l in range(abs(a['angular_momentum'] - b['angular_momentum']),
+                               a['angular_momentum'] + b['angular_momentum'] + 1, 2)}
+    channels = data.get('kinetic_augmentation', [])
+    supplied = set()
+    for channel in channels:
+        i, j, l = (channel[key] for key in ('i', 'j', 'angular_momentum'))
+        if any(type(x) is not int for x in (i, j, l)):
+            raise ValueError('Kinetic augmentation indices must be integers')
+        key = (min(i, j), max(i, j), l)
+        if key not in expected or key in supplied:
+            raise ValueError('Invalid or duplicate kinetic augmentation channel')
+        values = channel['radial_function']
+        if len(values) != len(grid) or not all(math.isfinite(v) for v in values):
+            raise ValueError('Kinetic augmentation must be finite on the complete radial grid')
+        supplied.add(key)
+    if supplied != expected:
+        raise ValueError('Missing kinetic augmentation channels, including explicit zero channels')
+    core = data.get('core_kinetic_density')
+    nonzero_core = any(pp.get('core_charge_density', []))
+    if nonzero_core and core is None:
+        raise ValueError('NLCC requires independently supplied pseudo-core kinetic density')
+    if core is not None:
+        if (len(core) != len(grid) or not all(math.isfinite(v) and v >= 0 for v in core)
+                or nonzero_core != any(core)):
+            raise ValueError('Invalid or inconsistent pseudo-core kinetic density')
+        pp['core_kinetic_density'] = core
+    pp['kinetic_augmentation'] = channels
 
 
 def str2bool(v):

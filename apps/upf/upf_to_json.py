@@ -3,7 +3,7 @@ import json
 import re
 import os
 from upf1_to_json import parse_upf1_from_string
-from upf2_to_json import parse_upf2_from_string, add_paw_core_kinetic_density
+from upf2_to_json import parse_upf2_from_string, add_paw_core_kinetic_density, add_kinetic_augmentation
 
 def get_upf_version(upf):
     line = upf.split('\n')[0]
@@ -26,13 +26,15 @@ def main():
     parser = argparse.ArgumentParser(description='Convert an UPF pseudopotential to SIRIUS JSON.')
     parser.add_argument('upf', help='Input UPF file')
     parser.add_argument('--paw-core-xml', help='Matching ATOMPAW XML with AE and pseudo core kinetic densities')
+    parser.add_argument('--kinetic-augmentation-json',
+                        help='Generator-supplied ultrasoft r^2 T_ij^L tables matched by the UPF SHA-256')
     parser.add_argument('-o', '--output', help='Output JSON file (default: ELEMENT.json)')
     args = parser.parse_args()
     fname = args.upf
     if not os.path.exists(fname):
         raise FileNotFoundError('invalid path for UPF file')
 
-    with open(fname, 'r') as fh:
+    with open(fname, 'r', encoding='utf-8', newline='') as fh:
         upf_str = fh.read()
 
     pp_dict = parse_upf_from_string(upf_str)
@@ -41,6 +43,11 @@ def main():
     if args.paw_core_xml:
         try:
             add_paw_core_kinetic_density(pp_dict, args.paw_core_xml)
+        except (ValueError, RuntimeError, OSError) as error:
+            parser.error(str(error))
+    if args.kinetic_augmentation_json:
+        try:
+            add_kinetic_augmentation(pp_dict, upf_str, args.kinetic_augmentation_json)
         except (ValueError, RuntimeError, OSError) as error:
             parser.error(str(error))
     element = pp_dict['pseudo_potential']['header']['element']

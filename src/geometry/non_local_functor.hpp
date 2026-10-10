@@ -48,7 +48,10 @@ add_k_point_contribution_nonlocal(Potential& potential__, Beta_projectors_base<T
         for (int iat = 0; iat < uc.num_atom_types(); iat++) {
             auto const& type = uc.atom_type(iat);
             if (type.spin_orbit_coupling() && type.augment() && !type.is_paw()) {
-                RTE_THROW("SOC nonlocal derivatives require norm-conserving or PAW pseudopotentials");
+                if (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_) {
+                    RTE_THROW("ultrasoft SOC derivatives require the reconstructed external XC operator");
+                }
+                type.check_kinetic_augmentation();
             }
         }
         soc_d = std::make_unique<D_operator<T>>(potential__);

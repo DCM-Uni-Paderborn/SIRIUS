@@ -682,6 +682,15 @@ Atom_type::read_pseudo_uspp(nlohmann::json const& parser)
         }
     }
 
+    kinetic_augmentation_.clear();
+    if (parser["pseudo_potential"].contains("kinetic_augmentation")) {
+        for (auto const& channel : parser["pseudo_potential"]["kinetic_augmentation"]) {
+            add_kinetic_augmentation(channel["i"].get<int>(), channel["j"].get<int>(),
+                                     channel["angular_momentum"].get<int>(),
+                                     channel["radial_function"].get<std::vector<double>>());
+        }
+    }
+
     /* read starting wave functions ( UPF CHI ) */
     if (parser["pseudo_potential"].count("atomic_wave_functions")) {
         auto& dict = parser["pseudo_potential"]["atomic_wave_functions"];
@@ -1427,6 +1436,14 @@ Atom_type::serialize() const
                     dict["augmentation"].push_back(o);
                 }
             }
+        }
+    }
+    if (!kinetic_augmentation_.empty()) {
+        dict["kinetic_augmentation"] = nlohmann::json::array();
+        for (auto const& [indices, values] : kinetic_augmentation_) {
+            auto [i, j, l] = indices;
+            dict["kinetic_augmentation"].push_back(
+                    {{"i", i}, {"j", j}, {"angular_momentum", l}, {"radial_function", values}});
         }
     }
     if (is_paw()) {

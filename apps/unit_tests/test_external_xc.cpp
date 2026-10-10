@@ -11,6 +11,7 @@
 #include "dft/dft_ground_state.hpp"
 #include "dft/energy.hpp"
 #include "density/paw_xc_reconstruction.hpp"
+#include "symmetry/xc_point_symmetry.hpp"
 #include "function3d/smooth_periodic_function_sampler.hpp"
 #include "geometry/force.hpp"
 #include "geometry/stress.hpp"
@@ -69,7 +70,7 @@ auto
 test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool parallel_fft = false, bool external = true,
              double fixed_mag = 0, bool paw = false, bool points = false, std::string smearing = "gaussian",
              double extra_charge = 0, std::function<void(Simulation_context&)> setup = {}, bool gpu = false,
-             bool soc = false)
+             bool soc = false, bool ultrasoft = false)
 {
     auto conf                          = R"({"parameters": {
         "electronic_structure_method": "pseudopotential", "use_symmetry": false,
@@ -98,7 +99,8 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
     auto& type = ctx->unit_cell().add_atom_type("He");
     type.zn(2);
     type.spin_orbit_coupling(soc);
-    type.set_radial_grid(radial_grid_t::lin_exp, 400, paw ? 0.001 : 0.0, paw ? 3.0 : 20.0, 6);
+    bool augmented = paw || ultrasoft;
+    type.set_radial_grid(radial_grid_t::lin_exp, 400, augmented ? 0.001 : 0.0, augmented ? 3.0 : 20.0, 6);
     std::vector<double> v(400), rho(400), orbital(400);
     for (int ir = 0; ir < 400; ir++) {
         double r    = type.radial_grid(ir);
@@ -109,8 +111,8 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
     type.local_potential(v);
     type.ps_total_charge_density(rho);
     type.add_ps_atomic_wf(1, angular_momentum(0), orbital);
-    if (paw) {
-        type.is_paw(true);
+    if (augmented) {
+        type.is_paw(paw);
         std::vector<double> ae(400), ps(400), beta(400), q(400), core(400), core_tau(400), ps_core(400);
         for (int ir = 0; ir < 400; ir++) {
             double r     = type.radial_grid(ir);
@@ -136,12 +138,24 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
                         v *= (1 + 0.4 * i + 0.2 * j) / (l + 1);
                     }
                     type.add_q_radial_function(i, j, l, radial);
+                    if (ultrasoft) {
+                        // Independent kinetic augmentation, not a rescaled charge table.
+                        for (int ir = 0; ir < 400; ir++) {
+                            double r   = type.radial_grid(ir);
+                            radial[ir] = (1 + 0.2 * i + 0.4 * j) * 0.07 * r * r * (1 + r * r) * std::exp(-3 * r * r) /
+                                         (l + 1);
+                        }
+                        type.add_kinetic_augmentation(i, j, l, radial);
+                    }
                 }
             }
         }
         type.paw_ae_core_charge_density(core);
         type.paw_ae_core_kinetic_density(core_tau);
         type.ps_core_charge_density(ps_core);
+        if (ultrasoft) {
+            type.ps_core_kinetic_density(core_tau);
+        }
         type.paw_wf_occ(std::vector<double>(nbeta, 2.0 / nbeta));
         matrix<double> dion({nbeta, nbeta});
         dion.zero();
@@ -185,7 +199,7 @@ test_context(bool gamma, int mag, bool scf = false, bool exact = false, bool par
                     }
                 }
                 quadrature->energy_weights[0] = 0;
-                if (paw) {
+                if (augmented) {
                     // Exercise inner continuation in the orbital Hamiltonian/energy derivative,
                     // including a descriptor-only point and a point with nonzero energy weight.
                     quadrature->coordinates[0] = {1.6002, 2.6997, 4.0001};
@@ -488,13 +502,13 @@ check_spinor_eigensystem(Hamiltonian_k<double> const& hk, K_point<double>& kp, T
 }
 
 int
-test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
+test_spinor_xc_impl(bool gpu, bool paw, bool soc, double charge, bool ultrasoft)
 {
     auto ctx = test_context(
             false, 3, false, false, soc, true, 0, paw, true, "gaussian", charge,
             [=](auto& c) {
                 c.cb().external_xc_spinor_ = true;
-                if (!paw) {
+                if (!paw && !ultrasoft) {
                     set_test_core(c);
                 }
                 auto q = std::make_shared<xc_point_set_t>(*c.cb().external_xc_points_);
@@ -503,7 +517,7 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
                 }
                 c.cb().external_xc_points_ = std::move(q);
             },
-            gpu, soc);
+            gpu, soc, ultrasoft);
     int failures{0};
     Test_check check(failures, ctx->comm(),
                      "spinor XC PAW=" + std::to_string(paw) + " SOC=" + std::to_string(soc) +
@@ -574,16 +588,17 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
         auto const& type = c.unit_cell().atom_type(0);
         mdarray<std::complex<double>, 2> augmentation;
         std::array<std::vector<Flm>, 2> local;
-        if (paw) {
+        if (paw || ultrasoft) {
             augmentation = density.generate_rho_aug();
-            local        = density.generate_paw_xc_correction(0);
+            local        = paw ? density.generate_paw_xc_correction(0)
+                               : Ultrasoft_xc_correction(type).fields(density.density_matrix(0));
         }
         for (int s = 0; s < 4; s++) {
             auto const& rho  = s == 0 ? density.rho() : density.mag(s - 1);
             auto const& tau  = s == 0 ? density.kinetic_density().scalar() : density.kinetic_density().vector(s - 1);
             auto sampled_rho = sampler.sample(rho.rg()), sampled_tau = sampler.sample(tau.rg());
             std::vector<std::array<double, 4>> sampled_q;
-            if (paw) {
+            if (paw || ultrasoft) {
                 Smooth_periodic_function<double> q(c.spfft<double>(), c.gvec_fft_sptr());
                 for (int ig = 0; ig < c.gvec().count(); ig++) {
                     q.f_pw_local(ig) = augmentation(ig, s);
@@ -595,7 +610,7 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
                 if (s == 0) {
                     r -= charge / c.unit_cell().omega();
                 }
-                if (paw) {
+                if (paw || ultrasoft) {
                     auto position = point[0] - dot(c.unit_cell().lattice_vectors(), c.unit_cell().atom(0).position());
                     r += Spheric_function_interpolator(local[0][s], spheric_inner_extension_t::charge)
                                  .value_gradient(position)[0] -
@@ -674,7 +689,7 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
             }
         }
         check("nonzero SOC spin mixing", mixing > 1e-3 ? 0 : 1, 0);
-        if (paw) {
+        if (paw || ultrasoft) {
             Q_operator<double> q(*ctx);
             double mixing{0};
             for (int i = 0; i < type.mt_basis_size(); i++) {
@@ -729,7 +744,7 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
     if (soc && paw) {
         auto& type = ctx->unit_cell().atom_type(0);
         type.is_paw(false);
-        check.reject("external ultrasoft SOC requires PAW reconstruction", [&] { validate_external_xc_context(*ctx); });
+        check.reject("ultrasoft XC requires kinetic augmentation", [&] { validate_external_xc_context(*ctx); });
         type.is_paw(true);
     }
     Stress stress(*ctx, density, potential, ks);
@@ -759,8 +774,8 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
     };
     // Geometry stencils keep coefficients fixed. A common, nonzero SOC multiplier
     // tests the full spinor overlap response via the independent charge integral.
-    overlap_constraint = paw && soc;
-    if (paw) {
+    overlap_constraint = (paw || ultrasoft) && soc;
+    if (paw || ultrasoft) {
         for (auto it : ks.spl_num_kpoints()) {
             auto kp = ks.get<double>(it.i);
             for (int ib = 0; ib < ctx->num_bands(); ib++) {
@@ -819,7 +834,7 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
         }
         // PAW projector response belongs to the nonlocal stress component;
         // only the full tensor contains every contribution to the energy derivative.
-        if (!paw) {
+        if (!paw && !ultrasoft) {
             check("spinor XC strain derivative", error[0], 2e-8);
         }
         check("spinor total strain derivative", error[1], 2e-6);
@@ -849,7 +864,7 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
         ctx->cb().external_xc_points_ = std::move(q);
         return evaluate(0);
     };
-    for (double h : {1e-4, 5e-5}) {
+    for (double h : (ultrasoft ? std::array<double, 2>{5e-5, 2.5e-5} : std::array<double, 2>{1e-4, 5e-5})) {
         double error{0};
         for (int axis = 0; axis < 3; axis++) {
             double plus = displaced_energy(axis, h), minus = displaced_energy(axis, -h);
@@ -869,9 +884,38 @@ test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
 }
 
 int
-test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, bool nlcc, bool gpu, double charge)
+test_spinor_xc(bool gpu, bool paw, bool soc, double charge)
+{
+    return test_spinor_xc_impl(gpu, paw, soc, charge, false);
+}
+
+int
+test_external_xc_impl(bool gamma, int mag, bool parallel_fft, bool points, bool paw, bool nlcc, bool gpu, double charge,
+                      bool ultrasoft, bool symmetry)
 {
     auto core = [=](Simulation_context& ctx) {
+        if (symmetry) {
+            ctx.cfg().parameters().use_symmetry(true);
+            ctx.unit_cell().set_lattice_vectors({{8, 0, 0}, {0, 8, 0}, {0, 0, 8}});
+            ctx.unit_cell().atom(0).set_position({0, 0, 0});
+            auto q = std::make_shared<xc_point_set_t>(ctx);
+            if (ctx.comm().rank() == 0) {
+                for (double r : {1.1, 2.3}) {
+                    for (int x = 0; x < 3; x++) {
+                        for (int sign : {-1, 1}) {
+                            std::array<double, 3> p{};
+                            p[x] = sign * r;
+                            q->coordinates.push_back(p);
+                            q->energy_weights.push_back(512.0 / 12);
+                            q->descriptor_weights.push_back(512.0 / 12);
+                        }
+                    }
+                }
+                q->block_centres = {{0, 0, 0}};
+                q->block_sizes   = {12};
+            }
+            ctx.cb().external_xc_points_ = q;
+        }
         if (nlcc) {
             set_test_core(ctx);
             auto const& type = ctx.unit_cell().atom_type(0);
@@ -882,8 +926,8 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
             ctx.cb().external_xc_points_ = std::move(quadrature);
         }
     };
-    auto ctx =
-            test_context(gamma, mag, false, false, parallel_fft, true, 0, paw, points, "gaussian", charge, core, gpu);
+    auto ctx = test_context(gamma, mag, false, false, parallel_fft, true, 0, paw, points, "gaussian", charge, core, gpu,
+                            false, ultrasoft);
     K_point_set ks(*ctx);
     if (gamma) {
         ks.add_kpoint({0, 0, 0}, 1);
@@ -923,14 +967,14 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
     Potential potential(*ctx);
     auto evaluate = [&](double step) {
         set_orbitals(step);
-        density.generate<double>(ks, false, true, true);
-        potential.generate(density, false, true);
+        density.generate<double>(ks, symmetry, true, true);
+        potential.generate(density, symmetry, true);
         return density.kinetic_density().scalar().integrate().total + 0.5 * potential.energy_vha() +
                energy_vloc(density, potential) + potential.energy_exc(density) + potential.ewald_energy() +
                potential.PAW_total_energy(density);
     };
     std::vector<double> input_rho, input_tau;
-    if (paw || nlcc || charge != 0) {
+    if (!symmetry && (paw || ultrasoft || nlcc || charge != 0)) {
         ctx->cb().external_xc_ = [&](auto const& c, auto const& in, auto& out) {
             input_rho.resize(in.num_points * in.num_spins);
             input_tau.resize(input_rho.size());
@@ -1002,7 +1046,7 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
         check("smooth Hartree response and zero-G gauge", error, 2e-13);
         check("Hartree response preserves energy", std::abs(potential.energy_vha() - saved_energy), 0);
     }
-    if (paw || nlcc || charge != 0) {
+    if (!symmetry && (paw || ultrasoft || nlcc || charge != 0)) {
         std::vector<std::array<double, 3>> coordinates;
         if (points) {
             coordinates = ctx->cb().external_xc_points_->coordinates;
@@ -1060,7 +1104,7 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
             ctx->comm().allreduce<double, mpi::op_t::max>(&error, 1);
             check("independently supplied NLCC charge and tau", error, 2e-12);
         }
-        if (paw || nlcc) {
+        if (paw || ultrasoft || nlcc) {
             PAW_xc_reconstruction(density, points).add_to(rho, gradient, tau);
         }
         double error{0};
@@ -1234,6 +1278,108 @@ test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, 
 }
 
 int
+test_external_xc(bool gamma, int mag, bool parallel_fft, bool points, bool paw, bool nlcc, bool gpu, double charge)
+{
+    return test_external_xc_impl(gamma, mag, parallel_fft, points, paw, nlcc, gpu, charge, false, false);
+}
+
+int
+test_point_symmetry()
+{
+    int failures{0};
+    for (int mag : {0, 1, 3}) {
+        auto setup = [](Simulation_context& ctx) {
+            ctx.cfg().parameters().use_symmetry(true);
+            ctx.cb().external_xc_spinor_ = ctx.num_mag_dims() == 3;
+            ctx.unit_cell().set_lattice_vectors({{8, 0, 0}, {0, 8, 0}, {0, 0, 8}});
+            ctx.unit_cell().atom(0).set_position({0, 0, 0});
+            ctx.unit_cell().add_atom("He", {0.5, 0.5, 0.5});
+            auto q = std::make_shared<xc_point_set_t>(ctx);
+            for (int ia = 0; ia < 2; ia++) {
+                if (ia % ctx.comm().size() != ctx.comm().rank()) {
+                    continue;
+                }
+                std::array<double, 3> c{4.0 * ia, 4.0 * ia, 4.0 * ia};
+                q->block_centres.push_back(c);
+                q->block_sizes.push_back(6);
+                for (int x = 0; x < 3; x++) {
+                    for (int sign : {-1, 1}) {
+                        auto p = c;
+                        p[x] += sign * 1.1;
+                        q->coordinates.push_back(p);
+                        q->energy_weights.push_back(1);
+                        q->descriptor_weights.push_back(2);
+                    }
+                }
+            }
+            ctx.cb().external_xc_points_ = q;
+        };
+        auto ctx      = test_context(false, mag, false, false, false, true, 0, false, false, "gaussian", 0, setup);
+        auto const& q = *ctx->cb().external_xc_points_;
+        auto const& projector = q.symmetry(*ctx);
+        int nr = q.coordinates.size(), ns = mag + 1;
+        xc_point_fields_t f(nr, ns), v(nr, ns);
+        for (int s = 0; s < ns; s++) {
+            for (int p = 0; p < nr; p++) {
+                double a    = 0.1 * (p + 7 * ctx->comm().rank() + 3 * s);
+                f.rho(p, s) = std::sin(a);
+                f.tau(p, s) = std::cos(a);
+                v.rho(p, s) = std::cos(2 * a);
+                v.tau(p, s) = std::sin(2 * a);
+                for (int x = 0; x < 3; x++) {
+                    f.gradient(p, x, s) = std::sin(a + x);
+                    v.gradient(p, x, s) = std::cos(a - x);
+                }
+            }
+        }
+        auto inner = [&](auto const& a, auto const& b) {
+            double r{0};
+            for (size_t i = 0; i < a.rho.size(); i++) {
+                r += a.rho[i] * b.rho[i] + a.tau[i] * b.tau[i];
+            }
+            for (size_t i = 0; i < a.gradient.size(); i++) {
+                r += a.gradient[i] * b.gradient[i];
+            }
+            ctx->comm().allreduce(&r, 1);
+            return r;
+        };
+        Test_check check(failures, ctx->comm(), "point symmetry spin=" + std::to_string(mag));
+        auto pf = projector.apply(f), ptv = projector.apply(v, true), ppf = projector.apply(pf);
+        check("symmetry sampling transpose", std::abs(inner(pf, v) - inner(f, ptv)), 3e-13);
+        check("symmetry projector idempotence", std::abs(inner(ppf, v) - inner(pf, v)), 3e-13);
+        r3::matrix<double> dA{{0.1, 0.03, -0.02}, {0.04, -0.07, 0.01}, {0.02, 0.05, 0.08}};
+        auto df = projector.apply(f, false, &dA), dtv = projector.apply(v, true, &dA);
+        check("symmetry cell-response transpose", std::abs(inner(df, v) - inner(f, dtv)), 3e-13);
+        auto d = projector.geometry_adjoint(f, v);
+        double analytic{0};
+        for (int x = 0; x < 3; x++) {
+            for (int y = 0; y < 3; y++) {
+                analytic += d(x, y) * dA(x, y);
+            }
+        }
+        auto A   = ctx->unit_cell().lattice_vectors();
+        double h = 1e-5;
+        ctx->unit_cell().set_lattice_vectors(A + dA * h);
+        double plus = inner(projector.apply(f), v);
+        ctx->unit_cell().set_lattice_vectors(A + dA * -h);
+        double minus = inner(projector.apply(f), v);
+        ctx->unit_cell().set_lattice_vectors(A);
+        check("symmetry cell derivative", std::abs((plus - minus) / (2 * h) - analytic), 3e-9);
+        auto bad = std::make_shared<xc_point_set_t>(q);
+        if (!bad->descriptor_weights.empty()) {
+            bad->descriptor_weights[0] *= 1.1;
+        }
+        check.reject("noninvariant descriptor quadrature", [&] { bad->symmetry(*ctx); });
+        *bad = q;
+        if (!bad->energy_weights.empty()) {
+            bad->energy_weights[0] *= 1.1;
+        }
+        check.reject("copied symmetry map rechecks energy weights", [&] { bad->symmetry(*ctx); });
+    }
+    return failures;
+}
+
+int
 test_external_nlcc()
 {
     int failures = test_external_xc(false, 1, mpi::Communicator::world().size() > 1, true, false, true, false, 0);
@@ -1361,7 +1507,8 @@ test_external_scf(bool exact, bool external, bool paw, bool gpu, double* total =
 }
 
 int
-test_external_geometry(bool paw, int mag, bool strain, bool gamma, bool nlcc, bool gpu, double charge)
+test_external_geometry_impl(bool paw, int mag, bool strain, bool gamma, bool nlcc, bool gpu, double charge,
+                            bool ultrasoft)
 {
     auto calculate = [&](double displacement, bool get_force) {
         std::array<double, 3> direction{0.7, -0.4, 0.2};
@@ -1440,7 +1587,7 @@ test_external_geometry(bool paw, int mag, bool strain, bool gamma, bool nlcc, bo
             };
         };
         auto ctx = test_context(gamma, mag, true, !gamma, strain && !gamma, true, mag ? 0.6 : 0, paw, false, "gaussian",
-                                charge, setup, gpu);
+                                charge, setup, gpu, false, ultrasoft);
         K_point_set ks(*ctx);
         if (gamma) {
             ks.add_kpoint({0, 0, 0}, 1);
@@ -1508,6 +1655,12 @@ test_external_geometry(bool paw, int mag, bool strain, bool gamma, bool nlcc, bo
         failures += !std::isfinite(error) || error > 2e-6;
     }
     return failures;
+}
+
+int
+test_external_geometry(bool paw, int mag, bool strain, bool gamma, bool nlcc, bool gpu, double charge)
+{
+    return test_external_geometry_impl(paw, mag, strain, gamma, nlcc, gpu, charge, false);
 }
 
 int
@@ -1593,6 +1746,28 @@ main(int argc, char** argv)
 {
     sirius::initialize(true);
     int result{0};
+    if (argc == 2 && std::string(argv[1]) == "symmetry") {
+        result += call_test("point quadrature symmetry", test_point_symmetry);
+        for (bool paw : {false, true}) {
+            result += call_test("symmetry-projected XC operator", test_external_xc_impl, false, 0, false, true, paw,
+                                false, false, 0, false, true);
+        }
+        sirius::finalize();
+        return std::min(result, 1);
+    }
+    if (argc == 2 && (std::string(argv[1]) == "ultrasoft" || std::string(argv[1]) == "ultrasoft-gpu")) {
+        bool gpu      = std::string(argv[1]) == "ultrasoft-gpu";
+        bool parallel = mpi::Communicator::world().size() > 1;
+        result += call_test("ultrasoft point XC", test_external_xc_impl, false, 1, parallel, true, false, false, gpu, 0,
+                            true, false);
+        result += call_test("ultrasoft spinor SOC XC", test_spinor_xc_impl, gpu, false, true, 0, true);
+        result += call_test("ultrasoft XC forces", test_external_geometry_impl, false, 1, false, false, false, gpu, 0,
+                            true);
+        result += call_test("ultrasoft XC stress", test_external_geometry_impl, false, 1, true, false, false, gpu, 0,
+                            true);
+        sirius::finalize();
+        return std::min(result, 1);
+    }
     if (argc == 2 && (std::string(argv[1]) == "spinor" || std::string(argv[1]) == "spinor-gpu" ||
                       std::string(argv[1]) == "spinor-paw" || std::string(argv[1]) == "spinor-paw-gpu" ||
                       std::string(argv[1]) == "spinor-soc" || std::string(argv[1]) == "spinor-soc-gpu" ||

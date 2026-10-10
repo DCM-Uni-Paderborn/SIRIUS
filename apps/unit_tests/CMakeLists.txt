@@ -98,6 +98,21 @@ set_tests_properties(test_paw_xc_correction_h_setup PROPERTIES
 set_tests_properties(test_kinetic_density test_spheric_kinetic_density test_spheric_interpolation test_smooth_periodic_sampling test_paw_xc_correction test_lapw_xc_field_map test_lapw_external_xc test_core_kinetic_density test_external_xc PROPERTIES
   TIMEOUT 60 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 set_tests_properties(test_external_xc PROPERTIES TIMEOUT 300)
+add_test(NAME test_external_xc_ultrasoft COMMAND test_external_xc ultrasoft)
+set_tests_properties(test_external_xc_ultrasoft PROPERTIES
+  TIMEOUT 180 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+add_test(NAME test_external_xc_symmetry COMMAND test_external_xc symmetry)
+set_tests_properties(test_external_xc_symmetry PROPERTIES
+  TIMEOUT 120 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+add_test(NAME test_lapw_external_xc_symmetry COMMAND test_lapw_external_xc symmetry)
+set_tests_properties(test_lapw_external_xc_symmetry PROPERTIES
+  TIMEOUT 120 ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME test_upf_kinetic_data COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+           -s "${PROJECT_SOURCE_DIR}/apps/upf")
+  set_tests_properties(test_upf_kinetic_data PROPERTIES TIMEOUT 30)
+endif()
 add_test(NAME test_lapw_external_xc_dirac COMMAND test_lapw_external_xc dirac-response)
 set_tests_properties(test_lapw_external_xc test_lapw_external_xc_dirac PROPERTIES TIMEOUT 120)
 set_tests_properties(test_lapw_external_xc_dirac PROPERTIES

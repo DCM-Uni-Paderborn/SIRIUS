@@ -8,12 +8,14 @@
 #define __XC_CALLBACK_HPP__
 
 #include <functional>
+#include <memory>
 #include <array>
 #include <vector>
 
 namespace sirius {
 
 class Simulation_context;
+class XC_point_symmetry;
 
 /// A fixed distributed quadrature, grouped into complete local atom blocks.
 /** Coordinates and block centres are Cartesian bohr. Blocks and their rows
@@ -31,12 +33,18 @@ struct xc_point_set_t
     std::vector<std::array<double, 3>> block_centres;
 
     explicit xc_point_set_t(Simulation_context const& ctx__);
+    xc_point_set_t(xc_point_set_t const& other);
+    xc_point_set_t&
+    operator=(xc_point_set_t const& other);
     void
     validate(Simulation_context const& ctx__) const;
+    XC_point_symmetry const&
+    symmetry(Simulation_context const& ctx__) const;
 
   private:
     std::array<double, 9> lattice_;
     std::vector<std::array<double, 3>> atoms_;
+    mutable std::shared_ptr<XC_point_symmetry> symmetry_;
 };
 
 /// Primitive fields on the local FFT slab or explicit point rows, in atomic units.

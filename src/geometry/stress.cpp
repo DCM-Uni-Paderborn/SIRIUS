@@ -49,7 +49,7 @@ external_xc_stress(Simulation_context& ctx, Density const& density, Potential& p
     // orbitals add -rho and -tau on diagonal strains. PAW Q is electrostatic,
     // and frozen atom-local fields must not be scaled with the cell volume.
     mdarray<std::complex<double>, 2> augmentation;
-    if (cell.num_paw_atoms()) {
+    if (cell.augment()) {
         augmentation = density.generate_rho_aug();
     }
     double normalization{0};
@@ -60,7 +60,7 @@ external_xc_stress(Simulation_context& ctx, Density const& density, Potential& p
             if (j == 0 && ctx.gvec().offset() + ig == 0) {
                 rho -= ctx.cfg().parameters().extra_charge() / cell.omega();
             }
-            if (cell.num_paw_atoms()) {
+            if (cell.augment()) {
                 rho -= augmentation(ig, j);
             }
             auto v = j == 0 ? potential.xc_potential().rg().f_pw_local(ig)

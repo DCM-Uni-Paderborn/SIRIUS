@@ -25,6 +25,8 @@
 #include "core/r3/r3.hpp"
 #include "core/profiler.hpp"
 #include "core/packed_index.hpp"
+#include <map>
+#include <tuple>
 
 #ifdef SIRIUS_USE_PUGIXML
 #include "pugixml.hpp"
@@ -183,6 +185,9 @@ class Atom_type
     /** The dimension of this array is fully determined by the number and lmax of beta-projectors.
         Beta-projectors must be loaded before loading the Q radial functions. */
     mdarray<Spline<double>, 2> q_radial_functions_l_;
+
+    /// Setup-supplied ultrasoft tau augmentation, including 1/2 and r^2 but no angular weights.
+    std::map<std::tuple<int, int, int>, std::vector<double>> kinetic_augmentation_;
 
     /// True if the pseudopotential is soft and charge augmentation is required.
     bool augment_{false};
@@ -414,6 +419,56 @@ class Atom_type
         deterimine the storage size for the radial functions of the augmented charge. */
     void
     add_q_radial_function(int idxrf1__, int idxrf2__, int l__, std::vector<double> qrf__);
+
+    void
+    add_kinetic_augmentation(int i__, int j__, int l__, std::vector<double> values__)
+    {
+        int n = num_beta_radial_functions();
+        if (i__ < 0 || j__ < 0 || i__ >= n || j__ >= n || l__ < 0 || l__ > 2 * lmax_beta() ||
+            values__.size() != static_cast<size_t>(num_mt_points()) ||
+            std::any_of(values__.begin(), values__.end(), [](double v) { return !std::isfinite(v); })) {
+            RTE_THROW("invalid ultrasoft kinetic augmentation channel");
+        }
+        int li = beta_radial_functions_[i__].first.l(), lj = beta_radial_functions_[j__].first.l();
+        if (l__ < std::abs(li - lj) || l__ > li + lj || (li + lj + l__) % 2) {
+            RTE_THROW("ultrasoft kinetic augmentation has incompatible angular momentum");
+        }
+        if (i__ > j__) {
+            std::swap(i__, j__);
+        }
+        if (!kinetic_augmentation_.emplace(std::make_tuple(i__, j__, l__), std::move(values__)).second) {
+            RTE_THROW("duplicate ultrasoft kinetic augmentation channel");
+        }
+    }
+
+    void
+    check_kinetic_augmentation() const
+    {
+        if (!augment() || is_paw()) {
+            RTE_THROW("ultrasoft kinetic augmentation requires a non-PAW augmented setup");
+        }
+        for (int j = 0; j < num_beta_radial_functions(); j++) {
+            int lj = beta_radial_functions_[j].first.l();
+            for (int i = 0; i <= j; i++) {
+                int li = beta_radial_functions_[i].first.l();
+                for (int l = std::abs(li - lj); l <= li + lj; l += 2) {
+                    if (!kinetic_augmentation_.count({i, j, l})) {
+                        RTE_THROW("ultrasoft XC requires every allowed kinetic augmentation channel, including zeros");
+                    }
+                }
+            }
+        }
+        check_ps_core_kinetic_density();
+    }
+
+    auto const&
+    kinetic_augmentation(int i__, int j__, int l__) const
+    {
+        if (i__ > j__) {
+            std::swap(i__, j__);
+        }
+        return kinetic_augmentation_.at({i__, j__, l__});
+    }
 
     /// Set the radial grid of the given type.
     inline void

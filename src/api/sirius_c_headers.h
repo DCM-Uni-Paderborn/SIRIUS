@@ -1059,7 +1059,10 @@ sirius_add_atom_type_radial_function:
         and the factor 1/2, without a radial Jacobian or spherical-harmonic factor.
         ps_core_tau supplies the distinct pseudo-core tau for ordinary meta-GGA
         nonlinear core corrections in the same units and spin convention.
-        Supply either field after the radial grid, with a value at every grid point.
+        t_aug supplies generator-provided ultrasoft kinetic augmentation r^2 T_ij^L,
+        including the factor 1/2, without angular factors. Both projector indices
+        and angular momentum are required, including explicitly zero channels.
+        Supply these fields after the radial grid, with a value at every grid point.
     rf:
       type: double
       attr: in, required, dimension(num_points)
@@ -2874,7 +2877,7 @@ sirius_set_xc_point_callback:
     Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1
     total fields or ns=2 up/down fields. Explicit sirius_set_xc_spinor_mode
     registration instead supplies ns=4 total/z/x/y fields for norm-conserving PW,
-    PAW, and FP-LAPW. They are jointly reconstructed before the callback.
+    PAW, ultrasoft, and FP-LAPW. They are jointly reconstructed before the callback.
     The energy and descriptor weights do not scale those fields.
     Return raw covectors of the complete discrete energy, including model weights,
     without dividing by quadrature weights or applying host adjoints. Return the
@@ -2882,11 +2885,13 @@ sirius_set_xc_point_callback:
     status are initially zero. Set status nonzero on failure after completing
     callback collectives. Never unwind across the C ABI. The caller retains
     user_data until the context is destroyed. Geometry changes invalidate the
-    supplied quadrature. Scalar/collinear PW and PAW are supported on CPU/GPU,
-    without symmetry reduction. PAW and norm-conserving nonlinear core corrections
+    supplied quadrature. Crystal symmetry requires a symmetry-closed atom quadrature,
+    preserving both weight arrays. The complete point set is retained while k-points
+    may be reduced. Ultrasoft setups additionally supply independent r^2 T_ij^L tables.
+    PW, PAW and ultrasoft are supported on CPU/GPU. PAW and nonlinear core corrections
     require explicitly supplied positive core tau. FP-LAPW fields are supported on
     CPU/GPU with scalar-relativistic or native Dirac radial functions.
-    PW and PAW atomic forces and stress additionally require the point geometry callbacks.
+    PW, PAW and ultrasoft atomic forces and stress additionally require the point geometry callbacks.
     FP-LAPW forces and total stress also require joint Hessian and quadrature-direction
     callbacks and CPU/GPU fp64 orbitals. Scalar and collinear states use full variation.
     Noncollinear states use NR/ZORA second variation with SOC or native Dirac full

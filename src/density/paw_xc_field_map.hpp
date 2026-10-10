@@ -111,8 +111,8 @@ class PAW_xc_field_map
     /** Fourier coefficients are normalized as ordinary SIRIUS potentials. The
      *  rho result includes the Cartesian-gradient adjoint. Apply it as a local
      *  potential and cancel its ordinary smooth-Q projector contraction.
-     *  local_matrices contains the hard-minus-soft response, without Q or a
-     *  frozen-core derivative, in unit_cell().paw_atoms() order.
+     *  local_matrices contains PAW hard-minus-soft or ultrasoft Q/T responses,
+     *  without a frozen-core derivative, in unit_cell().atoms() order.
      *  The tau result must pass through the fine/coarse Fourier adjoint before
      *  the positive-tau orbital operator is applied. No second radial integral
      *  or occupation factor belongs in either returned projector contribution.

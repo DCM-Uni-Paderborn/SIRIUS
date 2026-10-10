@@ -66,7 +66,12 @@ class Potential : public Field4D
     std::unique_ptr<Field4D> kinetic_potential_;
     bool external_xc_registered_{false};
     double external_xc_energy_{0};
-    std::vector<mdarray<double, 3>> external_paw_d_mtrx_;
+    std::vector<mdarray<double, 3>> external_projector_d_mtrx_;
+    /// Ultrasoft local XC response after removing the duplicate Fourier Q contraction.
+    std::vector<mdarray<double, 3>> external_uspp_d_mtrx_;
+
+    void
+    add_external_projector_d_mtrx(int ia__, mdarray<double, 3>& result__) const;
     std::unique_ptr<lapw_xc_field_adjoint_t> lapw_xc_derivatives_;
     std::optional<double> lapw_xc_energy_;
     /// Grid XC energy using the PAW orbital density without compensation charge.
@@ -1003,6 +1008,22 @@ class Potential : public Field4D
         return charge * xc_potential().integrate().total / unit_cell_.omega();
     }
 
+    /// Ultrasoft XC projector contraction not included in the smooth-field integrals.
+    double
+    energy_external_augmentation(Density const& density__) const
+    {
+        double result{0};
+        if (external_xc_registered_ && !ctx_.full_potential()) {
+            for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+                if (!external_uspp_d_mtrx_.empty() && external_uspp_d_mtrx_[ia].size()) {
+                    auto dm = density__.density_matrix_aux(atom_index_t::global(ia));
+                    result += calc_PAW_one_elec_energy(unit_cell_.atom(ia), dm, external_uspp_d_mtrx_[ia]);
+                }
+            }
+        }
+        return result;
+    }
+
     /// Integral of \f$ \rho({\bf r}) V^{XC}({\bf r}) \f$.
     auto
     energy_vxc(Density const& density__) const
@@ -1011,7 +1032,8 @@ class Potential : public Field4D
         if (lapw_xc_derivatives_) {
             return lapw_xc_contractions(density__).rho;
         }
-        return inner(density__.rho(), xc_potential()) - external_xc_background_contraction();
+        return inner(density__.rho(), xc_potential()) - external_xc_background_contraction() +
+               energy_external_augmentation(density__);
     }
 
     /// Integral of \f$ \rho_{c}({\bf r}) V^{XC}({\bf r}) \f$.
