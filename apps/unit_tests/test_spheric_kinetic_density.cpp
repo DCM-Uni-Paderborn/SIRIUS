@@ -488,6 +488,7 @@ test_atom_kinetic_density(bool paw__, int num_mag_dims__)
     }
     ctx.unit_cell().add_atom("H", {0, 0, 0}, {0, 0, 1});
     ctx.initialize();
+    Density density(ctx);
     if (!paw__) {
         for (auto const& rf : type.indexr()) {
             std::vector<double> values(nr), derivatives(nr);
@@ -496,11 +497,11 @@ test_atom_kinetic_density(bool paw__, int num_mag_dims__)
                 values[ir]      = std::pow(r, rf.am.l()) * std::exp(-0.5 * r * r);
                 derivatives[ir] = (rf.am.l() - r * r) * values[ir];
             }
-            ctx.unit_cell().atom(0).symmetry_class().radial_function(rf.idxrf, values);
-            ctx.unit_cell().atom(0).symmetry_class().radial_function_derivative(rf.idxrf, derivatives);
+            auto& basis = density.lapw_basis_sptr()->radial_basis(atom_index_t::global(0));
+            basis.radial_function(rf.idxrf, values);
+            basis.radial_function_derivative(rf.idxrf, derivatives);
         }
     }
-    Density density(ctx);
     density.density_matrix(0).zero();
     for (int ispn = 0; ispn < ctx.num_spins(); ispn++) {
         density.density_matrix(0)(0, 0, ispn) = 0.8 / (ispn + 1);

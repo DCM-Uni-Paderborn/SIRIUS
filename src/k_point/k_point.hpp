@@ -297,12 +297,13 @@ class K_point
         and local-orbital coefficients copied directly from \f$ c_{j i}^{\bf k} \f$.
      */
     void
-    generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf::Wave_functions<T>& wf__, int ispn__);
+    generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf::Wave_functions<T>& wf__, int ispn__,
+                                 LAPW_radial_basis const& lapw_basis__);
 
     /// Store positive-energy PW coefficients in two slots and intrinsic full-j MT coefficients in slot zero.
     /** The PW slots label free positive-energy spinors, not the four physical Dirac components. */
     void
-    generate_dirac_wave_functions(mdarray<std::complex<double>, 2> const& evec__,
+    generate_dirac_wave_functions(mdarray<std::complex<double>, 2> const& evec__, LAPW_radial_basis const& lapw_basis__,
                                   wf::Wave_functions<T>* target__ = nullptr);
 
     /// Generate two-component spinor wave functions.

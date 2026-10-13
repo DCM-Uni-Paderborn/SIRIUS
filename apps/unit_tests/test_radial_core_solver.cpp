@@ -162,7 +162,7 @@ test_radial_core_solver()
                                 peak     = std::max(peak, std::abs(d));
                                 error    = std::max(
                                         error, std::abs(d - ((*std::get<1>(fields))[ir] - (*std::get<2>(fields))[ir]) /
-                                                                       (2 * h)));
+                                                                    (2 * h)));
                             }
                         }
                         check("projected radial energy derivative", error / peak, 2e-6);
@@ -210,8 +210,8 @@ test_radial_core_solver()
                     double r   = grid[ir];
                     double tau = 0.5 * normalization * std::pow(r, 2 * gamma - 2) * std::exp(-2 * beta * r) *
                                  std::pow((gamma - 1) / r - beta, 2);
-                    peak  = std::max(peak, tau);
-                    error = std::max(error, std::abs(fourpi * state.tau[ir] - tau));
+                    peak       = std::max(peak, tau);
+                    error      = std::max(error, std::abs(fourpi * state.tau[ir] - tau));
                 }
                 check("analytic ZORA 1s energy", std::abs(state.energy / (-0.5 * beta * beta) - 1), 2e-8);
                 check("analytic ZORA 1s positive tau", error / peak, 2e-6);
@@ -490,7 +490,7 @@ test_dirac_core_reference()
                                               std::exp(-2 * beta * r) *
                                               ((1 + ratio * ratio) * d * d +
                                                (l * (l + 1.0) + ratio * ratio * k * (k + 1.0)) / (r * r));
-                        peak = std::max(peak, expected_tau);
+                        peak                = std::max(peak, expected_tau);
                         ode_error =
                                 std::max(ode_error, std::abs(reference.positive_kinetic_density()(ir) - expected_tau));
                         double difference = std::abs(fourpi * state.tau[ir] - expected_tau);
@@ -650,7 +650,7 @@ test_dirac_xc_core(bool native__, int native_points__)
             auto radial_response = Radial_solver(z, potential, grid, 1e-12, 1e-12)
                                            .solve_dirac_potential_response(radial_order, kappa, radial_energy, dv,
                                                                            radial_energy_direction);
-            auto radial = radial_response.value;
+            auto radial          = radial_response.value;
             radial_solver_result_t dradial{0,
                                            radial_response.p,
                                            radial_response.rdudr,
@@ -770,8 +770,8 @@ test_dirac_xc_core(bool native__, int native_points__)
                             double fd = ((orbital ? ps : 1) * (plus[j].*member)[ir] -
                                          (orbital ? ms : 1) * (minus[j].*member)[ir]) /
                                         (2 * step);
-                            error = std::max(error, std::abs(fd - (tangent.*member)[ir]));
-                            peak  = std::max(peak, std::abs((value.*member)[ir]));
+                            error     = std::max(error, std::abs(fd - (tangent.*member)[ir]));
+                            peak      = std::max(peak, std::abs((value.*member)[ir]));
                         }
                         check("Dirac XC spinor/density/tau response", error / std::max(peak, 1e-30), 2e-6);
                     }
@@ -858,9 +858,10 @@ test_dirac_xc_core(bool native__, int native_points__)
             type.add_aw_descriptor(1, 0, -0.3, 1, 0);
             cell.add_atom("Zn", {0, 0, 0});
             cell.initialize();
+            lapw_radial_basis_t atom_basis(0, type);
             std::vector<radial_core_state_t> atom_response;
-            auto atom_states = cell.atom(0).symmetry_class().solve_core_states(
-                    grid, kappa, changed, count, fields, relativity_t::dirac, &direction, &atom_response);
+            auto atom_states = atom_basis.solve_core_states(grid, kappa, changed, count, fields, relativity_t::dirac,
+                                                            &direction, &atom_response);
             for (int j = 0; j < count; j++) {
                 check("shared Dirac atom core solver",
                       atom_states[j].energy == fresh[j].energy && atom_states[j].rho == fresh[j].rho &&
@@ -874,8 +875,10 @@ test_dirac_xc_core(bool native__, int native_points__)
             }
             cell.atom(0).set_position({0.01, 0, 0});
             cell.update();
-            auto moved_states = cell.atom(0).symmetry_class().solve_core_states(
-                    grid, kappa, changed, count, fields, relativity_t::dirac, &direction, &atom_response);
+            lapw_radial_basis_t moved_basis(0, type);
+            moved_basis.inherit_dirac_core_reference(atom_basis);
+            auto moved_states = moved_basis.solve_core_states(grid, kappa, changed, count, fields, relativity_t::dirac,
+                                                              &direction, &atom_response);
             for (int j = 0; j < count; j++) {
                 check("Dirac core projector survives symmetry-class rebuild",
                       moved_states[j].energy == fresh[j].energy && moved_states[j].rho == fresh[j].rho &&
@@ -1192,9 +1195,9 @@ test_dirac_radial_solution()
                 auto p = zero, q = zero;
                 for (int ir = 0; ir < grid.num_points(); ir++) {
                     double x = momentum * grid[ir], jl = gsl_sf_bessel_jl(l, x);
-                    p[ir] = grid[ir] * jl;
-                    q[ir] = ((l + 1 + kappa) * jl - x * gsl_sf_bessel_jl(l + 1, x)) /
-                            (2 * speed_of_light + energy / speed_of_light);
+                    p[ir]       = grid[ir] * jl;
+                    q[ir]       = ((l + 1 + kappa) * jl - x * gsl_sf_bessel_jl(l + 1, x)) /
+                                  (2 * speed_of_light + energy / speed_of_light);
                     product(ir) = p[ir] * p[ir] + q[ir] * q[ir];
                 }
                 double norm = std::sqrt(product.interpolate().integrate(0)), error{0};
@@ -1454,7 +1457,6 @@ test_radial_basis_response(bool dirac_core_only)
         cell.add_atom(label, {0.23, 0.31, 0.43});
         cell.initialize();
         auto& atom = cell.atom(0);
-        auto& cls  = atom.symmetry_class();
         fft::Gvec gkvec({0.07, -0.03, 0.02}, cell.reciprocal_lattice_vectors(), 2.0, cell.comm(), false);
         Matching_coefficients matching(cell, gkvec);
         auto const& grid = type.radial_grid();
@@ -1484,6 +1486,8 @@ test_radial_basis_response(bool dirac_core_only)
                 }
             }
         }
+        LAPW_radial_basis radial_basis(cell, parameters.valence_relativity(), {potential}, {fields});
+        auto& cls   = radial_basis.radial_basis_for_class(0);
         auto sample = [&](double step) {
             auto v  = potential;
             auto xc = fields;
@@ -1498,7 +1502,7 @@ test_radial_basis_response(bool dirac_core_only)
             cls.set_spherical_potential(v);
             cls.set_spherical_xc_derivatives(xc);
             // Exercise the production owner-rank generation and replicated response.
-            cell.generate_radial_functions(std::cout);
+            radial_basis.generate_radial_functions();
             std::vector<double> values;
             for (int j : {0, 1}) {
                 for (int i = 0; i < type.mt_radial_basis_size(); i++) {
@@ -1515,7 +1519,7 @@ test_radial_basis_response(bool dirac_core_only)
                 }
             }
             mdarray<std::complex<double>, 2> alm({gkvec.count(), type.mt_aw_basis_size()});
-            matching.generate<false>(atom, alm);
+            matching.generate<false>(atom, alm, cls);
             return std::make_pair(std::move(values), std::move(alm));
         };
         auto baseline = sample(0);
@@ -1537,7 +1541,7 @@ test_radial_basis_response(bool dirac_core_only)
         auto response          = cls.radial_basis_potential_response(direction, xc_direction);
         if (core_relativity == "dirac") {
             auto [extended_grid, extended_potential] = type.core_radial_problem(potential);
-            Atom_symmetry_class::core_states_t dcores;
+            lapw_radial_basis_t::core_states_t dcores;
             auto extended_direction = direction;
             extended_direction.resize(extended_grid.num_points(), direction.back());
             auto cores = cls.solve_occupied_core_states(extended_grid, extended_potential, fields, relativity_t::dirac,
@@ -1602,8 +1606,8 @@ test_radial_basis_response(bool dirac_core_only)
         check("LO boundary response", boundary_error, 2e-10);
         mdarray<std::complex<double>, 2> dalm({gkvec.count(), type.mt_aw_basis_size()});
         mdarray<std::complex<double>, 2> conjugate({gkvec.count(), type.mt_aw_basis_size()});
-        matching.generate_potential_response<false>(atom, response, dalm);
-        matching.generate_potential_response<true>(atom, response, conjugate);
+        matching.generate_potential_response<false>(atom, response, dalm, cls);
+        matching.generate_potential_response<true>(atom, response, conjugate, cls);
         double conjugation_error{0};
         for (size_t i = 0; i < dalm.size(); i++) {
             conjugation_error = std::max(conjugation_error, std::abs(dalm[i] - std::conj(conjugate[i])));
@@ -1743,7 +1747,6 @@ test_dirac_radial_basis()
         }
         cell.add_atom("Ne", {0.23, 0.31, 0.43});
         cell.initialize();
-        auto& cls = cell.atom(0).symmetry_class();
         fft::Gvec gkvec({0.07, -0.03, 0.02}, cell.reciprocal_lattice_vectors(), 2.0, cell.comm(), false);
         Matching_coefficients matching(cell, gkvec);
         auto const& grid = type.radial_grid();
@@ -1770,6 +1773,8 @@ test_dirac_radial_basis()
                 xc_direction[1][ir] *= 0.001 * std::sin(3 * r) * std::exp(-r);
             }
         }
+        LAPW_radial_basis radial_basis(cell, parameters.valence_relativity(), {potential}, {fields});
+        auto& cls   = radial_basis.radial_basis_for_class(0);
         auto sample = [&](double h) {
             auto v  = potential;
             auto xc = fields;
@@ -1783,7 +1788,7 @@ test_dirac_radial_basis()
             }
             cls.set_spherical_potential(v);
             cls.set_spherical_xc_derivatives(xc);
-            cell.generate_radial_functions(std::cout);
+            radial_basis.generate_radial_functions();
             std::vector<double> values;
             for (int c : {0, 1}) {
                 for (int field : {0, 1}) {
@@ -1805,7 +1810,7 @@ test_dirac_radial_basis()
                 }
             }
             mdarray<std::complex<double>, 3> alm({gkvec.count(), type.mt_aw_basis_size(), 4});
-            matching.generate<false>(cell.atom(0), alm);
+            matching.generate<false>(cell.atom(0), alm, cls);
             return std::pair{std::move(values), std::move(alm)};
         };
         auto baseline = sample(0);
@@ -1817,7 +1822,7 @@ test_dirac_radial_basis()
         std::vector<radial_basis_response_t> responses;
         responses.push_back(cls.radial_basis_potential_response(direction, xc_direction));
         auto const& response = responses.front();
-        Dirac_lapw_basis global_basis(cell, gkvec);
+        Dirac_lapw_basis global_basis(cell, gkvec, radial_basis);
         auto metric       = global_basis.overlap();
         auto dmetric      = global_basis.overlap(&responses);
         auto hamiltonian  = global_basis.hamiltonian();
@@ -1872,7 +1877,7 @@ test_dirac_radial_basis()
         mdarray<std::complex<double>, 2> field_matrix, dfield_matrix;
         std::array<std::vector<Flm>, 2> covectors;
         auto local_operator = [&](radial_basis_response_t const* tangent = nullptr) {
-            LAPW_xc_atom op(cell.atom(0), 6);
+            LAPW_xc_atom op(cell.atom(0), cls, 6);
             std::vector<mdarray<std::complex<double>, 2>> result;
             result.push_back(mdarray<std::complex<double>, 2>({type.mt_basis_size(), type.mt_basis_size()}));
             result[0].zero();
@@ -1948,7 +1953,7 @@ test_dirac_radial_basis()
                     dm(i, j, 0) = std::conj(mt[i]) * mt[j];
                 }
             }
-            auto fields     = LAPW_xc_atom(cell.atom(0), 6).fields(dm);
+            auto fields     = LAPW_xc_atom(cell.atom(0), cls, 6).fields(dm);
             auto const& rho = fields[0][0];
             Spline<double> mt_charge(grid), sphere_pw_charge(grid), sphere_pw_kinetic(grid);
             SHT angular(device_t::CPU, 10);
@@ -2157,13 +2162,13 @@ test_dirac_radial_basis()
         check("Dirac radial response layout", baseline.first.size() == analytic.size() ? 0 : 1, 0);
         mdarray<std::complex<double>, 3> dalm({gkvec.count(), type.mt_aw_basis_size(), 4});
         mdarray<std::complex<double>, 3> conjugated({gkvec.count(), type.mt_aw_basis_size(), 4});
-        matching.generate_potential_response<false>(cell.atom(0), response, dalm);
+        matching.generate_potential_response<false>(cell.atom(0), response, dalm, cls);
         double matching_conjugation_error{0};
         for (bool derivative : {false, true}) {
             if (derivative) {
-                matching.generate_potential_response<true>(cell.atom(0), response, conjugated);
+                matching.generate_potential_response<true>(cell.atom(0), response, conjugated, cls);
             } else {
-                matching.generate<true>(cell.atom(0), conjugated);
+                matching.generate<true>(cell.atom(0), conjugated, cls);
             }
             auto const& original = derivative ? dalm : baseline.second;
             for (size_t i = 0; i < original.size(); i++) {
@@ -2214,16 +2219,17 @@ test_dirac_radial_basis()
         }
         check("Dirac both-component plane-wave matching", matching_boundary_error, 2e-10);
         check("Dirac matching conjugation", matching_conjugation_error, 1e-14);
-        matching.generate_potential_response<false>(cell.atom(0), zero, conjugated);
+        matching.generate_potential_response<false>(cell.atom(0), zero, conjugated, cls);
         double matching_null_error{0};
         for (auto z : conjugated) {
             matching_null_error = std::max(matching_null_error, std::abs(z));
         }
         check("zero Dirac matching response", matching_null_error, 0);
         mdarray<std::complex<double>, 2> scalar_alm({gkvec.count(), type.mt_aw_basis_size()});
-        check.reject("Dirac scalar matching rejected", [&] { matching.generate<false>(cell.atom(0), scalar_alm); });
+        check.reject("Dirac scalar matching rejected",
+                     [&] { matching.generate<false>(cell.atom(0), scalar_alm, cls); });
         double norm_error{0}, tangent_error{0}, boundary_error{0}, null_error{0}, small_norm{0}, core_overlap{0};
-        Atom_symmetry_class::core_states_t cores;
+        lapw_radial_basis_t::core_states_t cores;
         if (core) {
             auto [extended_grid, extended_potential] = type.core_radial_problem(potential);
             cores = cls.solve_occupied_core_states(extended_grid, extended_potential, fields, relativity_t::dirac);
@@ -2276,20 +2282,19 @@ test_dirac_radial_basis()
         for (double h : {1e-3, 5e-4}) {
             auto plus           = sample(h);
             auto plus_spherical = cls.dirac_spherical_matrices();
-            auto plus_metric    = Dirac_lapw_basis(cell, gkvec).overlap();
-            auto plus_h         = Dirac_lapw_basis(cell, gkvec).hamiltonian();
-            auto plus_field =
-                    !core && !auto_enu
-                            ? Dirac_lapw_basis(cell, gkvec).field_operator(field_gvec, rho_pw, tau_pw, local_operator())
-                            : mdarray<std::complex<double>, 2>();
-            auto minus           = sample(-h);
+            auto plus_metric    = Dirac_lapw_basis(cell, gkvec, radial_basis).overlap();
+            auto plus_h         = Dirac_lapw_basis(cell, gkvec, radial_basis).hamiltonian();
+            auto plus_field = !core && !auto_enu ? Dirac_lapw_basis(cell, gkvec, radial_basis)
+                                                           .field_operator(field_gvec, rho_pw, tau_pw, local_operator())
+                                                 : mdarray<std::complex<double>, 2>();
+            auto minus      = sample(-h);
             auto minus_spherical = cls.dirac_spherical_matrices();
-            auto minus_metric    = Dirac_lapw_basis(cell, gkvec).overlap();
-            auto minus_h         = Dirac_lapw_basis(cell, gkvec).hamiltonian();
-            auto minus_field =
-                    !core && !auto_enu
-                            ? Dirac_lapw_basis(cell, gkvec).field_operator(field_gvec, rho_pw, tau_pw, local_operator())
-                            : mdarray<std::complex<double>, 2>();
+            auto minus_metric    = Dirac_lapw_basis(cell, gkvec, radial_basis).overlap();
+            auto minus_h         = Dirac_lapw_basis(cell, gkvec, radial_basis).hamiltonian();
+            auto minus_field     = !core && !auto_enu
+                                           ? Dirac_lapw_basis(cell, gkvec, radial_basis)
+                                                     .field_operator(field_gvec, rho_pw, tau_pw, local_operator())
+                                           : mdarray<std::complex<double>, 2>();
             auto [metric_error, derivative_peak] = derivative_error(dmetric, plus_metric, minus_metric, h);
             check("nonzero global Dirac metric potential derivative", derivative_peak > 1e-8 ? 0 : 1, 0);
             check("global Dirac metric potential derivative", metric_error / derivative_peak, 2e-6);
@@ -2357,7 +2362,7 @@ test_dirac_radial_basis()
                 Matching_coefficients fixed(cell, vectors);
                 mdarray<std::complex<double>, 3> dalm({vectors.count(), type.mt_aw_basis_size(), 4});
                 mdarray<std::complex<double>, 3> conjugated({vectors.count(), type.mt_aw_basis_size(), 4});
-                Dirac_lapw_basis basis(cell, vectors);
+                Dirac_lapw_basis basis(cell, vectors, radial_basis);
                 mdarray<double, 2> atoms({3, cell.num_atoms()});
                 for (int x = 0; x < 3; x++) {
                     atoms(x, 0) = displacement[x];
@@ -2412,12 +2417,12 @@ test_dirac_radial_basis()
                     check.reject("different native Dirac geometry rejected collectively",
                                  [&] { basis.geometry_response(atoms, bad_strain); });
                 }
-                fixed.generate_geometry_response<false>(cell.atom(0), displacement, strain, dalm);
-                fixed.generate_geometry_response<true>(cell.atom(0), displacement, strain, conjugated);
+                fixed.generate_geometry_response<false>(cell.atom(0), displacement, strain, dalm, cls);
+                fixed.generate_geometry_response<true>(cell.atom(0), displacement, strain, conjugated, cls);
                 mdarray<std::complex<double>, 3> positive_dalm({vectors.count(), type.mt_aw_basis_size(), 2});
                 mdarray<std::complex<double>, 3> positive_conjugated({vectors.count(), type.mt_aw_basis_size(), 2});
-                fixed.generate_geometry_response<false>(cell.atom(0), displacement, strain, positive_dalm);
-                fixed.generate_geometry_response<true>(cell.atom(0), displacement, strain, positive_conjugated);
+                fixed.generate_geometry_response<false>(cell.atom(0), displacement, strain, positive_dalm, cls);
+                fixed.generate_geometry_response<true>(cell.atom(0), displacement, strain, positive_conjugated, cls);
                 std::array<double, 2> error{}, peak{};
                 double conjugation_error{0}, positive_error{0}, positive_peak{0};
                 for (size_t i = 0; i < dalm.size(); i++) {
@@ -2443,10 +2448,10 @@ test_dirac_radial_basis()
                     Matching_coefficients changed(cell, vectors);
                     mdarray<std::complex<double>, 3> result({vectors.count(), type.mt_aw_basis_size(), 4});
                     mdarray<std::complex<double>, 3> positive_result({vectors.count(), type.mt_aw_basis_size(), 2});
-                    changed.generate<false>(cell.atom(0), result);
-                    changed.generate<false>(cell.atom(0), positive_result);
+                    changed.generate<false>(cell.atom(0), result, cls);
+                    changed.generate<false>(cell.atom(0), positive_result, cls);
                     field_gvec.lattice_vectors(cell.reciprocal_lattice_vectors());
-                    Dirac_lapw_basis shifted_basis(cell, vectors);
+                    Dirac_lapw_basis shifted_basis(cell, vectors, radial_basis);
                     return geometry_sample_t{
                             std::move(result),
                             std::move(positive_result),
@@ -2614,7 +2619,7 @@ test_core_reference()
     type.add_aw_descriptor(1, 0, -0.3, 1, 0);
     cell.add_atom("He", {0, 0, 0});
     cell.initialize();
-    auto& atom_class = cell.atom(0).symmetry_class();
+    lapw_radial_basis_t atom_class(0, type);
     radial_core_reference_t reference;
     auto equal = [](auto const& a, auto const& b) {
         if (a.size() != b.size()) {

@@ -20,6 +20,7 @@ class Dirac_lapw_basis
 {
   private:
     Unit_cell const& cell_;
+    LAPW_radial_basis const& radial_;
     fft::Gvec const& gkvec_;
     Matching_coefficients matching_;
     std::vector<mdarray<std::complex<double>, 2>> atoms_;
@@ -41,15 +42,16 @@ class Dirac_lapw_basis
     {
         auto const& atom = cell_.atom(ia__);
         auto const& type = atom.type();
+        auto const& rb   = radial_.radial_basis(atom_index_t::global(ia__));
         int ng = gkvec_.num_gvec(), naw = type.mt_aw_basis_size();
         mdarray<std::complex<double>, 3> local({gkvec_.count(), naw, 2}), full({ng, naw, 2});
         if (displacements__) {
             r3::vector<double> d{(*displacements__)(0, ia__), (*displacements__)(1, ia__), (*displacements__)(2, ia__)};
-            matching_.generate_geometry_response<false>(atom, d, *strain__, local);
+            matching_.generate_geometry_response<false>(atom, d, *strain__, local, rb);
         } else if (response__) {
-            matching_.generate_potential_response<false>(atom, *response__, local);
+            matching_.generate_potential_response<false>(atom, *response__, local, rb);
         } else {
-            matching_.generate<false>(atom, local);
+            matching_.generate<false>(atom, local, rb);
         }
         for (int s : {0, 1}) {
             for (int xi = 0; xi < naw; xi++) {
@@ -237,7 +239,7 @@ class Dirac_lapw_basis
     {
         auto result = interstitial_matrix(part__ == 0, &displacements__, &strain__);
         for (int ia = 0; ia < cell_.num_atoms(); ia++) {
-            auto radial = cell_.atom(ia).symmetry_class().dirac_spherical_matrices();
+            auto radial = radial_.radial_basis(atom_index_t::global(ia)).dirac_spherical_matrices();
             auto matrix = spherical_matrix(radial[part__], ia);
             auto da     = atom_coefficients(ia, nullptr, &displacements__, &strain__);
             add_projection(da, matrix, atoms_[ia], result);
@@ -273,14 +275,15 @@ class Dirac_lapw_basis
         }
         for (int ia = 0; ia < cell_.num_atoms(); ia++) {
             auto const& atom = cell_.atom(ia);
-            auto radial      = atom.symmetry_class().dirac_spherical_matrices();
+            auto const& rb   = radial_.radial_basis(atom_index_t::global(ia));
+            auto radial      = rb.dirac_spherical_matrices();
             auto matrix      = spherical_matrix(radial[part__], ia);
             auto const& a    = atoms_[ia];
             if (response__) {
                 auto const& response = (*response__)[atom.symmetry_class().id()];
                 auto da              = atom_coefficients(ia, &response);
-                auto dradial         = atom.symmetry_class().dirac_spherical_matrices(
-                        &response, direction__.empty() ? std::vector<double>{} : direction__[ia]);
+                auto dradial = rb.dirac_spherical_matrices(&response, direction__.empty() ? std::vector<double>{}
+                                                                                          : direction__[ia]);
                 auto dmatrix = spherical_matrix(dradial[part__], ia);
                 add_projection(da, matrix, a, result);
                 add_projection(a, matrix, da, result);
@@ -293,8 +296,9 @@ class Dirac_lapw_basis
     }
 
   public:
-    Dirac_lapw_basis(Unit_cell const& cell__, fft::Gvec const& gkvec__)
+    Dirac_lapw_basis(Unit_cell const& cell__, fft::Gvec const& gkvec__, LAPW_radial_basis const& radial__)
         : cell_(cell__)
+        , radial_(radial__)
         , gkvec_(gkvec__)
         , matching_(cell__, gkvec__)
     {
@@ -393,7 +397,7 @@ class Dirac_lapw_basis
                        !tau__.on_host() || local__.size() != static_cast<size_t>(cell_.num_atoms()) ||
                        (response__ != nullptr) != (local_response__ != nullptr) || (response__ && strain__) ||
                        (local_response__ && local_response__->size() != local__.size());
-        auto finite = [](auto value) { return std::isfinite(value.real()) && std::isfinite(value.imag()); };
+        auto finite  = [](auto value) { return std::isfinite(value.real()) && std::isfinite(value.imag()); };
         if (!invalid) {
             for (auto const* pw : {&rho__, &tau__}) {
                 for (auto value : *pw) {

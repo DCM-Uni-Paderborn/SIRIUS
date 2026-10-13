@@ -16,6 +16,7 @@
 
 #include <iomanip>
 #include "function3d/field4d.hpp"
+#include "lapw/lapw_radial_basis.hpp"
 #include "function3d/paw_field4d.hpp"
 #include "function3d/periodic_function.hpp"
 #include "function3d/spheric_function_set.hpp"
@@ -239,6 +240,9 @@ class Density : public Field4D
 
     /// Scalar and spin-vector tau (plus core inside LAPW spheres), mixed with rho/magnetization.
     std::unique_ptr<Field4D> kinetic_density_;
+    std::shared_ptr<LAPW_radial_basis> lapw_basis_;
+    friend void
+    copy(Density const&, Density&);
 
     bool external_xc_registered_;
 
@@ -326,7 +330,7 @@ class Density : public Field4D
 
     /// Generate valence density in the muffin-tins
     void
-    generate_valence_mt();
+    generate_valence_mt(LAPW_radial_basis const& basis__);
 
     /// Generate pseudo core charge density needed for non-linear core correction.
     void
@@ -423,7 +427,39 @@ class Density : public Field4D
      */
     template <typename T>
     void
-    generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__);
+    generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> lapw_basis__, bool symmetrize__,
+             bool add_core__, bool transform_to_rg__);
+
+    template <typename T>
+    void
+    generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__)
+    {
+        generate<T>(ks__, lapw_basis_, symmetrize__, add_core__, transform_to_rg__);
+    }
+
+    std::shared_ptr<LAPW_radial_basis>
+    lapw_basis_sptr() const
+    {
+        return lapw_basis_;
+    }
+
+    void
+    set_lapw_basis(std::shared_ptr<LAPW_radial_basis> basis__)
+    {
+        if (basis__ && &basis__->unit_cell() != &unit_cell_) {
+            RTE_THROW("LAPW density and radial basis must belong to the same unit cell");
+        }
+        lapw_basis_ = std::move(basis__);
+    }
+
+    LAPW_radial_basis const&
+    lapw_basis() const
+    {
+        if (!lapw_basis_) {
+            RTE_THROW("LAPW density has no radial basis");
+        }
+        return *lapw_basis_;
+    }
 
     /// Generate valence charge density and magnetization from the wave functions.
     /** The interstitial density is generated on the coarse FFT grid and then transformed to the PW domain.
@@ -432,7 +468,7 @@ class Density : public Field4D
      */
     template <typename T>
     void
-    generate_valence(K_point_set const& ks__);
+    generate_valence(K_point_set const& ks__, LAPW_radial_basis const* basis__);
 
     /// Generate unsymmetrized smooth valence kinetic-energy densities from occupied orbitals.
     /** Returns one total component for a nonmagnetic calculation, or separate
@@ -963,9 +999,10 @@ inline void
 copy(Density const& src__, Density& dest__)
 {
     if (src__.has_kinetic_density() != dest__.has_kinetic_density() ||
-        (src__.has_kinetic_density() && &src__.ctx() != &dest__.ctx())) {
+        ((src__.has_kinetic_density() || src__.lapw_basis_) && &src__.ctx() != &dest__.ctx())) {
         RTE_THROW("kinetic-density copy requires matching storage in the same context");
     }
+    dest__.lapw_basis_ = src__.lapw_basis_;
     for (int j = 0; j < src__.ctx().num_mag_dims() + 1; j++) {
         copy(src__.component(j).rg(), dest__.component(j).rg());
         if (src__.has_kinetic_density()) {
@@ -1007,7 +1044,7 @@ get_rho_up_dn(Density const& density__, double add_delta_rho_xc__ = 0.0, double 
 
     /* compute "up" and "dn" components and also check for negative values of density */
     double rhomin{0};
-    #pragma omp parallel for reduction(min : rhomin)
+#pragma omp parallel for reduction(min : rhomin)
     for (int ir = 0; ir < num_points; ir++) {
         r3::vector<double> m;
         for (int j = 0; j < ctx.num_mag_dims(); j++) {

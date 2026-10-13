@@ -40,15 +40,15 @@ double
 xc_mt(Radial_grid<double> const& rgrid__, SHT const& sht__, std::vector<XC_functional> const& xc_func__,
       int num_mag_dims__, std::vector<Flm const*> rho__, std::vector<Flm*> vxc__, Flm* exc__, bool use_lalp__);
 
+/* Forward declartaion */
+class LAPW_radial_basis;
+
 /// Generate effective potential from charge density and magnetization.
-/** \note At some point we need to update the atomic potential with the new MT potential. This is simple if the
-          effective potential is a global function. Otherwise we need to pass the effective potential between MPI ranks.
-          This is also simple, but requires some time. It is also easier to mix the global functions.  */
 class Potential : public Field4D
 {
   private:
     /// Alias to unit cell.
-    Unit_cell& unit_cell_;
+    Unit_cell const& unit_cell_;
 
     /// Communicator of the simulation.
     mpi::Communicator const& comm_;
@@ -74,6 +74,9 @@ class Potential : public Field4D
     add_external_projector_d_mtrx(int ia__, mdarray<double, 3>& result__) const;
     std::unique_ptr<lapw_xc_field_adjoint_t> lapw_xc_derivatives_;
     std::optional<double> lapw_xc_energy_;
+    mutable std::shared_ptr<LAPW_radial_basis> lapw_basis_;
+    friend void
+    copy(Potential const&, Potential&);
     /// Grid XC energy using the PAW orbital density without compensation charge.
     std::optional<double> paw_meta_grid_energy_;
 
@@ -218,7 +221,7 @@ class Potential : public Field4D
     calc_PAW_local_Dij(typename atom_index_t::global ia__, mdarray<double, 3>& d_mtrx_paw__);
 
     double
-    calc_PAW_hartree_potential(Atom& atom, Flm const& full_density, Flm& full_potential);
+    calc_PAW_hartree_potential(Atom const& atom, Flm const& full_density, Flm& full_potential);
 
     double
     calc_PAW_one_elec_energy(Atom const& atom__, mdarray<double, 2> const& density_matrix__,
@@ -756,9 +759,6 @@ class Potential : public Field4D
     void
     generate(Density const& density__, bool use_sym__, bool transform_to_rg__);
 
-    void
-    update_atomic_potential();
-
     template <device_t pu>
     void
     add_mt_contribution_to_pw();
@@ -1152,15 +1152,26 @@ class Potential : public Field4D
     {
         return vdw_stress_kernel_;
     }
+
     inline auto&
     vdw_stress_gradient()
     {
         return vdw_stress_gradient_;
     }
+
     inline auto&
     vdw_stress_potential()
     {
         return vdw_stress_potential_;
+    }
+
+    std::shared_ptr<LAPW_radial_basis>
+    create_lapw_basis() const;
+
+    std::shared_ptr<LAPW_radial_basis>
+    lapw_basis_sptr() const
+    {
+        return lapw_basis_ ? lapw_basis_ : create_lapw_basis();
     }
 };
 
@@ -1170,6 +1181,10 @@ copy(Potential const& src__, Potential& dest__)
     if (src__.lapw_xc_derivatives() || dest__.lapw_xc_derivatives()) {
         RTE_THROW("copying staged LAPW XC operators is not implemented");
     }
+    if (src__.lapw_basis_ && &src__.ctx() != &dest__.ctx()) {
+        RTE_THROW("LAPW potential copy requires the same context");
+    }
+    dest__.lapw_basis_ = src__.lapw_basis_;
     for (int j = 0; j < src__.ctx().num_mag_dims() + 1; j++) {
         copy(src__.component(j).rg(), dest__.component(j).rg());
         if (src__.ctx().full_potential()) {

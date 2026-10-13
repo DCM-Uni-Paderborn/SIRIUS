@@ -389,7 +389,8 @@ Density::generate_mt_valence_kinetic_density(int ia__) const
     }
     auto const& atom = unit_cell_.atom(ia__);
     if (ctx_.num_mag_dims() == 3 || ctx_.valence_relativity() == relativity_t::dirac) {
-        auto fields = LAPW_xc_atom(atom, ctx_.lmax_rho()).fields(density_matrix(ia__));
+        auto fields = LAPW_xc_atom(atom, lapw_basis().radial_basis(atom_index_t::global(ia__)), ctx_.lmax_rho())
+                              .fields(density_matrix(ia__));
         return std::move(fields[1]);
     }
     auto const& type = atom.type();
@@ -397,9 +398,10 @@ Density::generate_mt_valence_kinetic_density(int ia__) const
     mdarray<double, 2> derivative({type.num_mt_points(), type.indexr().size()});
     for (auto const& rf : type.indexr()) {
         for (int ir = 0; ir < type.num_mt_points(); ir++) {
-            radial(ir, rf.idxrf) = atom.symmetry_class().radial_function(ir, rf.idxrf);
+            radial(ir, rf.idxrf) = lapw_basis().radial_basis(atom_index_t::global(ia__)).radial_function(ir, rf.idxrf);
             derivative(ir, rf.idxrf) =
-                    atom.symmetry_class().radial_function_derivative(ir, rf.idxrf) / type.radial_grid(ir);
+                    lapw_basis().radial_basis(atom_index_t::global(ia__)).radial_function_derivative(ir, rf.idxrf) /
+                    type.radial_grid(ir);
         }
     }
     return atom_kinetic_density<std::complex<double>>(type, radial, radial_wave_function_t::R, density_matrix(ia__),
@@ -449,7 +451,7 @@ Density::lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis
                   response__.size() != unit_cell_.num_atom_symmetry_classes();
     if (!invalid) {
         for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
-            auto const& cls  = unit_cell_.atom_symmetry_class(ic);
+            auto const& cls  = lapw_basis().radial_basis_for_class(ic);
             auto const& type = cls.atom_type();
             auto const& d    = response__[ic];
             invalid |= type.num_core_electrons() != 0 && cls.spherical_xc_derivatives()[0].empty();
@@ -496,8 +498,9 @@ Density::lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis
             std::array<index_range, 2> shape{kp.gkvec().count(), atom.type().mt_aw_basis_size()};
             alm.emplace_back(shape);
             dalm.emplace_back(shape);
-            matching.generate<false>(atom, alm.back());
-            matching.generate_potential_response<false>(atom, response__[atom.symmetry_class().id()], dalm.back());
+            matching.generate<false>(atom, alm.back(), lapw_basis().radial_basis(atom_index_t::global(ia)));
+            matching.generate_potential_response<false>(atom, response__[atom.symmetry_class().id()], dalm.back(),
+                                                        lapw_basis().radial_basis(atom_index_t::global(ia)));
         }
         for (int s = 0; s < ctx_.num_spinors(); s++) {
             for (int band = 0; band < ctx_.num_bands(); band++) {
@@ -550,7 +553,7 @@ Density::lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis
         ctx_.comm().allreduce(ddm[ia].at(memory_t::host), ddm[ia].size());
         auto const& atom = unit_cell_.atom(ia);
         auto const& d    = response__[atom.symmetry_class().id()];
-        LAPW_xc_atom op(atom, ctx_.lmax_rho());
+        LAPW_xc_atom op(atom, lapw_basis().radial_basis(atom_index_t::global(ia)), ctx_.lmax_rho());
         auto radial = op.fields(dm[ia], &d);
         result.push_back(op.fields(ddm[ia]));
         for (int part : {0, 1}) {
@@ -641,6 +644,7 @@ Density::lapw_orbital_fields_response(K_point_set& ks__, std::vector<wf::Wave_fu
         RTE_THROW("LAPW orbital fields response requires matching finite fp64 orbitals and valid directions");
     }
     auto result = std::make_unique<Density>(ctx_);
+    result->set_lapw_basis(lapw_basis_sptr());
     result->zero();
     result->kinetic_density().zero();
     if (dirac) {
@@ -863,7 +867,9 @@ Density::lapw_orbital_fields_response(K_point_set& ks__, std::vector<wf::Wave_fu
                                    : lapw_radial_fields_response(ks__, radial__);
     for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
         ctx_.comm().allreduce(dm[ia].at(memory_t::host), dm[ia].size());
-        auto fields = LAPW_xc_atom(unit_cell_.atom(ia), ctx_.lmax_rho()).fields(dm[ia]);
+        auto fields =
+                LAPW_xc_atom(unit_cell_.atom(ia), lapw_basis().radial_basis(atom_index_t::global(ia)), ctx_.lmax_rho())
+                        .fields(dm[ia]);
         for (int part : {0, 1}) {
             auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
             for (int s = 0; s < ns; s++) {
@@ -1057,7 +1063,7 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
         int n          = dirac ? 2 * npw + unit_cell_.mt_lo_basis_size() : kp.gklo_basis_size();
         std::unique_ptr<Dirac_lapw_basis> dirac_basis;
         if (dirac) {
-            dirac_basis = std::make_unique<Dirac_lapw_basis>(unit_cell_, kp.gkvec());
+            dirac_basis = std::make_unique<Dirac_lapw_basis>(unit_cell_, kp.gkvec(), lapw_basis());
         }
         if (dirac && !radial__) {
             std::vector<std::array<std::complex<double>, 4>> spinors(2 * npw), tangent(2 * npw);
@@ -1145,7 +1151,7 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
             int mt = atom.type().mt_basis_size(), naw = atom.type().mt_aw_basis_size();
             mdarray<std::complex<double>, 2> alm({kp.gkvec().count(), naw}), map({mt, n});
             if (!dirac) {
-                matching.generate<false>(atom, alm);
+                matching.generate<false>(atom, alm, lapw_basis().radial_basis(atom_index_t::global(ia)));
             }
             mdarray<std::complex<double>, 2> delta_map;
             if (radial__ || geometry__) {
@@ -1156,11 +1162,13 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
                 } else {
                     mdarray<std::complex<double>, 2> dalm({kp.gkvec().count(), naw});
                     if (radial__) {
-                        matching.generate_potential_response<false>(atom, (*radial__)[atom.symmetry_class().id()],
-                                                                    dalm);
+                        matching.generate_potential_response<false>(
+                                atom, (*radial__)[atom.symmetry_class().id()], dalm,
+                                lapw_basis().radial_basis(atom_index_t::global(ia)));
                     } else {
                         auto const& d = geometry__->atoms[ia];
-                        matching.generate_geometry_response<false>(atom, {d[0], d[1], d[2]}, strain, dalm);
+                        matching.generate_geometry_response<false>(atom, {d[0], d[1], d[2]}, strain, dalm,
+                                                                   lapw_basis().radial_basis(atom_index_t::global(ia)));
                     }
                     delta_map = mdarray<std::complex<double>, 2>({mt, n});
                     delta_map.zero();
@@ -1225,6 +1233,7 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
         RTE_THROW("LAPW PW products lie outside the density reciprocal grid");
     }
     auto result = std::make_unique<Density>(ctx_);
+    result->set_lapw_basis(lapw_basis_sptr());
     result->zero();
     result->kinetic_density().zero();
     for (int part : {0, 1}) {
@@ -1252,7 +1261,7 @@ Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
         auto& matrix = geometry__ ? ddm[ia] : dm[ia];
         ctx_.comm().allreduce(matrix.at(memory_t::host), matrix.size());
         auto const& atom = unit_cell_.atom(ia);
-        LAPW_xc_atom op(atom, ctx_.lmax_rho());
+        LAPW_xc_atom op(atom, lapw_basis().radial_basis(atom_index_t::global(ia)), ctx_.lmax_rho());
         auto fields = op.fields(matrix, radial__ ? &(*radial__)[atom.symmetry_class().id()] : nullptr);
         if (radial__) {
             ctx_.comm().allreduce(ddm[ia].at(memory_t::host), ddm[ia].size());
@@ -1472,7 +1481,7 @@ Density::generate_dirac_valence(K_point_set const& ks__, std::vector<wf::Wave_fu
             finish(tau_coarse[s], kinetic_density_->component(s).rg());
         }
     }
-    generate_valence_mt();
+    generate_valence_mt(lapw_basis());
 }
 
 template <typename T>

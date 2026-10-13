@@ -21,14 +21,27 @@ using namespace sirius;
 
 namespace {
 
+void
+update_radial_potential(Potential const& potential, LAPW_radial_basis& basis)
+{
+    auto vs = potential.get_spherical_potential();
+    auto xc = potential.get_core_xc_derivatives();
+    for (size_t ic = 0; ic < vs.size(); ic++) {
+        auto& radial = basis.radial_basis_for_class(ic);
+        radial.set_spherical_potential(vs[ic]);
+        radial.set_spherical_xc_derivatives(xc.empty() ? std::array<std::vector<double>, 2>{} : xc[ic]);
+    }
+}
+
 // Independent occupied-state radial Pulay contraction used only in the checks below.
 double
 radial_basis_derivative(Potential& potential, K_point_set& kset, std::vector<std::vector<double>> const& directions__,
                         std::vector<std::array<std::vector<double>, 2>> const& xc_directions__ = {},
                         bool update_enu__                                                      = true)
 {
-    auto& ctx_  = kset.ctx();
-    auto& uc    = ctx_.unit_cell();
+    auto& ctx_ = kset.ctx();
+    auto& uc   = ctx_.unit_cell();
+    Hamiltonian0<double> h0(potential, false);
     int invalid = !ctx_.full_potential() || ctx_.processing_unit() != device_t::CPU ||
                   ctx_.valence_relativity() != relativity_t::none || ctx_.so_correction() || ctx_.num_mag_dims() == 3 ||
                   ctx_.hubbard_correction() ||
@@ -42,7 +55,7 @@ radial_basis_derivative(Potential& potential, K_point_set& kset, std::vector<std
                        !std::all_of(directions__[ic].begin(), directions__[ic].end(),
                                     [](double x) { return std::isfinite(x); });
             if (!xc_directions__.empty()) {
-                auto const& cls = uc.atom_symmetry_class(ic);
+                auto const& cls = h0.lapw_basis().radial_basis_for_class(ic);
                 for (auto const& field : xc_directions__[ic]) {
                     invalid |=
                             !field.empty() &&
@@ -60,10 +73,9 @@ radial_basis_derivative(Potential& potential, K_point_set& kset, std::vector<std
     }
 
     // Differentiate the stored basis without updating its potential or energies.
-    Hamiltonian0<double> h0(potential, false);
     std::vector<radial_basis_response_t> response;
     for (int ic = 0; ic < uc.num_atom_symmetry_classes(); ic++) {
-        response.push_back(uc.atom_symmetry_class(ic).radial_basis_potential_response(
+        response.push_back(h0.lapw_basis().radial_basis_for_class(ic).radial_basis_potential_response(
                 directions__[ic], xc_directions__.empty() ? std::array<std::vector<double>, 2>{} : xc_directions__[ic],
                 update_enu__));
     }
@@ -80,8 +92,9 @@ radial_basis_derivative(Potential& potential, K_point_set& kset, std::vector<std
             std::array<index_range, 2> shape{kp.gkvec().count(), atom.type().mt_aw_basis_size()};
             alm.emplace_back(shape);
             dalm.emplace_back(shape);
-            matching.generate<false>(atom, alm.back());
-            matching.generate_potential_response<false>(atom, response[atom.symmetry_class().id()], dalm.back());
+            matching.generate<false>(atom, alm.back(), h0.lapw_basis().radial_basis(atom_index_t::global(ia)));
+            matching.generate_potential_response<false>(atom, response[atom.symmetry_class().id()], dalm.back(),
+                                                        h0.lapw_basis().radial_basis(atom_index_t::global(ia)));
         }
         for (int s = 0; s < ns; s++) {
             for (int band = 0; band < ctx_.num_bands(); band++) {
@@ -224,9 +237,9 @@ functional_response(Simulation_context const& ctx, xc_callback_input_t const& in
             double descriptor      = spinor && s > 0 ? 0 : nonlocal;
             double base_descriptor = spinor && s > 0 ? 0 : base_nonlocal;
             out.vrho[j]  = scale * (w * (0.04 * dr + 0.005 * dt) + dw * (0.04 * r + 0.005 * t) + d * descriptor +
-                                   dd * base_descriptor);
+                                    dd * base_descriptor);
             out.vtau[j]  = scale * (w * (0.02 * dt + 0.005 * dr) + dw * (0.02 * t + 0.005 * r) +
-                                   0.3 * (d * descriptor + dd * base_descriptor));
+                                    0.3 * (d * descriptor + dd * base_descriptor));
             double local = (0.04 * r + 0.005 * t) * dr + (0.02 * t + 0.005 * r) * dt;
             for (int x = 0; x < 3; x++) {
                 int k            = p + in.num_points * (x + 3 * s);
@@ -710,7 +723,8 @@ radial_hartree_response(Simulation_context const& ctx, Potential const& potentia
 }
 
 std::vector<double>
-sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::vector<double>> const& vs,
+sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::shared_ptr<LAPW_radial_basis> const& basis,
+                     std::vector<std::vector<double>> const& vs,
                      std::vector<std::array<std::vector<double>, 2>> const& core_xc,
                      std::vector<double>* hartree = nullptr, std::vector<double>* xc = nullptr,
                      Density* valence = nullptr)
@@ -724,7 +738,7 @@ sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::
         for (int ia = 0; ia < ctx.unit_cell().num_atoms(); ia++) {
             auto const& atom = ctx.unit_cell().atom(ia);
             alm.emplace_back(std::array<index_range, 2>{kp->gkvec().count(), atom.type().mt_aw_basis_size()});
-            matching.generate<false>(atom, alm.back());
+            matching.generate<false>(atom, alm.back(), basis->radial_basis(atom_index_t::global(ia)));
         }
         // Reconstruct every physical band, including the second-variation spinors.
         for (int s = 0; s < ctx.num_spins(); s++) {
@@ -769,9 +783,11 @@ sample_radial_fields(Simulation_context& ctx, K_point_set& ks, std::vector<std::
     std::vector<double> result;
     try {
         Density density(ctx);
+        density.set_lapw_basis(basis);
         density.generate_core_charge_density(vs, core_xc);
         density.generate<double>(ks, false, true, false);
         if (valence) {
+            valence->set_lapw_basis(basis);
             valence->generate<double>(ks, false, false, true);
         }
         if (hartree) {
@@ -1045,8 +1061,8 @@ test_lapw_spinor_spectrum(bool distributed, std::string relativity)
                     (*h[s])(i, j)  = degenerate
                                              ? diagonal * metric * (s == 0 ? energy : 0.035 * (s + 1))
                                              : diagonal * (s == 0 ? -0.4 + 0.3 * row : 0.02 * (s + 1)) +
-                                                      0.012 * (s + 1) * std::polar(1.0, 0.5 * (s + 1) * (row - col)) /
-                                                              ((1.0 + row) * (1.0 + col));
+                                                       0.012 * (s + 1) * std::polar(1.0, 0.5 * (s + 1) * (row - col)) /
+                                                               ((1.0 + row) * (1.0 + col));
                     (*dh[s])(i, j) = 0.013 * (s + 1) * diagonal * std::cos(row + 1.0) / (row + 1.0) +
                                      0.008 * (s + 1) * std::polar(1.0, 0.3 * (s + 1) * (row - col)) / (1.0 + row + col);
                 }
@@ -1350,15 +1366,15 @@ test_lapw_density_response(int mag, bool distributed, bool spin_orbit, std::stri
             }
             field.mt().sync(ctx->unit_cell().spl_num_atoms());
         }
-        gs.potential().update_atomic_potential();
-        ctx->unit_cell().generate_radial_integrals();
+        update_radial_potential(gs.potential(), *gs.density().lapw_basis_sptr());
+        gs.density().lapw_basis_sptr()->generate_radial_integrals();
     }
     if (spin_orbit) {
-        ctx->unit_cell().generate_radial_functions(ctx->out());
-        ctx->unit_cell().generate_radial_integrals();
+        gs.density().lapw_basis_sptr()->generate_radial_functions();
+        gs.density().lapw_basis_sptr()->generate_radial_integrals();
         double peak{0};
         for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-            auto& cls        = ctx->unit_cell().atom_symmetry_class(ic);
+            auto& cls        = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
             auto const& type = cls.atom_type();
             auto const& grid = type.radial_grid();
             auto base        = cls.spherical_potential();
@@ -1411,7 +1427,7 @@ test_lapw_density_response(int mag, bool distributed, bool spin_orbit, std::stri
             sample(0);
         }
         check("nonzero SOC radial derivative", peak > 1e-10 ? 0 : 1, 0);
-        ctx->unit_cell().generate_radial_integrals();
+        gs.density().lapw_basis_sptr()->generate_radial_integrals();
     }
     Hamiltonian0<double> h0(gs.potential(), false);
     if (!dirac) {
@@ -1715,8 +1731,8 @@ test_lapw_coupled_response(int mag, bool distributed, bool spin_orbit, std::stri
         for (int ia = 0; ia < ctx->unit_cell().num_atoms(); ia++) {
             auto const& atom = ctx->unit_cell().atom(ia);
             auto r           = r3::vector<double>{xyz[0], xyz[1], xyz[2]} -
-                     ctx->unit_cell().get_cartesian_coordinates(atom.position());
-            auto fractional = dot(ctx->unit_cell().inverse_lattice_vectors(), r);
+                               ctx->unit_cell().get_cartesian_coordinates(atom.position());
+            auto fractional  = dot(ctx->unit_cell().inverse_lattice_vectors(), r);
             for (int x = 0; x < 3; x++) {
                 fractional[x] -= std::round(fractional[x]);
             }
@@ -1929,7 +1945,10 @@ test_lapw_coupled_response(int mag, bool distributed, bool spin_orbit, std::stri
             }
             *soc_energy = energy.real();
         }
-        auto output = input.lapw_density_matrix_fields(kpoints, matrices);
+        Density basis_input(c);
+        copy(input, basis_input);
+        basis_input.set_lapw_basis(h0.lapw_basis_sptr());
+        auto output = basis_input.lapw_density_matrix_fields(kpoints, matrices);
         if (core) {
             output->generate_core_charge_density(potential.get_spherical_potential(),
                                                  potential.get_core_xc_derivatives());
@@ -1952,10 +1971,10 @@ test_lapw_coupled_response(int mag, bool distributed, bool spin_orbit, std::stri
         }
         prepare(input);
         auto result = map(input, ks, soc_energy);
-        gs.potential().update_atomic_potential();
-        ctx->unit_cell().generate_radial_functions(ctx->out());
+        update_radial_potential(gs.potential(), *gs.density().lapw_basis_sptr());
+        gs.density().lapw_basis_sptr()->generate_radial_functions();
         if (!dirac) {
-            ctx->unit_cell().generate_radial_integrals();
+            gs.density().lapw_basis_sptr()->generate_radial_integrals();
         }
         return result;
     };
@@ -2149,7 +2168,7 @@ test_lapw_coupled_response(int mag, bool distributed, bool spin_orbit, std::stri
         auto potential = potential_samples(gs.potential().effective_potential());
         result.insert(result.end(), potential.begin(), potential.end());
         for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-            auto const& cls = ctx->unit_cell().atom_symmetry_class(ic);
+            auto const& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
             for (int i = 0; i < cls.atom_type().mt_radial_basis_size(); i++) {
                 for (int ir = 0; ir < cls.atom_type().num_mt_points(); ir++) {
                     for (int component = 0; component < (dirac ? 2 : 1); component++) {
@@ -2204,9 +2223,9 @@ test_lapw_coupled_response(int mag, bool distributed, bool spin_orbit, std::stri
                 auto const& type = ctx->unit_cell().atom(atom.i).type();
                 auto const& grid = type.radial_grid();
                 bool rel         = ctx->valence_relativity() != relativity_t::none ||
-                           (type.num_core_electrons() != 0 && ctx->core_relativity() != relativity_t::none);
-                double gamma = std::sqrt(1 - std::pow(type.zn() / speed_of_light, 2));
-                double power = rel ? (part == 0 ? 2 : 4) - 2 * gamma : 0;
+                                   (type.num_core_electrons() != 0 && ctx->core_relativity() != relativity_t::none);
+                double gamma     = std::sqrt(1 - std::pow(type.zn() / speed_of_light, 2));
+                double power     = rel ? (part == 0 ? 2 : 4) - 2 * gamma : 0;
                 for (int ir = 0; ir < grid.num_points(); ir++) {
                     double factor = std::pow(grid[ir] / grid.last(), power);
                     for (int lm = 0; lm < a.mt()[atom.i].angular_domain_size(); lm++) {
@@ -2306,12 +2325,12 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         for (double error : testing::check_lapw_xc_response(gs, core ? 1e-2 : 1e-3)) {
             check("four-component LAPW callback response", error, 1e-8);
         }
-        ctx->unit_cell().generate_radial_functions(ctx->out());
-        ctx->unit_cell().generate_radial_integrals();
+        gs.density().lapw_basis_sptr()->generate_radial_functions();
+        gs.density().lapw_basis_sptr()->generate_radial_integrals();
         std::vector<std::vector<double>> base, direction;
         std::vector<radial_basis_response_t> radial;
         for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-            auto& cls        = ctx->unit_cell().atom_symmetry_class(ic);
+            auto& cls        = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
             auto const& grid = cls.atom_type().radial_grid();
             base.push_back(cls.spherical_potential());
             direction.emplace_back(grid.num_points());
@@ -2345,7 +2364,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         }
         auto mapped = density.lapw_density_matrix_fields(ks, matrices);
         Density valence(*ctx);
-        sample_radial_fields(*ctx, ks, base, potential.get_core_xc_derivatives(), nullptr, nullptr, &valence);
+        sample_radial_fields(*ctx, ks, gs.density().lapw_basis_sptr(), base, potential.get_core_xc_derivatives(),
+                             nullptr, nullptr, &valence);
         for (int part : {0, 1}) {
             for (int s = 0; s < 4; s++) {
                 auto a = potential_samples(part == 0 ? mapped->component(s) : mapped->kinetic_density().component(s));
@@ -2463,7 +2483,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         auto sample = [&](double step) {
             auto v = base;
             for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-                auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
+                auto& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
                 for (size_t ir = 0; ir < v[ic].size(); ir++) {
                     v[ic][ir] += step * direction[ic][ir];
                 }
@@ -2473,8 +2493,9 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 }
                 cls.set_spherical_potential(base[ic]);
             }
-            ctx->unit_cell().generate_radial_integrals();
-            return sample_radial_fields(*ctx, ks, v, potential.get_core_xc_derivatives());
+            gs.density().lapw_basis_sptr()->generate_radial_integrals();
+            return sample_radial_fields(*ctx, ks, gs.density().lapw_basis_sptr(), v,
+                                        potential.get_core_xc_derivatives());
         };
         double radial_step = core ? 1e-2 : 5e-3;
         for (double step : {radial_step, radial_step / 2}) {
@@ -2962,6 +2983,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                      [&] { potential.lapw_external_xc_response(density, direction); });
     }
     Density regenerated(*ctx);
+    regenerated.set_lapw_basis(density.lapw_basis_sptr());
     copy(density, regenerated);
     regenerated.generate<double>(ks, false, true, true);
     double initial_field_error{0};
@@ -3033,8 +3055,10 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         check("XC operator is staged", potential.lapw_xc_derivatives() ? 0 : 1, 0);
     };
     check_energy();
-    check.reject("point potential cannot be symmetrized independently",
-                 [&] { potential.generate(density, true, true); });
+    double unsymmetrized_energy = potential.energy_exc(density);
+    potential.generate(density, true, true);
+    check("identity symmetry preserves the point XC energy",
+          std::abs(potential.energy_exc(density) - unsymmetrized_energy), 1e-12);
 
     auto result = gs.find(1e-9, 1e-10, 1e-9, 100, false);
     check("SCF convergence", result.at("converged").get<bool>() ? 0 : 1, 0);
@@ -3063,7 +3087,10 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             auto const& atom = ctx->unit_cell().atom(ia);
             for (auto rf : atom.type().indexr()) {
                 for (int ir = 0; ir < atom.num_mt_points(); ir++) {
-                    values.push_back(atom.symmetry_class().radial_function(ir, rf.idxrf));
+                    values.push_back(gs.density()
+                                             .lapw_basis()
+                                             .radial_basis_for_class(atom.symmetry_class().id())
+                                             .radial_function(ir, rf.idxrf));
                 }
             }
         }
@@ -3127,18 +3154,18 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
     std::vector<std::vector<double>> spherical_before_fields;
     std::vector<std::array<std::vector<double>, 2>> core_xc_before_fields;
     for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-        auto const& cls = ctx->unit_cell().atom_symmetry_class(ic);
+        auto const& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
         spherical_before_fields.push_back(cls.spherical_potential());
         core_xc_before_fields.push_back(cls.spherical_xc_derivatives());
     }
     auto restore_field_matrices = [&] {
-        potential.update_atomic_potential();
+        update_radial_potential(potential, *gs.density().lapw_basis_sptr());
         for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-            auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
+            auto& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
             cls.set_spherical_potential(spherical_before_fields[ic]);
             cls.set_spherical_xc_derivatives(core_xc_before_fields[ic]);
         }
-        ctx->unit_cell().generate_radial_integrals();
+        gs.density().lapw_basis_sptr()->generate_radial_integrals();
     };
     bool spectrum_checked{false};
     std::array<double, 4> spectrum_errors{};
@@ -3246,8 +3273,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             if (!mag || !second_variation) {
                 try {
                     probe.generate(displaced, false, true);
-                    probe.update_atomic_potential();
-                    ctx->unit_cell().generate_radial_integrals();
+                    update_radial_potential(probe, *gs.density().lapw_basis_sptr());
+                    gs.density().lapw_basis_sptr()->generate_radial_integrals();
                     sampled_matrices = matrix_snapshot(probe, nullptr);
                 } catch (...) {
                     restore_field_matrices();
@@ -3312,7 +3339,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         check("self-consistent core tau residual", residual, 2e-6);
         check("core leakage", std::abs(density.core_leakage()), 1e-6);
         double derivative{0};
-        auto const& cls = ctx->unit_cell().atom(0).symmetry_class();
+        auto const& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(0);
         for (size_t ir = 0; ir < tau.size(); ir++) {
             derivative += density.core_charge_density(0)[ir] * d[cls.id()][0][ir] + tau[ir] * d[cls.id()][1][ir];
         }
@@ -3365,9 +3392,11 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                 int ng = kp->gkvec_row().count(), na = ctx->unit_cell().atom(0).type().mt_aw_basis_size();
                 mdarray<std::complex<double>, 2> derivative({ng, na}), conjugate_derivative({ng, na});
                 Matching_coefficients matching(ctx->unit_cell(), kp->gkvec_row());
-                matching.generate_geometry_response<false>(ctx->unit_cell().atom(0), displacement, strain, derivative);
+                matching.generate_geometry_response<false>(ctx->unit_cell().atom(0), displacement, strain, derivative,
+                                                           gs.density().lapw_basis().radial_basis_for_class(0));
                 matching.generate_geometry_response<true>(ctx->unit_cell().atom(0), displacement, strain,
-                                                          conjugate_derivative);
+                                                          conjugate_derivative,
+                                                          gs.density().lapw_basis().radial_basis_for_class(0));
                 for (size_t i = 0; i < derivative.size(); i++) {
                     peak = std::max(peak, std::abs(derivative[i]));
                     conjugation_error =
@@ -3387,7 +3416,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     kp->update();
                     Matching_coefficients shifted(ctx->unit_cell(), kp->gkvec_row());
                     mdarray<std::complex<double>, 2> result({ng, na});
-                    shifted.generate<false>(ctx->unit_cell().atom(0), result);
+                    shifted.generate<false>(ctx->unit_cell().atom(0), result,
+                                            gs.density().lapw_basis().radial_basis_for_class(0));
                     return result;
                 };
                 for (double step : {1e-4, 5e-5}) {
@@ -3565,7 +3595,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
         std::vector<std::vector<double>> spherical;
         std::vector<std::array<std::vector<double>, 2>> spherical_xc;
         for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-            auto const& cls = ctx->unit_cell().atom_symmetry_class(ic);
+            auto const& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
             spherical.push_back(cls.spherical_potential());
             spherical_xc.push_back(cls.spherical_xc_derivatives());
         }
@@ -3646,7 +3676,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                         }
                     }
                 }
-                kp.generate_lapw_wave_functions(evec, delta, s);
+                kp.generate_lapw_wave_functions(evec, delta, s, density.lapw_basis());
             }
             matched_ptrs.push_back(&delta);
             matrix_k++;
@@ -3721,6 +3751,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             }
         };
         Density plus(*ctx), minus(*ctx);
+        plus.set_lapw_basis(density.lapw_basis_sptr());
+        minus.set_lapw_basis(density.lapw_basis_sptr());
         constexpr double occupation_step{1e-4};
         try {
             set_occupations(occupation_step);
@@ -3772,7 +3804,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             auto radial_direction = spherical;
             std::vector<std::array<std::vector<double>, 2>> xc_direction(spherical.size());
             for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-                auto const& grid = ctx->unit_cell().atom_symmetry_class(ic).atom_type().radial_grid();
+                auto const& grid = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic).atom_type().radial_grid();
                 for (int ir = 0; ir < grid.num_points(); ir++) {
                     // Resolve core response rather than subtracting a nearly constant potential shift.
                     radial_direction[ic][ir] = (part == 0 || part == 3)
@@ -3794,8 +3826,9 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
             double basis_derivative = radial_basis_derivative(gs.potential(), ks, radial_direction, xc_direction);
             std::vector<radial_basis_response_t> radial_response;
             for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-                radial_response.push_back(ctx->unit_cell().atom_symmetry_class(ic).radial_basis_potential_response(
-                        radial_direction[ic], xc_direction[ic]));
+                radial_response.push_back(
+                        gs.density().lapw_basis_sptr()->radial_basis_for_class(ic).radial_basis_potential_response(
+                                radial_direction[ic], xc_direction[ic]));
             }
             Hamiltonian0<double> basis_h0(potential, false);
             auto atom_matrices = basis_h0.lapw_radial_basis_response(radial_response);
@@ -3900,7 +3933,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                              [&] { density.lapw_orbital_fields_response(ks, invalid_orbitals); });
                 std::vector<radial_basis_response_t> zero;
                 for (int ic = 0; ic < ctx->unit_cell().num_atom_symmetry_classes(); ic++) {
-                    zero.emplace_back(ctx->unit_cell().atom_symmetry_class(ic).atom_type());
+                    zero.emplace_back(gs.density().lapw_basis_sptr()->radial_basis_for_class(ic).atom_type());
                 }
                 double zero_peak{0};
                 for (auto const& atom : density.lapw_radial_fields_response(ks, zero)) {
@@ -3962,7 +3995,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                             }
                         }
                     }
-                    auto& cls = ctx->unit_cell().atom_symmetry_class(ic);
+                    auto& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
                     cls.set_spherical_potential(v);
                     cls.set_spherical_xc_derivatives(xc);
                     shifted_vs[ic] = v;
@@ -3974,7 +4007,7 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     cls.set_spherical_potential(spherical[ic]);
                     cls.set_spherical_xc_derivatives(spherical_xc[ic]);
                 }
-                ctx->unit_cell().generate_radial_integrals();
+                gs.density().lapw_basis_sptr()->generate_radial_integrals();
                 Hamiltonian0<double> radial_h0(potential, false);
                 radial_h0.generate_pw_coefs(potential);
                 double value{0};
@@ -3994,7 +4027,8 @@ test_lapw_external(int mag, bool distributed_fft, bool second_variation, bool co
                     }
                 }
                 ctx->comm().allreduce(&value, 1);
-                sampled_fields = sample_radial_fields(*ctx, ks, shifted_vs, shifted_xc, &sampled_hartree, &sampled_xc);
+                sampled_fields = sample_radial_fields(*ctx, ks, gs.density().lapw_basis_sptr(), shifted_vs, shifted_xc,
+                                                      &sampled_hartree, &sampled_xc);
                 return value;
             };
             for (double step : {1e-3, 5e-4}) {
@@ -4123,7 +4157,7 @@ test_lapw_force_response(int mag, double pw_cutoff, bool core)
             }
         }
         for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
-            auto const& cls = ctx.unit_cell().atom_symmetry_class(ic);
+            auto const& cls = gs.density().lapw_basis_sptr()->radial_basis_for_class(ic);
             for (auto rf : cls.atom_type().indexr()) {
                 for (int ir = 0; ir < cls.atom_type().num_mt_points(); ir++) {
                     values.push_back(cls.radial_function(ir, rf.idxrf));
@@ -4196,7 +4230,7 @@ test_lapw_cell_response(int mag, bool core, bool spin_orbit, std::string device,
             strain(0, 1) = strain(1, 0) = 0.5;
         }
         auto ctx = context(mag, true, spinor, core, false, 0, 9.0, false, 0, "fermi_dirac", core, device, spin_orbit,
-                              relativity, true, core_relativity, radial_points);
+                           relativity, true, core_relativity, radial_points);
         if (mag == 3) {
             // Fractional occupations retain a finite response to the vector field in this closed-shell fixture.
             ctx->cfg().unlock();
@@ -4285,7 +4319,7 @@ test_lapw_cell_response(int mag, bool core, bool spin_orbit, std::string device,
                 auto const& atom  = ctx->unit_cell().atom(attached[p]);
                 auto moved_centre = ctx->unit_cell().get_cartesian_coordinates(atom.position());
                 if (std::abs((r - moved_centre).length() -
-                                (r3::vector<double>{xyz[0], xyz[1], xyz[2]} - centre).length()) > 1e-12) {
+                             (r3::vector<double>{xyz[0], xyz[1], xyz[2]} - centre).length()) > 1e-12) {
                     RTE_THROW("LAPW cell stencil must retain atom-local quadrature radii");
                 }
             } else {
@@ -4378,7 +4412,7 @@ test_lapw_cell_response(int mag, bool core, bool spin_orbit, std::string device,
                     auto const& xyz = q.coordinates[p];
                     auto fractional = dot(inverse, r3::vector<double>{xyz[0], xyz[1], xyz[2]});
                     double measure  = q.energy_weights[p] * in.energy_weights[p] +
-                                     q.descriptor_weights[p] * in.descriptor_weights[p];
+                                      q.descriptor_weights[p] * in.descriptor_weights[p];
                     for (int y = 0; y < 3; y++) {
                         for (int x = 0; x < 3; x++) {
                             out.lattice[x + 3 * y] += in.coordinates[p][x] * fractional[y] + measure * inverse(y, x);
@@ -4442,7 +4476,7 @@ test_lapw_cell_response(int mag, bool core, bool spin_orbit, std::string device,
                     for (size_t i = 0; i < reference_fields[part].size(); i++) {
                         double residual = std::abs(reference_fields[part][i] - spectral_fields[part][i]);
                         part_error      = std::isfinite(residual) ? std::max(part_error, residual)
-                                                                     : std::numeric_limits<double>::infinity();
+                                                                  : std::numeric_limits<double>::infinity();
                         peak            = std::max(peak, std::abs(reference_fields[part][i]));
                     }
                     ctx->comm().allreduce<double, mpi::op_t::max>(&part_error, 1);
@@ -4500,9 +4534,9 @@ test_lapw_cell_response(int mag, bool core, bool spin_orbit, std::string device,
     int failures{0};
     for (int component = 0; component < (forces ? 3 : 2); component++) {
         for (double h : {2e-3, 1e-3}) {
-            double fd = (8 * (sample(h, component) - sample(-h, component)) -
-                         (sample(2 * h, component) - sample(-2 * h, component))) /
-                        (12 * h);
+            double fd    = (8 * (sample(h, component) - sample(-h, component)) -
+                            (sample(2 * h, component) - sample(-2 * h, component))) /
+                           (12 * h);
             double error = std::abs(fd - reference[component + 1]);
             if (mpi::Communicator::world().rank() == 0) {
                 std::cout << "LAPW cell " << device << " spin=" << mag << " core=" << core << " SOC=" << spin_orbit
@@ -4525,10 +4559,10 @@ test_lapw_linearization_response()
     ks.initialize();
     DFT_ground_state gs(ks);
     gs.initial_state();
-    gs.potential().update_atomic_potential();
-    ctx->unit_cell().generate_radial_functions(ctx->out());
-    ctx->unit_cell().generate_radial_integrals();
-    auto& cls        = ctx->unit_cell().atom_symmetry_class(0);
+    update_radial_potential(gs.potential(), *gs.density().lapw_basis_sptr());
+    gs.density().lapw_basis_sptr()->generate_radial_functions();
+    gs.density().lapw_basis_sptr()->generate_radial_integrals();
+    auto& cls        = gs.density().lapw_basis_sptr()->radial_basis_for_class(0);
     auto base        = cls.spherical_potential();
     auto const& grid = cls.atom_type().radial_grid();
     std::vector<double> direction(grid.num_points());
@@ -4556,7 +4590,7 @@ test_lapw_linearization_response()
                 RTE_THROW("linearisation response fixture failed");
             }
             cls.set_spherical_potential(base);
-            ctx->unit_cell().generate_radial_integrals();
+            gs.density().lapw_basis_sptr()->generate_radial_integrals();
             Hamiltonian0<double> h0(gs.potential(), false);
             h0.generate_pw_coefs(gs.potential());
             double value{0};
@@ -4570,8 +4604,9 @@ test_lapw_linearization_response()
                 value += occupied_lapw_lagrangian(*ctx, *kp, 0, h, o);
             }
             ctx->comm().allreduce(&value, 1);
-            sampled_fields = sample_radial_fields(*ctx, ks, {v}, gs.potential().get_core_xc_derivatives(),
-                                                  &sampled_hartree, &sampled_xc);
+            sampled_fields =
+                    sample_radial_fields(*ctx, ks, gs.density().lapw_basis_sptr(), {v},
+                                         gs.potential().get_core_xc_derivatives(), &sampled_hartree, &sampled_xc);
             return value;
         };
         std::cout << "LAPW Lagrangian update_enu=" << update_enu << '\n';
@@ -4621,10 +4656,10 @@ test_lapw_relativistic_basis_response(std::string const& device)
         ks.initialize();
         DFT_ground_state gs(ks);
         gs.initial_state();
-        gs.potential().update_atomic_potential();
-        ctx->unit_cell().generate_radial_functions(ctx->out());
-        ctx->unit_cell().generate_radial_integrals();
-        auto& cls        = ctx->unit_cell().atom_symmetry_class(0);
+        update_radial_potential(gs.potential(), *gs.density().lapw_basis_sptr());
+        gs.density().lapw_basis_sptr()->generate_radial_functions();
+        gs.density().lapw_basis_sptr()->generate_radial_integrals();
+        auto& cls        = gs.density().lapw_basis_sptr()->radial_basis_for_class(0);
         auto base        = cls.spherical_potential();
         auto const& grid = cls.atom_type().radial_grid();
         auto rel         = ctx->valence_relativity();
@@ -4706,8 +4741,8 @@ test_lapw_relativistic_basis_response(std::string const& device)
             }
             effective.rg().fft_transform(-1);
             potential.set_lapw_xc_derivatives(covectors(field_step));
-            potential.update_atomic_potential();
-            ctx->unit_cell().generate_radial_integrals();
+            update_radial_potential(potential, *gs.density().lapw_basis_sptr());
+            gs.density().lapw_basis_sptr()->generate_radial_integrals();
             Hamiltonian0<double> h0(gs.potential(), false);
             h0.generate_pw_coefs(gs.potential());
             std::array<std::vector<std::complex<double>>, 3> result;

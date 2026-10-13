@@ -63,11 +63,10 @@ DFT_ground_state::initial_state()
                 RTE_THROW("external XC LAPW orbital initialization did not converge");
             }
             kset_.find_band_occupancies<double>();
+            density_.set_lapw_basis(H0.lapw_basis_sptr());
             density_.generate_core_charge_density(seed.get_spherical_potential());
-            density_.generate<double>(kset_, false, true, true);
+            density_.generate<double>(kset_, H0.lapw_basis_sptr(), false, true, true);
             potential_.generate(density_, false, true);
-            // Atom potential views must outlive the temporary seed Hamiltonian.
-            potential_.update_atomic_potential();
             return;
         }
         seed.generate_d_mtrx();
@@ -94,13 +93,13 @@ DFT_ground_state::initial_state()
     if (!ctx_.full_potential()) {
         if (ctx_.cfg().parameters().precision_wf() == "fp32") {
 #if defined(SIRIUS_USE_FP32)
-            Hamiltonian0<float> H0(potential_, true);
+            Hamiltonian0<float> H0(potential_);
             initialize_subspace(kset_, H0);
 #else
             RTE_THROW("not compiled with FP32 support");
 #endif
         } else {
-            Hamiltonian0<double> H0(potential_, true);
+            Hamiltonian0<double> H0(potential_);
             initialize_subspace(kset_, H0);
         }
     }
@@ -125,7 +124,7 @@ DFT_ground_state::energy_kin_sum_pw() const
     for (auto it : kset_.spl_num_kpoints()) {
         auto kp = kset_.get<double>(it.i);
 
-        #pragma omp parallel for schedule(static) reduction(+ : ekin)
+#pragma omp parallel for schedule(static) reduction(+ : ekin)
         for (int igloc = 0; igloc < kp->num_gkvec_loc(); igloc++) {
             auto Gk = kp->gkvec().gkvec_cart(gvec_index_t::local(igloc));
 
@@ -175,8 +174,7 @@ DFT_ground_state::check_scf_density()
     bool transform_to_rg{true};
     pot.generate(density_, ctx_.use_symmetry(), transform_to_rg);
     /* create new Hamiltonian */
-    bool precompute_lapw{true};
-    Hamiltonian0<double> H0(pot, precompute_lapw);
+    Hamiltonian0<double> H0(pot);
     /* initialize the subspace */
     ::sirius::initialize_subspace(kset_, H0);
     /* find new wave-functions */
@@ -188,7 +186,9 @@ DFT_ground_state::check_scf_density()
     bool add_core{true};
     /* create new density */
     Density rho(ctx_);
-    rho.generate<double>(kset_, ctx_.use_symmetry(), add_core, transform_to_rg);
+
+    auto lapw_basis = density_.lapw_basis_sptr();
+    rho.generate<double>(kset_, lapw_basis, ctx_.use_symmetry(), add_core, transform_to_rg);
 
     auto gs1 = energy_dict(ctx_, kset_, rho, pot, this->scf_correction_energy_);
 
@@ -259,6 +259,9 @@ DFT_ground_state::find(double density_tol__, double energy_tol__, double iter_so
 
     density_.print_info(ctx_.out(1));
 
+    /* generate initial lapw basis */
+    auto lapw_basis = potential_.create_lapw_basis();
+
     for (int iter = 0; iter < num_dft_iter__; iter++) {
         PROFILE("sirius::DFT_ground_state::scf_loop|iteration");
         std::stringstream s;
@@ -274,7 +277,7 @@ DFT_ground_state::find(double density_tol__, double energy_tol__, double iter_so
         double ne_diff{0};
         if (ctx_.cfg().parameters().precision_wf() == "fp32") {
 #if defined(SIRIUS_USE_FP32)
-            Hamiltonian0<float> H0(potential_, true);
+            Hamiltonian0<float> H0(potential_, lapw_basis);
             /* find new wave-functions */
             if (ctx_.cfg().parameters().precision_hs() == "fp32") {
                 result = sirius::diagonalize<float, float>(H0, kset_, iter_solver_tol__,
@@ -286,12 +289,12 @@ DFT_ground_state::find(double density_tol__, double energy_tol__, double iter_so
             /* find band occupancies */
             ne_diff = kset_.find_band_occupancies<float>();
             /* generate new density from the occupied wave-functions */
-            density_.generate<float>(kset_, ctx_.use_symmetry(), true, true);
+            density_.generate<float>(kset_, lapw_basis, ctx_.use_symmetry(), true, true);
 #else
             RTE_THROW("not compiled with FP32 support");
 #endif
         } else {
-            Hamiltonian0<double> H0(potential_, true);
+            Hamiltonian0<double> H0(potential_, lapw_basis);
             /* find new wave-functions */
             result = sirius::diagonalize<double, double>(H0, kset_, iter_solver_tol__,
                                                          ctx_.cfg().iterative_solver().num_steps());
@@ -301,7 +304,7 @@ DFT_ground_state::find(double density_tol__, double energy_tol__, double iter_so
             auto vs = potential_.get_spherical_potential();
             density_.generate_core_charge_density(vs, potential_.get_core_xc_derivatives());
             /* generate new density from the occupied wave-functions */
-            density_.generate<double>(kset_, ctx_.use_symmetry(), true, true);
+            density_.generate<double>(kset_, lapw_basis, ctx_.use_symmetry(), true, true);
         }
 
         double e1 = energy_potential(density_, potential_);
@@ -380,8 +383,21 @@ DFT_ground_state::find(double density_tol__, double energy_tol__, double iter_so
             density_.check_num_electrons();
         }
 
+        bool transform_to_rg{true};
         /* compute new potential */
-        potential_.generate(density_, ctx_.use_symmetry(), true);
+        potential_.generate(density_, ctx_.use_symmetry(), transform_to_rg);
+
+        if (ctx_.full_potential()) {
+            std::shared_ptr<LAPW_radial_basis> lapw_basis_new;
+            try {
+                RTE_OUT(ctx_.out()) << "Generating new LAPW basis\n";
+                lapw_basis_new = potential_.create_lapw_basis();
+                lapw_basis     = lapw_basis_new;
+            } catch (std::exception const& e) {
+                RTE_OUT(ctx_.out()) << "LAPW basis is not updated\n";
+            }
+            lapw_basis->write_enu(ctx_.out(2));
+        }
 
         if (!ctx_.full_potential() && ctx_.cfg().control().verification() >= 2) {
             if (ctx_.verbosity() >= 1) {

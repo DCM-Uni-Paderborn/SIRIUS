@@ -19,6 +19,7 @@
 #include "core/fft/gvec.hpp"
 #include "core/la/linalg.hpp"
 #include "core/sht/sht.hpp"
+#include "lapw/lapw_radial_basis.hpp"
 
 namespace sirius {
 
@@ -389,23 +390,23 @@ class Matching_coefficients // TODO: compute on GPU
      */
     template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
     void
-    generate(Atom const& atom__, mdarray<T, 2>& alm__) const
+    generate(Atom const& atom__, mdarray<T, 2>& alm__, lapw_radial_basis_t const& rb__) const
     {
-        generate_impl<conjugate>(atom__, alm__, nullptr);
+        generate_impl<conjugate>(atom__, alm__, rb__, nullptr);
     }
 
     /// Differentiate matching coefficients for a radial-basis variation at fixed geometry.
     template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
     void
-    generate_potential_response(Atom const& atom__, radial_basis_response_t const& response__,
-                                mdarray<T, 2>& alm__) const
+    generate_potential_response(Atom const& atom__, radial_basis_response_t const& response__, mdarray<T, 2>& alm__,
+                                lapw_radial_basis_t const& rb__) const
     {
         auto const& sd = response__.surface_derivatives;
         if (sd.size(0) != 3 ||
             sd.size(1) != atom__.type().mt_radial_basis_size() - atom__.type().num_lo_descriptors()) {
             RTE_THROW("wrong dimensions of AW boundary response");
         }
-        generate_impl<false>(atom__, alm__, &sd);
+        generate_impl<false>(atom__, alm__, rb__, &sd);
         if constexpr (conjugate) {
             for (auto& z : alm__) {
                 z = std::conj(z);
@@ -418,9 +419,10 @@ class Matching_coefficients // TODO: compute on GPU
     template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
     void
     generate_geometry_response(Atom const& atom__, r3::vector<double> const& displacement__,
-                               r3::matrix<double> const& strain__, mdarray<T, 2>& alm__) const
+                               r3::matrix<double> const& strain__, mdarray<T, 2>& alm__,
+                               lapw_radial_basis_t const& rb__) const
     {
-        generate_impl<conjugate>(atom__, alm__, nullptr, &displacement__, &strain__);
+        generate_impl<conjugate>(atom__, alm__, rb__, nullptr, &displacement__, &strain__);
     }
 
     /// Full-j coefficients indexed by (G+k, AW, 4 physical components or 2 positive-energy PW spinors).
@@ -428,38 +430,39 @@ class Matching_coefficients // TODO: compute on GPU
         The lower spinor is -i S Omega_-kappa, consistent with the radial Dirac solver and angular convention. */
     template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
     void
-    generate(Atom const& atom__, mdarray<T, 3>& alm__) const
+    generate(Atom const& atom__, mdarray<T, 3>& alm__, lapw_radial_basis_t const& rb__) const
     {
-        generate_dirac_impl<conjugate>(atom__, alm__, nullptr);
+        generate_dirac_impl<conjugate>(atom__, alm__, rb__, nullptr);
     }
 
     template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
     void
-    generate_potential_response(Atom const& atom__, radial_basis_response_t const& response__,
-                                mdarray<T, 3>& alm__) const
+    generate_potential_response(Atom const& atom__, radial_basis_response_t const& response__, mdarray<T, 3>& alm__,
+                                lapw_radial_basis_t const& rb__) const
     {
         auto const& sd = response__.surface_derivatives;
         if (sd.size(0) != 6 ||
             sd.size(1) != atom__.type().mt_radial_basis_size() - atom__.type().num_lo_descriptors()) {
             RTE_THROW("wrong dimensions of Dirac AW boundary response");
         }
-        generate_dirac_impl<conjugate>(atom__, alm__, &sd);
+        generate_dirac_impl<conjugate>(atom__, alm__, rb__, &sd);
     }
 
     template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
     void
     generate_geometry_response(Atom const& atom__, r3::vector<double> const& displacement__,
-                               r3::matrix<double> const& strain__, mdarray<T, 3>& alm__) const
+                               r3::matrix<double> const& strain__, mdarray<T, 3>& alm__,
+                               lapw_radial_basis_t const& rb__) const
     {
-        generate_dirac_impl<conjugate>(atom__, alm__, nullptr, &displacement__, &strain__);
+        generate_dirac_impl<conjugate>(atom__, alm__, rb__, nullptr, &displacement__, &strain__);
     }
 
   private:
     template <bool conjugate, typename T>
     void
-    generate_dirac_impl(Atom const& atom__, mdarray<T, 3>& alm__, mdarray<double, 2> const* response__,
-                        r3::vector<double> const* displacement__ = nullptr,
-                        r3::matrix<double> const* strain__       = nullptr) const
+    generate_dirac_impl(Atom const& atom__, mdarray<T, 3>& alm__, lapw_radial_basis_t const& rb__,
+                        mdarray<double, 2> const* response__, r3::vector<double> const* displacement__ = nullptr,
+                        r3::matrix<double> const* strain__ = nullptr) const
     {
         auto const& type = atom__.type();
         if (!type.indexb().full_j() || alm__.size(0) != gkvec_.count() || alm__.size(1) != type.mt_aw_basis_size() ||
@@ -468,17 +471,17 @@ class Matching_coefficients // TODO: compute on GPU
         }
         if (alm__.size(2) == 2) {
             if constexpr (conjugate) {
-                generate_dirac_impl<false>(atom__, alm__, response__, displacement__, strain__);
+                generate_dirac_impl<false>(atom__, alm__, rb__, response__, displacement__, strain__);
                 for (auto& value : alm__) {
                     value = std::conj(value);
                 }
                 return;
             }
             mdarray<T, 3> components({gkvec_.count(), type.mt_aw_basis_size(), 4}), baseline;
-            generate_dirac_impl<false>(atom__, components, response__, displacement__, strain__);
+            generate_dirac_impl<false>(atom__, components, rb__, response__, displacement__, strain__);
             if (strain__) {
                 baseline = mdarray<T, 3>({gkvec_.count(), type.mt_aw_basis_size(), 4});
-                generate_dirac_impl<false>(atom__, baseline, nullptr);
+                generate_dirac_impl<false>(atom__, baseline, rb__, nullptr);
             }
             alm__.zero();
             for (int igk = 0; igk < gkvec_.count(); igk++) {
@@ -508,7 +511,7 @@ class Matching_coefficients // TODO: compute on GPU
             if (int(rf.idxlo) >= 0 || rf.order != 0) {
                 continue;
             }
-            int n = static_cast<int>(atom__.symmetry_class().aw_descriptor(rf.am).size());
+            int n = static_cast<int>(rb__.aw_descriptor(rf.am).size());
             if (n < 2 || n > 3) {
                 RTE_THROW("Dirac matching requires two or three augmented waves per kappa");
             }
@@ -517,8 +520,7 @@ class Matching_coefficients // TODO: compute on GPU
             for (int row = 0; row < n; row++) {
                 inverse(row, row) = 1;
                 for (int order = 0; order < n; order++) {
-                    boundary(row, order) =
-                            atom__.symmetry_class().aw_surface_deriv(rf.am, order, derivative[row], component[row]);
+                    boundary(row, order) = rb__.aw_surface_deriv(rf.am, order, derivative[row], component[row]);
                 }
             }
             if (la::wrap(la::lib_t::lapack).gesv(n, n, boundary.at(memory_t::host), n, inverse.at(memory_t::host), n) !=
@@ -556,7 +558,7 @@ class Matching_coefficients // TODO: compute on GPU
         for (int xi = 0; xi < type.mt_aw_basis_size(); xi++) {
             auto const& basis = type.indexb(xi);
             auto const& A     = inverse_boundary.at(basis.am.kappa());
-            int n             = static_cast<int>(atom__.symmetry_class().aw_descriptor(basis.am).size());
+            int n             = static_cast<int>(rb__.aw_descriptor(basis.am).size());
             for (int c = 0; c < 4; c++) {
                 auto [lm, cg] = basis.spinor_component(c % 2, c >= 2);
                 if (lm < 0) {
@@ -590,9 +592,9 @@ class Matching_coefficients // TODO: compute on GPU
 
     template <bool conjugate, typename T>
     void
-    generate_impl(Atom const& atom__, mdarray<T, 2>& alm__, mdarray<double, 2> const* response__,
-                  r3::vector<double> const* displacement__ = nullptr,
-                  r3::matrix<double> const* strain__       = nullptr) const
+    generate_impl(Atom const& atom__, mdarray<T, 2>& alm__, lapw_radial_basis_t const& rb__,
+                  mdarray<double, 2> const* response__, r3::vector<double> const* displacement__ = nullptr,
+                  r3::matrix<double> const* strain__ = nullptr) const
     {
         auto& type = atom__.type();
 
@@ -620,7 +622,7 @@ class Matching_coefficients // TODO: compute on GPU
             /* create matrix of radial derivatives */
             for (int order = 0; order < num_aw; order++) {
                 for (int dm = 0; dm < num_aw; dm++) {
-                    A(dm, order) = atom__.symmetry_class().aw_surface_deriv(l, order, dm);
+                    A(dm, order) = rb__.aw_surface_deriv(l, order, dm);
                 }
             }
 
@@ -725,7 +727,7 @@ class Matching_coefficients // TODO: compute on GPU
   public:
     /// Generate matching coefficients for all atoms.
     inline void
-    generate()
+    generate(LAPW_radial_basis const& rb__)
     {
         PROFILE("sirius::Matching_coefficients::generate");
 
@@ -745,7 +747,7 @@ class Matching_coefficients // TODO: compute on GPU
                                                       alm_all_atoms_.at(memory_t::host, 0, mt_aw_offset_[ia]),
                                                       mdarray_label("alm_atom"));
             /* generate conjugated LAPW matching coefficients on the CPU */
-            this->generate<true>(atom, alm_atom);
+            this->generate<true>(atom, alm_atom, rb__.radial_basis(atom_index_t::global(ia)));
         }
     }
 };

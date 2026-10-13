@@ -14,9 +14,9 @@ std::array<double, 2>
 check_external_xc_point_hessian(Potential const& potential__, Density const& density__, double step__)
 {
     auto const& ctx_ = potential__.ctx();
-    int invalid = !ctx_.full_potential() || !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_geometry_ ||
-                  !ctx_.cb().external_xc_geometry_response_ || &density__.ctx() != &ctx_ ||
-                  !density__.has_kinetic_density() || !std::isfinite(step__) || step__ <= 0;
+    int invalid      = !ctx_.full_potential() || !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_geometry_ ||
+                       !ctx_.cb().external_xc_geometry_response_ || &density__.ctx() != &ctx_ ||
+                       !density__.has_kinetic_density() || !std::isfinite(step__) || step__ <= 0;
     double hmin = step__, hmax = step__;
     ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
     ctx_.comm().allreduce<double, mpi::op_t::min>(&hmin, 1);
@@ -196,9 +196,9 @@ check_external_xc_point_hessian(Potential const& potential__, Density const& den
 std::array<double, 2>
 check_lapw_xc_response(DFT_ground_state& gs__, double step__)
 {
-    auto& kset_ = gs__.k_point_set();
-    auto& ctx_ = kset_.ctx();
-    auto& density_ = gs__.density();
+    auto& kset_      = gs__.k_point_set();
+    auto& ctx_       = kset_.ctx();
+    auto& density_   = gs__.density();
     auto& potential_ = gs__.potential();
     int invalid = !ctx_.full_potential() || !ctx_.cb().external_xc_response_ || !std::isfinite(step__) || step__ <= 0;
     double hmin = step__, hmax = step__;
@@ -225,7 +225,7 @@ check_lapw_xc_response(DFT_ground_state& gs__, double step__)
     std::unique_ptr<Hamiltonian0<double>> h0;
     if (dirac || (nf == 4 && ctx_.processing_unit() == device_t::CPU && !ctx_.so_correction())) {
         // Field matrices use the frozen basis and supplied covectors, not the reference potential.
-        h0 = std::make_unique<Hamiltonian0<double>>(plus_potential, false);
+        h0 = std::make_unique<Hamiltonian0<double>>(plus_potential, density_.lapw_basis_sptr());
     }
     auto matrix_samples = [&](Periodic_function<double> const& hartree, lapw_xc_field_adjoint_t const& xc,
                               Potential* actual = nullptr) {
@@ -236,7 +236,7 @@ check_lapw_xc_response(DFT_ground_state& gs__, double step__)
             // Rebuild the production operator for the stencil, independently of its derivative assembler.
             // Its fixed spherical and kinetic terms cancel between the two samples.
             copy(hartree, actual->effective_potential());
-            shifted = std::make_unique<Hamiltonian0<double>>(*actual, false);
+            shifted = std::make_unique<Hamiltonian0<double>>(*actual, density_.lapw_basis_sptr());
         } else {
             prepared = h0->lapw_field_response(hartree, xc);
         }
@@ -380,17 +380,17 @@ check_lapw_xc_response(DFT_ground_state& gs__, double step__)
 std::array<std::array<double, 3>, 2>
 check_lapw_xc_derivative(DFT_ground_state& gs__, double step__)
 {
-    auto& kset_ = gs__.k_point_set();
-    auto& ctx_ = kset_.ctx();
+    auto& kset_      = gs__.k_point_set();
+    auto& ctx_       = kset_.ctx();
     auto& unit_cell_ = ctx_.unit_cell();
-    auto& density_ = gs__.density();
+    auto& density_   = gs__.density();
     auto& potential_ = gs__.potential();
-    bool spinor = ctx_.num_mag_dims() == 3;
-    bool dirac  = ctx_.valence_relativity() == relativity_t::dirac;
-    int nsc     = dirac ? 2 : ctx_.num_spins();
-    int nf      = ctx_.num_mag_dims() + 1;
-    int invalid = !ctx_.full_potential() || !potential_.lapw_xc_derivatives() || ctx_.hubbard_correction() ||
-                  ctx_.cfg().parameters().precision_wf() != "fp64" || !std::isfinite(step__) || step__ <= 0;
+    bool spinor      = ctx_.num_mag_dims() == 3;
+    bool dirac       = ctx_.valence_relativity() == relativity_t::dirac;
+    int nsc          = dirac ? 2 : ctx_.num_spins();
+    int nf           = ctx_.num_mag_dims() + 1;
+    int invalid      = !ctx_.full_potential() || !potential_.lapw_xc_derivatives() || ctx_.hubbard_correction() ||
+                       ctx_.cfg().parameters().precision_wf() != "fp64" || !std::isfinite(step__) || step__ <= 0;
     ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
     double hmin = step__, hmax = step__;
     ctx_.comm().allreduce<double, mpi::op_t::min>(&hmin, 1);
@@ -462,11 +462,11 @@ check_lapw_xc_derivative(DFT_ground_state& gs__, double step__)
                     auto c = dirac_coefficients(*kp, *saved[ik], b);
                     for (int s : {0, 1}) {
                         for (int ig = 0; ig < ng; ig++) {
-                            auto g               = kp->gkvec().gvec(gvec_index_t::global(ig));
-                            double phase         = direction == 0
-                                                           ? (1 + 0.17 * s) * std::sin(0.41 * g[0] + 0.73 * g[1] + 0.19 * g[2])
-                                                           : 0;
-                            auto z               = c[s * ng + ig] * std::polar(1.0, t * phase);
+                            auto g       = kp->gkvec().gvec(gvec_index_t::global(ig));
+                            double phase = direction == 0
+                                                   ? (1 + 0.17 * s) * std::sin(0.41 * g[0] + 0.73 * g[1] + 0.19 * g[2])
+                                                   : 0;
+                            auto z       = c[s * ng + ig] * std::polar(1.0, t * phase);
                             evec(s * ng + ig, b) = derivative ? std::complex<double>(0, phase) * z : z;
                         }
                     }
@@ -479,7 +479,8 @@ check_lapw_xc_derivative(DFT_ground_state& gs__, double step__)
                         }
                     }
                 }
-                kp->generate_dirac_wave_functions(evec, derivative ? tangent[ik].get() : nullptr);
+                kp->generate_dirac_wave_functions(evec, density_.lapw_basis(),
+                                                  derivative ? tangent[ik].get() : nullptr);
                 ik++;
                 continue;
             }
@@ -509,7 +510,7 @@ check_lapw_xc_derivative(DFT_ground_state& gs__, double step__)
                         }
                     }
                 }
-                kp->generate_lapw_wave_functions(evec, target, s);
+                kp->generate_lapw_wave_functions(evec, target, s, density_.lapw_basis());
             }
             ik++;
         }
@@ -523,7 +524,7 @@ check_lapw_xc_derivative(DFT_ground_state& gs__, double step__)
         auto expectation = [&] {
             // Do not regenerate radial functions or update atom-potential pointers.
             // Subtracting the zero-XC operator cancels the fixed non-XC terms.
-            Hamiltonian0<double> h0(potential, false);
+            Hamiltonian0<double> h0(potential, density_.lapw_basis_sptr());
             double derivative{0};
             size_t ik{0};
             for (auto it : kset_.spl_num_kpoints()) {
@@ -614,6 +615,8 @@ check_lapw_xc_derivative(DFT_ground_state& gs__, double step__)
             return derivative;
         };
         Density plus_fields(ctx_), minus_fields(ctx_);
+        plus_fields.set_lapw_basis(density_.lapw_basis_sptr());
+        minus_fields.set_lapw_basis(density_.lapw_basis_sptr());
         std::vector<std::pair<std::complex<double>, double>> coarse_difference;
         auto field_error = [&](Density const& response, double h, bool refined) {
             double error{0}, peak{0}, relative{0};

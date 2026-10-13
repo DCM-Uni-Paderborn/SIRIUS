@@ -125,7 +125,7 @@ LAPW_response::LAPW_response(K_point_set& ks__, Density const& density__, Potent
     if (invalid) {
         RTE_THROW("coupled LAPW response requires matching fields and NR, ZORA or Dirac core XC response");
     }
-    h0_ = std::make_unique<Hamiltonian0<double>>(potential_, false);
+    h0_ = std::make_unique<Hamiltonian0<double>>(potential_, density_.lapw_basis_sptr());
     if (ctx.valence_relativity() != relativity_t::dirac) {
         h0_->generate_pw_coefs(potential_);
     }
@@ -190,7 +190,7 @@ LAPW_response::radial_geometry_response(xc_geometry_direction_t const& direction
     auto explicit_contraction = potential_.lapw_xc_contractions(density_, xc);
     auto induced_contraction  = potential_.lapw_xc_contractions(density_, induced_xc);
     result.xc_contraction     = explicit_contraction.rho + explicit_contraction.magnetic + explicit_contraction.tau +
-                            induced_contraction.rho + induced_contraction.magnetic + induced_contraction.tau;
+                                induced_contraction.rho + induced_contraction.magnetic + induced_contraction.tau;
     for (size_t ic = 0; ic < result.scalar.size(); ic++) {
         for (size_t ir = 0; ir < result.scalar[ic].size(); ir++) {
             result.scalar[ic][ir] += explicit_response.scalar[ic][ir];
@@ -310,7 +310,7 @@ LAPW_response::potential_response(Periodic_function<double> const& hartree__, la
     try {
         for (int ic = 0; ic < ctx.unit_cell().num_atom_symmetry_classes(); ic++) {
             radial.push_back(
-                    ctx.unit_cell().atom_symmetry_class(ic).radial_basis_potential_response(scalar[ic], core[ic]));
+                    h0_->lapw_basis().radial_basis_for_class(ic).radial_basis_potential_response(scalar[ic], core[ic]));
         }
     } catch (std::exception const&) {
         invalid = 1;
@@ -559,6 +559,7 @@ LAPW_response::solve(Density const& rhs__, double tolerance__, int max_iteration
         RTE_THROW("LAPW response solve requires common positive controls and matching rho/tau fields");
     }
     auto x = std::make_unique<Density>(ctx, true);
+    x->set_lapw_basis(density_.lapw_basis_sptr());
     x->zero();
     x->kinetic_density().zero();
     mixer::FunctionProperties<Density> properties(

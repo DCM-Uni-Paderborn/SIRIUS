@@ -6,23 +6,28 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/** \file atom_symmetry_class.cpp
+/** \file lapw_radial_basis.cpp
  *
- *  \brief Partial implementation of sirius::Atom_symmetry_class class.
+ *  \brief Partial implementation of sirius::lapw_radial_basis_t class.
  */
 
-#include "atom_symmetry_class.hpp"
+#include "lapw_radial_basis.hpp"
 #include "core/la/eigensolver.hpp"
 #include "radial/radial_core_solver.hpp"
 
 namespace sirius {
 
-Atom_symmetry_class::Atom_symmetry_class(int id__, Atom_type const& atom_type__)
+lapw_radial_basis_t::lapw_radial_basis_t(int id__, Atom_type const& atom_type__, relativity_t rel__,
+                                         std::vector<double> potential__)
     : id_(id__)
     , atom_type_(atom_type__)
+    , rel_(rel__)
 {
     if (!atom_type_.initialized()) {
         RTE_THROW("atom type is not initialized");
+    }
+    if (!potential__.empty()) {
+        set_spherical_potential(potential__);
     }
 
     int nl        = atom_type_.indexr().lmax() + 1;
@@ -82,7 +87,7 @@ Atom_symmetry_class::Atom_symmetry_class(int id__, Atom_type const& atom_type__)
 }
 
 std::vector<angular_momentum>
-Atom_symmetry_class::aw_channels() const
+lapw_radial_basis_t::aw_channels() const
 {
     std::vector<angular_momentum> result;
     if (!atom_type_.parameters().full_potential()) {
@@ -97,7 +102,7 @@ Atom_symmetry_class::aw_channels() const
 }
 
 void
-Atom_symmetry_class::validate_radial_relativity(relativity_t rel__) const
+lapw_radial_basis_t::validate_radial_relativity(relativity_t rel__) const
 {
     bool dirac = rel__ == relativity_t::dirac;
     if (dirac != atom_type_.indexb().full_j()) {
@@ -112,7 +117,7 @@ Atom_symmetry_class::validate_radial_relativity(relativity_t rel__) const
 }
 
 int
-Atom_symmetry_class::generate_aw_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__,
+lapw_radial_basis_t::generate_aw_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__,
                                                   mdarray<double, 2>& sd__, core_states_t const& core__,
                                                   std::vector<double> const* direction__,
                                                   radial_basis_response_t* response__,
@@ -279,7 +284,7 @@ Atom_symmetry_class::generate_aw_radial_functions(relativity_t rel__, mdarray<do
     std::vector<std::string> errors(channels.size());
     std::vector<int> status(channels.size(), 0);
 
-    #pragma omp parallel for schedule(dynamic, 1) default(shared)
+#pragma omp parallel for schedule(dynamic, 1) default(shared)
     for (size_t channel = 0; channel < channels.size(); channel++) {
         auto am = channels[channel];
         /* take first radial function */
@@ -329,7 +334,7 @@ Atom_symmetry_class::generate_aw_radial_functions(relativity_t rel__, mdarray<do
 
     int ierr{0};
     std::stringstream s;
-    s << "Atom_symmetry_class::generate_aw_radial_functions()" << std::endl
+    s << "lapw_radial_basis_t::generate_aw_radial_functions()" << std::endl
       << "  atom symmetry class id : " << id_ << std::endl
       << "  atom type label        : " << atom_type_.label() << std::endl
       << "  atom symbol            : " << atom_type_.symbol() << std::endl;
@@ -346,7 +351,7 @@ Atom_symmetry_class::generate_aw_radial_functions(relativity_t rel__, mdarray<do
 }
 
 int
-Atom_symmetry_class::generate_lo_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__,
+lapw_radial_basis_t::generate_lo_radial_functions(relativity_t rel__, mdarray<double, 3>& rf__,
                                                   core_states_t const& core__, std::vector<double> const* direction__,
                                                   radial_basis_response_t* response__,
                                                   core_states_t const* core_response__,
@@ -358,7 +363,7 @@ Atom_symmetry_class::generate_lo_radial_functions(relativity_t rel__, mdarray<do
     bool found{true};
     std::vector<std::string> errors(num_lo_descriptors());
 
-    #pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(dynamic, 1)
     for (int idxlo = 0; idxlo < num_lo_descriptors(); idxlo++) {
         Spline<double> s(atom_type_.radial_grid());
         double a[3][3];
@@ -571,7 +576,7 @@ Atom_symmetry_class::generate_lo_radial_functions(relativity_t rel__, mdarray<do
 }
 
 void
-Atom_symmetry_class::orthogonalize_radial_functions(mdarray<double, 3>& rf__, mdarray<double, 3>* response__) const
+lapw_radial_basis_t::orthogonalize_radial_functions(mdarray<double, 3>& rf__, mdarray<double, 3>* response__) const
 {
     int nmtp       = atom_type().num_mt_points();
     int components = atom_type_.indexb().full_j() ? 2 : 1;
@@ -658,7 +663,7 @@ Atom_symmetry_class::orthogonalize_radial_functions(mdarray<double, 3>& rf__, md
 }
 
 std::vector<int>
-Atom_symmetry_class::check_lo_linear_independence(double tol__) const
+lapw_radial_basis_t::check_lo_linear_independence(double tol__) const
 {
     int nmtp = atom_type_.num_mt_points();
 
@@ -747,7 +752,7 @@ Atom_symmetry_class::check_lo_linear_independence(double tol__) const
 }
 
 void
-Atom_symmetry_class::set_spherical_potential(std::vector<double> const& vs__)
+lapw_radial_basis_t::set_spherical_potential(std::vector<double> const& vs__)
 {
     if (atom_type_.num_mt_points() != (int)vs__.size()) {
         RTE_THROW("wrong size of effective potential array");
@@ -757,7 +762,7 @@ Atom_symmetry_class::set_spherical_potential(std::vector<double> const& vs__)
 }
 
 void
-Atom_symmetry_class::set_spherical_xc_derivatives(std::array<std::vector<double>, 2> const& fields__)
+lapw_radial_basis_t::set_spherical_xc_derivatives(std::array<std::vector<double>, 2> const& fields__)
 {
     for (auto const& field : fields__) {
         if (field.size() != fields__[0].size() || (!field.empty() && field.size() != atom_type_.num_mt_points()) ||
@@ -769,7 +774,7 @@ Atom_symmetry_class::set_spherical_xc_derivatives(std::array<std::vector<double>
 }
 
 radial_solver_result_t
-Atom_symmetry_class::solve_radial(relativity_t rel__, int dme__, angular_momentum am__, double energy__,
+lapw_radial_basis_t::solve_radial(relativity_t rel__, int dme__, angular_momentum am__, double energy__,
                                   core_states_t const& core__, std::vector<double> const* direction__,
                                   radial_solver_result_t* response__, core_states_t const* core_response__,
                                   double energy_direction__) const
@@ -815,9 +820,9 @@ Atom_symmetry_class::solve_radial(relativity_t rel__, int dme__, angular_momentu
 }
 
 int
-Atom_symmetry_class::find_enu(relativity_t rel__)
+lapw_radial_basis_t::find_enu(relativity_t rel__)
 {
-    PROFILE("sirius::Atom_symmetry_class::find_enu");
+    PROFILE("sirius::lapw_radial_basis_t::find_enu");
 
     /* unroll {n,l} -> enu map to enable omp for loop */
     std::vector<std::pair<std::pair<int, int>, enu_search_t>> nl_enu_vec(enu_search_.begin(), enu_search_.end());
@@ -825,7 +830,7 @@ Atom_symmetry_class::find_enu(relativity_t rel__)
     std::vector<std::string> errors(nl_enu_vec.size());
     std::vector<int> status(nl_enu_vec.size(), 0);
 
-    #pragma omp parallel for
+#pragma omp parallel for
     for (size_t i = 0; i < nl_enu_vec.size(); i++) {
         int n       = nl_enu_vec[i].first.first;
         int channel = nl_enu_vec[i].first.second;
@@ -841,7 +846,7 @@ Atom_symmetry_class::find_enu(relativity_t rel__)
     }
     int ierr{0};
     std::stringstream s;
-    s << "Atom_symmetry_class::find_enu()" << std::endl
+    s << "lapw_radial_basis_t::find_enu()" << std::endl
       << "  atom symmetry class id : " << id_ << std::endl
       << "  atom type label        : " << atom_type_.label() << std::endl
       << "  atom symbol            : " << atom_type_.symbol() << std::endl;
@@ -867,7 +872,7 @@ Atom_symmetry_class::find_enu(relativity_t rel__)
 }
 
 void
-Atom_symmetry_class::update_enu_descriptors()
+lapw_radial_basis_t::update_enu_descriptors()
 {
     /* update AW linearization energies */
     for (auto am : aw_channels()) {
@@ -889,7 +894,7 @@ Atom_symmetry_class::update_enu_descriptors()
 }
 
 std::vector<radial_core_state_t>
-Atom_symmetry_class::solve_core_states(Radial_grid<double> const& grid__, int channel__,
+lapw_radial_basis_t::solve_core_states(Radial_grid<double> const& grid__, int channel__,
                                        std::vector<double> const& potential__, int count__,
                                        std::array<std::vector<double>, 2> const& fields__, relativity_t relativity__,
                                        std::vector<double> const* direction__,
@@ -906,8 +911,8 @@ Atom_symmetry_class::solve_core_states(Radial_grid<double> const& grid__, int ch
                                     &core_reference_[channel__]);
 }
 
-Atom_symmetry_class::core_states_t
-Atom_symmetry_class::solve_occupied_core_states(Radial_grid<double> const& grid__,
+lapw_radial_basis_t::core_states_t
+lapw_radial_basis_t::solve_occupied_core_states(Radial_grid<double> const& grid__,
                                                 std::vector<double> const& potential__,
                                                 std::array<std::vector<double>, 2> const& fields__,
                                                 relativity_t relativity__, std::vector<double> const* direction__,
@@ -948,8 +953,8 @@ Atom_symmetry_class::solve_occupied_core_states(Radial_grid<double> const& grid_
     return result;
 }
 
-Atom_symmetry_class::core_states_t
-Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* direction__, core_states_t* response__,
+lapw_radial_basis_t::core_states_t
+lapw_radial_basis_t::generate_core_radial_states(std::vector<double> const* direction__, core_states_t* response__,
                                                  std::array<std::vector<double>, 2> const& xc_directions__,
                                                  std::array<std::vector<double>, 2>* fields_response__,
                                                  double* energy_response__) const
@@ -1010,9 +1015,9 @@ Atom_symmetry_class::generate_core_radial_states(std::vector<double> const* dire
 }
 
 int
-Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_enu__)
+lapw_radial_basis_t::generate_radial_functions(relativity_t rel__, bool update_enu__)
 {
-    PROFILE("sirius::Atom_symmetry_class::generate_radial_functions");
+    PROFILE("sirius::lapw_radial_basis_t::generate_radial_functions");
 
     validate_radial_relativity(rel__);
     bool dirac = atom_type_.indexb().full_j();
@@ -1074,7 +1079,7 @@ Atom_symmetry_class::generate_radial_functions(relativity_t rel__, bool update_e
 }
 
 radial_basis_response_t
-Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& direction__,
+lapw_radial_basis_t::radial_basis_potential_response(std::vector<double> const& direction__,
                                                      std::array<std::vector<double>, 2> const& xc_directions__,
                                                      bool update_enu__) const
 {
@@ -1140,9 +1145,9 @@ Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& 
                     for (int ir = 0; ir < grid.num_points(); ir++) {
                         double product = radial_function(ir, i) * radial_function(ir, j);
                         double dp      = result.radial_functions(ir, i, 0) * radial_function(ir, j) +
-                                    radial_function(ir, i) * result.radial_functions(ir, j, 0);
-                        double mass   = 1 - 2 * soc * spherical_potential_[ir];
-                        double factor = soc * (dp + 4 * soc * product * direction__[ir] / mass) / (mass * mass);
+                                         radial_function(ir, i) * result.radial_functions(ir, j, 0);
+                        double mass    = 1 - 2 * soc * spherical_potential_[ir];
+                        double factor  = soc * (dp + 4 * soc * product * direction__[ir] / mass) / (mass * mass);
                         integrand(ir) =
                                 factor * potential.deriv(1, ir) + soc * product * tangent.deriv(1, ir) / (mass * mass);
                         nuclear(ir) = factor * atom_type_.zn();
@@ -1157,7 +1162,7 @@ Atom_symmetry_class::radial_basis_potential_response(std::vector<double> const& 
 }
 
 void
-Atom_symmetry_class::sync_radial_functions(mpi::Communicator const& comm__, int const rank__)
+lapw_radial_basis_t::sync_radial_functions(mpi::Communicator const& comm__, int const rank__)
 {
     // Kinetic-density and XC matrix elements need both R and rR' on every rank.
     comm__.bcast(radial_functions_.at(memory_t::host), static_cast<int>(radial_functions_.size()), rank__);
@@ -1183,7 +1188,7 @@ Atom_symmetry_class::sync_radial_functions(mpi::Communicator const& comm__, int 
 }
 
 void
-Atom_symmetry_class::sync_radial_integrals(mpi::Communicator const& comm__, int const rank__)
+lapw_radial_basis_t::sync_radial_integrals(mpi::Communicator const& comm__, int const rank__)
 {
     comm__.bcast(h_spherical_integrals_.at(memory_t::host), (int)h_spherical_integrals_.size(), rank__);
     comm__.bcast(o_radial_integrals_.at(memory_t::host), (int)o_radial_integrals_.size(), rank__);
@@ -1194,9 +1199,9 @@ Atom_symmetry_class::sync_radial_integrals(mpi::Communicator const& comm__, int 
 }
 
 void
-Atom_symmetry_class::generate_radial_integrals(relativity_t rel__)
+lapw_radial_basis_t::generate_radial_integrals(relativity_t rel__)
 {
-    PROFILE("sirius::Atom_symmetry_class::generate_radial_integrals");
+    PROFILE("sirius::lapw_radial_basis_t::generate_radial_integrals");
     if (rel__ == relativity_t::dirac) {
         RTE_THROW("Dirac LAPW uses native full-j H/O assembly, not scalar radial integrals");
     }
@@ -1209,10 +1214,10 @@ Atom_symmetry_class::generate_radial_integrals(relativity_t rel__)
     }
 
     h_spherical_integrals_.zero();
-    #pragma omp parallel default(shared)
+#pragma omp parallel default(shared)
     {
         Spline<double> s(atom_type_.radial_grid());
-        #pragma omp for
+#pragma omp for
         for (int i1 = 0; i1 < atom_type_.mt_radial_basis_size(); i1++) {
             for (int i2 = 0; i2 < atom_type_.mt_radial_basis_size(); i2++) {
                 /* for spherical part of potential integrals are diagonal in l */
@@ -1225,8 +1230,8 @@ Atom_symmetry_class::generate_radial_integrals(relativity_t rel__)
                         /* r*u'_1(r) * r*u'_2(r) */
                         double t1 = radial_functions_(ir, i1, 1) * radial_functions_(ir, i2, 1);
                         s(ir)     = 0.5 * t1 * Minv +
-                                t0 * (0.5 * ll * Minv +
-                                      spherical_potential_[ir] * std::pow(atom_type_.radial_grid(ir), 2));
+                                    t0 * (0.5 * ll * Minv +
+                                          spherical_potential_[ir] * std::pow(atom_type_.radial_grid(ir), 2));
                     }
                     h_spherical_integrals_(i1, i2) = s.interpolate().integrate(0) / y00;
                 }
@@ -1235,10 +1240,10 @@ Atom_symmetry_class::generate_radial_integrals(relativity_t rel__)
     }
 
     o_radial_integrals_.zero();
-    #pragma omp parallel default(shared)
+#pragma omp parallel default(shared)
     {
         Spline<double> s(atom_type_.radial_grid());
-        #pragma omp for
+#pragma omp for
         for (int l = 0; l <= atom_type_.indexr().lmax(); l++) {
             int nrf = atom_type_.indexr().max_order(l);
 
@@ -1268,7 +1273,7 @@ Atom_symmetry_class::generate_radial_integrals(relativity_t rel__)
     }
     if (atom_type_.parameters().valence_relativity() == relativity_t::iora) {
         o1_radial_integrals_.zero();
-        #pragma omp parallel for
+#pragma omp parallel for
         for (int i1 = 0; i1 < atom_type_.mt_radial_basis_size(); i1++) {
             Spline<double> s(atom_type_.radial_grid());
             for (int i2 = 0; i2 < atom_type_.mt_radial_basis_size(); i2++) {
@@ -1331,7 +1336,7 @@ Atom_symmetry_class::generate_radial_integrals(relativity_t rel__)
 }
 
 std::array<mdarray<double, 2>, 2>
-Atom_symmetry_class::dirac_spherical_matrices(radial_basis_response_t const* response__,
+lapw_radial_basis_t::dirac_spherical_matrices(radial_basis_response_t const* response__,
                                               std::vector<double> const& direction__) const
 {
     int nr = atom_type_.num_mt_points(), nrf = atom_type_.mt_radial_basis_size();
@@ -1399,7 +1404,7 @@ Atom_symmetry_class::dirac_spherical_matrices(radial_basis_response_t const* res
 }
 
 void
-Atom_symmetry_class::save_spherical_potential() const
+lapw_radial_basis_t::save_spherical_potential() const
 {
     nlohmann::json dict;
     dict["x"]                   = atom_type_.radial_grid().values();
@@ -1410,7 +1415,7 @@ Atom_symmetry_class::save_spherical_potential() const
 }
 
 void
-Atom_symmetry_class::save_radial_functions(std::string const& fname__) const
+lapw_radial_basis_t::save_radial_functions(std::string const& fname__) const
 {
     nlohmann::json dict;
     dict["x"]                   = atom_type_.radial_grid().values();

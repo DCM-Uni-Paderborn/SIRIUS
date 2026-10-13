@@ -68,10 +68,10 @@ test_core_kinetic_density()
             double r                      = grid[ir];
             double u2                     = normalization * std::pow(r, 2 * gamma - 2) * std::exp(-2 * z * r);
             double logarithmic_derivative = (gamma - 1) / r - z;
-            double expected               = 0.5 * u2 *
+            double expected = 0.5 * u2 *
                               ((1 + ratio * ratio) * std::pow(logarithmic_derivative, 2) + 2 * ratio * ratio / (r * r));
-            maximum = std::max(maximum, expected);
-            error   = std::max(error, std::abs(bs.positive_kinetic_density()(ir) - expected));
+            maximum         = std::max(maximum, expected);
+            error           = std::max(error, std::abs(bs.positive_kinetic_density()(ir) - expected));
         }
         std::cout << "Dirac 1s Z=" << z << '\n';
         check("analytic spinor tau, peak-scaled error", error / maximum, 2e-6);
@@ -316,7 +316,7 @@ test_dirac_xc_core_storage()
     ctx.unit_cell().add_atom("H", {0.5, 0.5, 0.5});
     ctx.initialize();
     Density density(ctx);
-    auto& cls        = ctx.unit_cell().atom(0).symmetry_class();
+    auto& cls        = density.lapw_basis_sptr()->radial_basis(atom_index_t::global(0));
     int ic           = cls.id();
     auto const& type = cls.atom_type();
     auto const& grid = type.radial_grid();
@@ -429,7 +429,7 @@ test_dirac_xc_core_storage()
                       density.core_kinetic_density(0)[ir] * fields[ic][1][ir];
     }
     std::vector<double> direction(extended.num_points(), 0);
-    Atom_symmetry_class::core_states_t response;
+    lapw_radial_basis_t::core_states_t response;
     cls.solve_occupied_core_states(extended, veff, fields[ic], relativity_t::dirac, &direction, &response, fields[ic]);
     std::array<std::vector<double>, 2> fields_response;
     for (auto& field : fields_response) {

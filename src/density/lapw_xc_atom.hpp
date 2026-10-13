@@ -26,16 +26,16 @@ class LAPW_xc_atom
     std::unique_ptr<Spheric_kinetic_density_operator<std::complex<double>>> small_;
 
     static mdarray<double, 2>
-    radial_functions(Atom const& atom__, bool derivative__ = false, int component__ = 0)
+    radial_functions(Atom const& atom__, lapw_radial_basis_t const& basis__, bool derivative__ = false,
+                     int component__ = 0)
     {
         auto const& type = atom__.type();
         mdarray<double, 2> result({type.num_mt_points(), type.indexr().size()});
         for (auto const& rf : type.indexr()) {
             for (int ir = 0; ir < type.num_mt_points(); ir++) {
-                result(ir, rf.idxrf) =
-                        derivative__ ? atom__.symmetry_class().radial_function_derivative(ir, rf.idxrf, component__) /
-                                               type.radial_grid(ir)
-                                     : atom__.symmetry_class().radial_function(ir, rf.idxrf, component__);
+                result(ir, rf.idxrf) = derivative__ ? basis__.radial_function_derivative(ir, rf.idxrf, component__) /
+                                                              type.radial_grid(ir)
+                                                    : basis__.radial_function(ir, rf.idxrf, component__);
                 if (!std::isfinite(result(ir, rf.idxrf))) {
                     RTE_THROW("LAPW XC atom: nonfinite radial function");
                 }
@@ -69,16 +69,16 @@ class LAPW_xc_atom
     }
 
   public:
-    LAPW_xc_atom(Atom const& atom__, int lmax__)
+    LAPW_xc_atom(Atom const& atom__, lapw_radial_basis_t const& basis__, int lmax__)
         : type_(atom__.type())
         , lmmax_(sf::lmmax(lmax__))
-        , kinetic_(type_.radial_grid(), type_.indexb(), radial_functions(atom__), lmax__, radial_wave_function_t::R, {},
-                   radial_functions(atom__, true))
+        , kinetic_(type_.radial_grid(), type_.indexb(), radial_functions(atom__, basis__), lmax__,
+                   radial_wave_function_t::R, {}, radial_functions(atom__, basis__, true))
     {
         if (type_.indexb().full_j()) {
             small_ = std::make_unique<Spheric_kinetic_density_operator<std::complex<double>>>(
-                    type_.radial_grid(), type_.indexb(), radial_functions(atom__, false, 1), lmax__,
-                    radial_wave_function_t::R, std::vector<int>{}, radial_functions(atom__, true, 1), false,
+                    type_.radial_grid(), type_.indexb(), radial_functions(atom__, basis__, false, 1), lmax__,
+                    radial_wave_function_t::R, std::vector<int>{}, radial_functions(atom__, basis__, true, 1), false,
                     spinor_harmonic_t::minus_kappa);
         }
     }

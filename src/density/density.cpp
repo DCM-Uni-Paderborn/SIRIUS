@@ -36,7 +36,7 @@ namespace sirius {
  *  of the muffin-tin is extended to effective infinity and spherical potential outside muffin-tin is approximated
  *  with alpha/r + beta tail. Bound states are found and accumulated in the core charge density. */
 static auto
-generate_core_charge_density(Atom_symmetry_class const& atom_class__, relativity_t core_rel__,
+generate_core_charge_density(lapw_radial_basis_t const& atom_class__, relativity_t core_rel__,
                              std::vector<double> const& vs__, std::vector<double>& rho_core__,
                              std::vector<double>& tau_core__, std::array<std::vector<double>, 2> const* core_xc__)
 {
@@ -105,7 +105,7 @@ generate_core_charge_density(Atom_symmetry_class const& atom_class__, relativity
         }
     } else {
         std::exception_ptr error;
-        #pragma omp parallel for
+#pragma omp parallel for
         for (int ist = 0; ist < atom_type__.num_atomic_levels(); ist++) {
             try {
                 if (atom_type__.atomic_level(ist).core) {
@@ -125,7 +125,7 @@ generate_core_charge_density(Atom_symmetry_class const& atom_class__, relativity
                     level_energy[ist] = bs.enu();
                 }
             } catch (...) {
-                #pragma omp critical(radial_core_failure)
+#pragma omp critical(radial_core_failure)
                 {
                     if (!error) {
                         error = std::current_exception();
@@ -268,6 +268,14 @@ Density::Density(Simulation_context& ctx__, bool kinetic_density__)
         }
         core_eval_sum_.resize(unit_cell_.num_atom_symmetry_classes());
         core_leakage_.resize(unit_cell_.num_atom_symmetry_classes());
+        std::vector<std::vector<double>> starting_potential(unit_cell_.num_atom_symmetry_classes());
+        for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
+            auto const& type = unit_cell_.atom_symmetry_class(ic).atom_type();
+            for (double r : type.radial_grid().values()) {
+                starting_potential[ic].push_back(type.free_atom_potential(r));
+            }
+        }
+        lapw_basis_ = std::make_shared<LAPW_radial_basis>(unit_cell_, ctx_.valence_relativity(), starting_potential);
     }
 
     l_by_lm_ = sf::l_by_lm(ctx_.lmax_rho());
@@ -1247,7 +1255,8 @@ Density::check_num_electrons() const
 
 template <typename T>
 void
-Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__)
+Density::generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> lapw_basis__, bool symmetrize__,
+                  bool add_core__, bool transform_to_rg__)
 {
     PROFILE("sirius::Density::generate");
     power::Profile p1("generate_dens");
@@ -1256,7 +1265,8 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
         RTE_THROW("external XC registration cannot change after constructing the density");
     }
 
-    generate_valence<T>(ks__);
+    set_lapw_basis(std::move(lapw_basis__));
+    generate_valence<T>(ks__, lapw_basis_.get());
 
     if (kinetic_density_) {
         if (ctx_.valence_relativity() != relativity_t::dirac) {
@@ -1405,7 +1415,8 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
         }
         sirius::symmetrize_density_matrix(unit_cell_, ctx_.rotm_ylm(), *density_matrix_, ctx_.num_mag_comp());
         for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
-            auto& type = ctx_.unit_cell().atom(ia).type();
+            auto& type     = ctx_.unit_cell().atom(ia).type();
+            auto const& rb = lapw_basis().radial_basis(atom_index_t::global(ia));
             out << "atom : " << ia << std::endl;
             for (int l = 0; l < 4; l++) {
                 int nrf = type.indexr().max_order(l);
@@ -1422,8 +1433,7 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
                                     dm_ylm(l + m1, l + m2) +=
                                             (*density_matrix_)[ia](type.indexb_by_l_m_order(l, m1, order1),
                                                                    type.indexb_by_l_m_order(l, m2, order2), is) *
-                                            ctx_.unit_cell().atom(ia).symmetry_class().o_radial_integral(l, order1,
-                                                                                                         order2);
+                                            rb.o_radial_integral(l, order1, order2);
                                 }
                             }
                         }
@@ -1483,10 +1493,12 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
 }
 
 template void
-Density::generate<double>(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__);
+Density::generate<double>(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> lapw_basis__, bool symmetrize__,
+                          bool add_core__, bool transform_to_rg__);
 #if defined(SIRIUS_USE_FP32)
 template void
-Density::generate<float>(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__);
+Density::generate<float>(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> lapw_basis__, bool symmetrize__,
+                         bool add_core__, bool transform_to_rg__);
 #endif
 
 void
@@ -1511,9 +1523,12 @@ Density::augment()
 
 template <typename T>
 void
-Density::generate_valence(K_point_set const& ks__)
+Density::generate_valence(K_point_set const& ks__, LAPW_radial_basis const* lapw_basis__)
 {
     PROFILE("sirius::Density::generate_valence");
+    if (ctx_.full_potential() && !lapw_basis__) {
+        RTE_THROW("LAPW density generation requires a radial basis");
+    }
 
     /* check weights */
     double wt{0};
@@ -1659,7 +1674,7 @@ Density::generate_valence(K_point_set const& ks__)
 
     /* for muffin-tin part */
     if (ctx_.full_potential()) {
-        generate_valence_mt();
+        generate_valence_mt(*lapw_basis__);
     }
 }
 
@@ -1872,13 +1887,14 @@ Density::reduce_density_matrix(Atom_type const& atom_type__, mdarray<std::comple
 }
 
 void
-Density::generate_valence_mt()
+Density::generate_valence_mt(LAPW_radial_basis const& lapw_basis__)
 {
     PROFILE("sirius::Density::generate_valence_mt");
 
     if (ctx_.valence_relativity() == relativity_t::dirac) {
         for (auto atom : unit_cell_.spl_num_atoms()) {
-            auto fields = LAPW_xc_atom(unit_cell_.atom(atom.i), ctx_.lmax_rho()).fields(density_matrix(atom.i));
+            auto fields = LAPW_xc_atom(unit_cell_.atom(atom.i), lapw_basis__.radial_basis(atom.i), ctx_.lmax_rho())
+                                  .fields(density_matrix(atom.i));
             for (int s = 0; s <= ctx_.num_mag_dims(); s++) {
                 auto& out = component(s).mt()[atom.i];
                 std::copy_n(fields[0][s].at(memory_t::host), out.size(), out.at(memory_t::host));
@@ -1956,6 +1972,8 @@ Density::generate_valence_mt()
     for (auto it : unit_cell_.spl_num_atoms()) {
         auto& atom_type = unit_cell_.atom(it.i).type();
 
+        auto const& rb = lapw_basis__.radial_basis(it.i);
+
         int nmtp         = atom_type.num_mt_points();
         int num_rf_pairs = atom_type.mt_radial_basis_size() * (atom_type.mt_radial_basis_size() + 1) / 2;
 
@@ -1984,9 +2002,7 @@ Density::generate_valence_mt()
                 /* off-diagonal pairs are taken two times: d_{12}*f_1*f_2 + d_{21}*f_2*f_1 = d_{12}*2*f_1*f_2 */
                 int n = (idxrf1 == idxrf2) ? 1 : 2;
                 for (int ir = 0; ir < unit_cell_.atom(it.i).num_mt_points(); ir++) {
-                    rf_pairs(ir, offs + idxrf1) = n *
-                                                  unit_cell_.atom(it.i).symmetry_class().radial_function(ir, idxrf1) *
-                                                  unit_cell_.atom(it.i).symmetry_class().radial_function(ir, idxrf2);
+                    rf_pairs(ir, offs + idxrf1) = n * rb.radial_function(ir, idxrf1) * rb.radial_function(ir, idxrf2);
                 }
             }
         }
@@ -2499,8 +2515,8 @@ Density::generate_core_charge_density(std::vector<std::vector<double>> const& vs
             }
         }
         for (auto it : spl_idx) {
-            auto& atom_class = unit_cell_.atom_symmetry_class(it.i);
-            auto const& type = atom_class.atom_type();
+            auto const& atom_class = lapw_basis().radial_basis_for_class(it.i);
+            auto const& type       = atom_class.atom_type();
             auto result =
                     ::sirius::generate_core_charge_density(atom_class, ctx_.core_relativity(), vs__[it.i], rho[it.i],
                                                            tau[it.i], core_xc__.empty() ? nullptr : &core_xc__[it.i]);

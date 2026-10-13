@@ -79,7 +79,8 @@ core_overlap(Density const& density)
         }
         Spline<double> product(grid);
         for (int ir = 0; ir < grid.num_points(); ir++) {
-            product(ir) = std::sqrt(fourpi * core_rho[ir] / 2) * atom.symmetry_class().radial_function(ir, b.idxrf);
+            product(ir) = std::sqrt(fourpi * core_rho[ir] / 2) *
+                          density.lapw_basis().radial_basis(atom_index_t::global(0)).radial_function(ir, b.idxrf);
         }
         overlap[b.xi] = product.interpolate().integrate(2);
     }
