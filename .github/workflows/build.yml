@@ -15,17 +15,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build SIRIUS
         run: |
+          install -d -m 755 "${RUNNER_TEMP}/sirius-stage"
+          spack -e /sirius-env config add "config:build_stage:${RUNNER_TEMP}/sirius-stage"
           spack -e /sirius-env develop -p ${GITHUB_WORKSPACE} sirius@develop
           spack -e /sirius-env concretize -f
           spack -e /sirius-env install
       - name: Run unit tests
         run: |
-          cd $(spack -e /sirius-env location -b sirius)
-          # Set these after Spack's environment cleanup for the root-run CI container.
-          spack -e /sirius-env --color always build-env sirius -- env \
-            OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-            PRTE_ALLOW_RUN_AS_ROOT=1 PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-            ctest --output-on-failure --label-exclude integration_test
+          build_dir=$(spack -e /sirius-env location -b sirius)
+          chown -R nobody:nogroup "$(dirname "$build_dir")"
+          cd "$build_dir"
+          spack -e /sirius-env --color always build-env sirius -- runuser -u nobody -- \
+            env HOME="$build_dir" ctest --output-on-failure --label-exclude integration_test
       - name: Run verification tests
         run: |
           cd $(spack -e /sirius-env location -b sirius)
