@@ -5,7 +5,7 @@ include(CMakePackageConfigHelpers)
 project(SIRIUS
   DESCRIPTION "Domain specific library for electronic structure calculations"
   HOMEPAGE_URL "https://github.com/electronic-structure/SIRIUS"
-  VERSION 7.12.0
+  VERSION 7.13.0
   LANGUAGES CXX C)
 
 # for CUDA_ARCHITECTURES
@@ -47,7 +47,7 @@ set_property(CACHE SIRIUS_USE_FP32 PROPERTY STRINGS "AUTO" "ON" "OFF")
 
 # set language and standard
 
-if(SIRIUS_CREATE_FORTRAN_BINDINGS)
+if(SIRIUS_CREATE_FORTRAN_BINDINGS OR SIRIUS_USE_DFTD3 OR SIRIUS_USE_DFTD4)
   enable_language(Fortran)
 endif()
 
@@ -88,17 +88,7 @@ if (NOT CMAKE_BUILD_TYPE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "debug" "release" "relwithdebinfo")
 endif()
 
-if(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU" OR ${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
-  set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -ggdb -DDEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -ggdb -O2")
-elseif(${CMAKE_CXX_COMPILER_ID} STREQUAL "Intel")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-  set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2")
-endif()
+add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang,IntelLLVM>:-Wall>)
 
 # preserve rpaths when installing and make the install folder relocatable
 # use `CMAKE_SKIP_INSTALL_RPATH` to skip this
@@ -133,23 +123,27 @@ endif()
 find_package(MPI REQUIRED)
 #set(GSL_CBLAS_LIBRARY ${BLAS_LIBRARIES} CACHE STRING "" FORCE)
 find_package(GSL REQUIRED)
-find_package(LibXC 4.0.0 REQUIRED)
+find_package(Libxc REQUIRED CONFIG)
 find_package(LibSPG REQUIRED)
 find_package(HDF5 REQUIRED C)
 include(cmake/hdf5_target.cmake)
 find_package(SpFFT 1.0.2 CONFIG REQUIRED)
 find_package(SPLA 1.4.0 CONFIG REQUIRED)
 
+if (Libxc_VERSION VERSION_LESS "4.0.0")
+   message(FATAL_ERROR "Libxc >= 4.0.0 is required; found version ${Libxc_VERSION}")
+endif ()
+
 if (SIRIUS_USE_PUGIXML)
    find_package(pugixml REQUIRED)
 endif()
 
 if (SIRIUS_USE_DFTD3)
-   find_package(DFTD3 REQUIRED)
+   find_package(s-dftd3 REQUIRED CONFIG)
 endif ()
 
 if (SIRIUS_USE_DFTD4)
-  find_package(DFTD4 REQUIRED)
+  find_package(dftd4 REQUIRED CONFIG)
 endif ()
 
 if (SIRIUS_USE_VCSQNM)
