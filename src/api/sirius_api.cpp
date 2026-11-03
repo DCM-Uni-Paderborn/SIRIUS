@@ -5573,6 +5573,12 @@ sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data
     call_sirius(
             [&]() {
                 auto& ctx = get_sim_ctx(handler__);
+                int enabled = fptr__ != nullptr, minimum = enabled, maximum = enabled;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&minimum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&maximum, 1);
+                if (minimum != maximum) {
+                    RTE_THROW("external XC registration must agree on all context ranks");
+                }
                 if (ctx.initialized()) {
                     RTE_THROW("register external XC before initializing the context");
                 }
@@ -5715,11 +5721,17 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
     call_sirius(
             [&]() {
                 auto& ctx = get_sim_ctx(handler__);
+                int enabled = fptr__ != nullptr, minimum = enabled, maximum = enabled;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&minimum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&maximum, 1);
+                if (minimum != maximum) {
+                    RTE_THROW("external XC registration must agree on all context ranks");
+                }
                 if (ctx.initialized()) {
                     RTE_THROW("register external point XC before initializing the context");
                 }
-                ctx.cb().external_xc_spinor_ = false;
                 if (!fptr__) {
+                    ctx.cb().external_xc_spinor_               = false;
                     ctx.cb().external_xc_geometry_             = nullptr;
                     ctx.cb().external_xc_pullback_             = nullptr;
                     ctx.cb().external_xc_quadrature_direction_ = nullptr;
@@ -5731,6 +5743,7 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                 }
                 auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
                                                 descriptor_weights__, block_sizes__, block_centres__);
+                ctx.cb().external_xc_spinor_               = false;
                 ctx.cb().external_xc_geometry_             = nullptr;
                 ctx.cb().external_xc_pullback_             = nullptr;
                 ctx.cb().external_xc_quadrature_direction_ = nullptr;
