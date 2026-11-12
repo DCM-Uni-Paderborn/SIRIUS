@@ -342,8 +342,9 @@ Potential::generate(Density const& density__, bool use_symmetry__, bool transfor
     if (bool(ctx_.cb().external_xc_) != external_xc_registered_) {
         RTE_THROW("external XC registration cannot change after constructing the potential");
     }
-    if (external_xc_registered_ && ctx_.cb().external_xc_points_ && use_symmetry__) {
-        RTE_THROW("external XC point quadrature requires disabled crystal symmetry");
+    if (ctx_.cb().external_xc_ && ctx_.cb().external_xc_points_ && use_symmetry__) {
+        ctx_.cb().external_xc_points_->validate(ctx_);
+        ctx_.cb().external_xc_points_->symmetry(ctx_);
     }
     if ((ctx_.full_potential() || unit_cell_.num_paw_atoms()) && ctx_.meta_gga() && use_symmetry__) {
         RTE_THROW("PAW/LAPW meta-GGA cannot symmetrize discrete XC operators independently of their quadrature");
