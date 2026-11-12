@@ -337,8 +337,30 @@ K_point_set::find_efermi_fixed_magn(double emin, double emax)
     };
 
     for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
-        auto F      = [&compute_ne, ispn, occ, &f](double x) { return compute_ne(ispn, x, f) - occ[ispn]; };
-        auto result = bisection_search(F, emin, emax, 1e-11);
+        if (occ[ispn] < 0 || occ[ispn] > ctx_.num_bands() * ctx_.max_occupancy()) {
+            RTE_THROW("fixed magnetic moment requests an impossible spin occupation");
+        }
+        auto F = [&compute_ne, ispn, occ, &f](double x) { return compute_ne(ispn, x, f) - occ[ispn]; };
+        // Empty or full spin channels need a chemical potential outside the spectrum.
+        double margin = std::max(1.0, 32 * ctx_.smearing_width());
+        double lo = emin - margin, hi = emax + margin;
+        double flo = F(lo), fhi = F(hi);
+        constexpr double tolerance = 1e-11;
+        for (int i = 0; i < 20 && (flo > tolerance || fhi < -tolerance); i++) {
+            margin *= 2;
+            lo  = emin - margin;
+            hi  = emax + margin;
+            flo = F(lo);
+            fhi = F(hi);
+        }
+        if (!std::isfinite(flo) || !std::isfinite(fhi) || flo > tolerance || fhi < -tolerance) {
+            RTE_THROW("failed to bracket the chemical potential for a fixed spin occupation");
+        }
+        if (std::abs(flo) < tolerance || std::abs(fhi) < tolerance) {
+            efermi[ispn] = std::abs(flo) < tolerance ? lo : hi;
+            continue;
+        }
+        auto result = bisection_search(F, lo, hi, tolerance);
         if (!result) {
             RTE_THROW(result.error());
         }
@@ -356,6 +378,10 @@ K_point_set::find_efermi_generic(double emin, double emax) const
     /* split number of bands between available ranks */
     splindex_block<> splb(ctx_.num_bands(), n_blocks(ctx_.comm_band().size()), block_id(ctx_.comm_band().rank()));
     double const ne_target = ctx_.unit_cell().num_valence_electrons() - ctx_.cfg().parameters().extra_charge();
+    if (!std::isfinite(ne_target) || ne_target < 0 ||
+        ne_target > ctx_.num_bands() * ctx_.num_spinors() * ctx_.max_occupancy()) {
+        RTE_THROW("requested electron count exceeds the available band occupations");
+    }
     /* computes N(ef; f) = \sum_{i,k} f(ef - e_{k,i}) */
     auto compute_ne = [&](double ef, auto&& f) {
         double ne{0};
@@ -374,6 +400,28 @@ K_point_set::find_efermi_generic(double emin, double emax) const
         return ne;
     };
 
+    auto search = [&](auto&& F) -> util::expected<local::efermi_search_t, std::string> {
+        double lo = emin, hi = emax;
+        double flo = F(lo), fhi = F(hi);
+        // Partially occupied edge bands can place the chemical potential outside the spectrum.
+        double margin = std::max(1.0, 32 * ctx_.smearing_width());
+        for (int i = 0; i < 20 && (flo > tol || fhi < -tol); i++) {
+            lo  = emin - margin;
+            hi  = emax + margin;
+            flo = F(lo);
+            fhi = F(hi);
+            margin *= 2;
+        }
+        if (!std::isfinite(flo) || !std::isfinite(fhi) || flo > tol || fhi < -tol) {
+            return util::unexpected(std::string("failed to bracket the chemical potential"));
+        }
+        if (std::abs(flo) < tol || std::abs(fhi) < tol) {
+            bool lower = std::abs(flo) < tol;
+            return local::efermi_search_t{.mu = lower ? lo : hi, .ne_diff = std::abs(lower ? flo : fhi), .iter = 0};
+        }
+        return bisection_search(F, lo, hi, tol);
+    };
+
     /* smearing function */
     switch (ctx_.smearing()) {
         // non-monotic smearing types
@@ -381,7 +429,7 @@ K_point_set::find_efermi_generic(double emin, double emax) const
         case smearing::smearing_t::methfessel_paxton: {
             auto fgauss = [&](double x) { return smearing::gaussian::occupancy(x, ctx_.smearing_width()); };
             auto F      = [&compute_ne, ne_target, &fgauss](double x) { return compute_ne(x, fgauss) - ne_target; };
-            auto bgauss_init = bisection_search(F, emin, emax, 1e-11);
+            auto bgauss_init = search(F);
             if (!bgauss_init) {
                 RTE_THROW(bgauss_init.error());
             }
@@ -402,8 +450,7 @@ K_point_set::find_efermi_generic(double emin, double emax) const
                 return res_newton.value();
             } // use bisection search
 
-            auto bsearch = bisection_search(
-                    [&compute_ne, ne_target, &f](double x) { return compute_ne(x, f) - ne_target; }, emin, emax, 1e-11);
+            auto bsearch = search([&compute_ne, ne_target, &f](double x) { return compute_ne(x, f) - ne_target; });
             if (!bsearch) {
                 RTE_THROW(bsearch.error());
             }
@@ -413,7 +460,7 @@ K_point_set::find_efermi_generic(double emin, double emax) const
         default: {
             std::function<double(double)> f = smearing::occupancy(ctx_.smearing(), ctx_.smearing_width());
             auto M      = [&compute_ne, ne_target, &f](double x) { return compute_ne(x, f) - ne_target; };
-            auto result = bisection_search(M, emin, emax, 1e-11);
+            auto result = search(M);
             if (!result) {
                 RTE_THROW(result.error());
             }
@@ -481,7 +528,7 @@ K_point_set::find_band_occupancies()
     /* set band occupancies */
     auto f = smearing::occupancy(ctx_.smearing(), ctx_.smearing_width());
     for (auto it : spl_num_kpoints_) {
-        for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+        for (int ispn = 0; ispn < ctx_.num_spinors(); ispn++) {
             #pragma omp parallel for
             for (int j = 0; j < ctx_.num_bands(); j++) {
                 auto o = f(this->energy_fermi_[ispn] - this->get<T>(it.i)->band_energy(j, ispn)) * ctx_.max_occupancy();
@@ -496,7 +543,7 @@ K_point_set::find_band_occupancies()
     band_gap_ = 0.0;
 
     int nve = static_cast<int>(ne_target + 1e-12);
-    if (ctx_.num_spins() == 2 || (std::abs(nve - ne_target) < 1e-12 && nve % 2 == 0)) {
+    if (ctx_.max_occupancy() == 1 || (std::abs(nve - ne_target) < 1e-12 && nve % 2 == 0)) {
         /* find band gap */
         std::vector<std::pair<double, double>> eband(ctx_.num_bands() * ctx_.num_spinors());
 
@@ -519,15 +566,149 @@ K_point_set::find_band_occupancies()
         std::sort(eband.begin(), eband.end());
 
         int ist = nve;
-        if (ctx_.num_spins() == 1) {
-            ist /= 2;
-        }
+        ist /= ctx_.max_occupancy();
 
-        if (eband[ist].first > eband[ist - 1].second) {
+        if (ist > 0 && ist < static_cast<int>(eband.size()) && eband[ist].first > eband[ist - 1].second) {
             band_gap_ = eband[ist].first - eband[ist - 1].second;
         }
     }
     return ne_diff;
+}
+
+K_point_set::occupation_response_t
+K_point_set::band_occupation_response(std::vector<mdarray<double, 2>> const& energy_directions__) const
+{
+    int ns = ctx_.num_spinors(), nb = ctx_.num_bands();
+    double ne       = ctx_.unit_cell().num_valence_electrons() - ctx_.cfg().parameters().extra_charge();
+    bool fixed_spin = ns == 2 && std::abs(ctx_.cfg().parameters().fixed_mag()) > 1e-10;
+    bool filled     = ns == 1 && std::abs(nb * ctx_.max_occupancy() - ne) < 1e-10;
+    std::array<double, 2> target{ne, ne};
+    double capacity = nb * ctx_.max_occupancy() * (fixed_spin ? 1 : ns);
+    if (fixed_spin) {
+        target = {(ne + ctx_.cfg().parameters().fixed_mag()) / 2, (ne - ctx_.cfg().parameters().fixed_mag()) / 2};
+    }
+    int invalid = !initialized_ || ctx_.cfg().parameters().precision_wf() != "fp64" ||
+                  static_cast<bool>(ctx_.band_occ_callback()) || !std::isfinite(ne) || ne < 0 ||
+                  (!filled && ne > nb * ns * ctx_.max_occupancy()) ||
+                  energy_directions__.size() != spl_num_kpoints_.local_size() ||
+                  (!filled && (!std::isfinite(ctx_.smearing_width()) || ctx_.smearing_width() <= 0));
+    if (fixed_spin) {
+        for (double count : target) {
+            invalid |= !std::isfinite(count) || count < 0 || count > capacity;
+        }
+    } else if (ns == 2) {
+        invalid |= energy_fermi_[0] != energy_fermi_[1];
+    }
+    for (int s = 0; s < ns; s++) {
+        invalid |= !std::isfinite(energy_fermi_[s]);
+    }
+    if (!invalid) {
+        size_t ik{0};
+        for (auto it : spl_num_kpoints_) {
+            auto const& d  = energy_directions__[ik++];
+            auto const& kp = *get<double>(it.i);
+            if (d.size(0) != nb || d.size(1) != ns || !d.on_host()) {
+                invalid = 1;
+                continue;
+            }
+            invalid |= !std::isfinite(kp.weight()) || kp.weight() < 0;
+            for (int s = 0; s < ns; s++) {
+                for (int b = 0; b < nb; b++) {
+                    invalid |= !std::isfinite(d(b, s)) || !std::isfinite(kp.band_energy(b, s)) ||
+                               !std::isfinite(kp.band_occupancy(b, s));
+                }
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("occupation response requires initialized fp64 bands and finite energy directions");
+    }
+    auto f  = smearing::occupancy(ctx_.smearing(), ctx_.smearing_width());
+    auto df = smearing::delta(ctx_.smearing(), ctx_.smearing_width());
+    // Center the weighted reduction so a common potential shift is retained exactly.
+    double origin = std::numeric_limits<double>::infinity();
+    for (auto const& direction : energy_directions__) {
+        for (double value : direction) {
+            origin = std::min(origin, value);
+        }
+    }
+    ctx_.comm().allreduce<double, mpi::op_t::min>(&origin, 1);
+    occupation_response_t result;
+    result.fermi.fill(0);
+    std::array<double, 8> sums{};
+    size_t ik{0};
+    for (auto it : spl_num_kpoints_) {
+        auto const& d  = energy_directions__[ik++];
+        auto const& kp = *get<double>(it.i);
+        std::vector<double> reference(d.at(memory_t::host), d.at(memory_t::host) + d.size());
+        kp.comm().bcast(reference.data(), reference.size(), 0);
+        for (size_t i = 0; i < d.size(); i++) {
+            invalid |= std::abs(d[i] - reference[i]) > 1e-12 * std::max(1.0, std::abs(reference[i]));
+        }
+        result.slopes.emplace_back(std::array<index_range, 2>{nb, ns});
+        auto& slopes  = result.slopes.back();
+        double weight = kp.weight() / kp.comm().size();
+        for (int s = 0; s < ns; s++) {
+            int channel   = fixed_spin ? s : 0;
+            bool constant = filled || target[channel] == 0 || target[channel] == capacity;
+            for (int b = 0; b < nb; b++) {
+                double x = energy_fermi_[s] - kp.band_energy(b, s);
+                double expected =
+                        constant ? (target[channel] == 0 ? 0 : ctx_.max_occupancy()) : ctx_.max_occupancy() * f(x);
+                slopes(b, s) = constant ? 0 : -ctx_.max_occupancy() * df(x);
+                invalid |= !std::isfinite(slopes(b, s)) ||
+                           std::abs(expected - kp.band_occupancy(b, s)) > 1e-11 * ctx_.max_occupancy();
+                sums[channel] += weight * slopes(b, s);
+                sums[2 + channel] += weight * slopes(b, s) * (d(b, s) - origin);
+                sums[4 + channel] += weight * std::abs(slopes(b, s));
+                sums[6 + channel] += weight * kp.band_occupancy(b, s);
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("occupation response requires consistent band populations and k-point replicas");
+    }
+    ctx_.comm().allreduce(sums.data(), sums.size());
+    for (int channel = 0; channel < (fixed_spin ? 2 : 1); channel++) {
+        for (int row : {0, 2, 4, 6}) {
+            invalid |= !std::isfinite(sums[row + channel]);
+        }
+        if (sums[4 + channel] != 0) {
+            invalid |= std::abs(sums[channel]) <= 64 * std::numeric_limits<double>::epsilon() * sums[4 + channel];
+            result.fermi[channel] = origin + sums[2 + channel] / sums[channel];
+            invalid |= !std::isfinite(result.fermi[channel]);
+        }
+    }
+    double tolerance = 1e-10 * std::max(1.0, ne);
+    invalid |= std::abs(sums[6] + sums[7] - ne) > tolerance;
+    if (fixed_spin) {
+        invalid |= std::abs(sums[6] - sums[7] - ctx_.cfg().parameters().fixed_mag()) > tolerance;
+    }
+    if (invalid) {
+        RTE_THROW("singular or nonfinite chemical-potential response for the prescribed band populations");
+    }
+    if (!fixed_spin) {
+        result.fermi[1] = result.fermi[0];
+    }
+    ik = 0;
+    for (auto const& d : energy_directions__) {
+        auto const& slopes = result.slopes[ik++];
+        result.occupations.emplace_back(std::array<index_range, 2>{nb, ns});
+        auto& response = result.occupations.back();
+        for (int s = 0; s < ns; s++) {
+            for (int b = 0; b < nb; b++) {
+                response(b, s) = slopes(b, s) * (d(b, s) - result.fermi[s]);
+                invalid |= !std::isfinite(response(b, s));
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("nonfinite occupation response");
+    }
+    return result;
 }
 
 template double

@@ -330,6 +330,12 @@ class dmatrix : public matrix<T>
         return bs_col_;
     }
 
+    inline bool
+    has_blacs_grid() const
+    {
+        return blacs_grid_ != nullptr;
+    }
+
     inline auto const&
     blacs_grid() const
     {

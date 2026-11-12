@@ -654,7 +654,6 @@ Unit_cell::get_symmetry()
             /* take next id */
             atom_class_id++;
             atom_symmetry_classes_.push_back(std::make_shared<Atom_symmetry_class>(atom_class_id, atom(i).type()));
-
             /* scan all atoms */
             for (int j = 0; j < num_atoms(); j++) {
                 bool is_equal = (equivalent_atoms_.size())

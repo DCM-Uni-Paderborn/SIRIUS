@@ -15,10 +15,12 @@
 #define __POTENTIAL_HPP__
 
 #include "density/density.hpp"
+#include "function3d/lapw_xc_fields.hpp"
 #include "hubbard/hubbard.hpp"
 #include "unit_cell/basis_functions_index.hpp"
 #include "unit_cell/radial_functions_index.hpp"
 #include "xc_functional.hpp"
+#include <optional>
 #include "dftd3_correction.hpp"
 #include "dftd4_correction.hpp"
 
@@ -26,6 +28,10 @@ namespace sirius {
 
 void
 check_xc_potential(Density const& rho__);
+
+/// Smooth rho/tau components supplied to the reconstructed point-field maps.
+std::array<std::vector<Smooth_periodic_function<double>>, 2>
+external_xc_smooth_fields(Simulation_context const& ctx__, Density const& density__);
 
 double
 xc_mt(Radial_grid<double> const& rgrid__, SHT const& sht__, std::vector<XC_functional> const& xc_func__,
@@ -55,21 +61,36 @@ class Potential : public Field4D
 
     /// Derivatives conjugate to total tau and its collinear spin difference.
     std::unique_ptr<Field4D> kinetic_potential_;
+    bool external_xc_registered_{false};
+    double external_xc_energy_{0};
+    std::vector<mdarray<double, 3>> external_projector_d_mtrx_;
+    /// Ultrasoft local XC response after removing the duplicate Fourier Q contraction.
+    std::vector<mdarray<double, 3>> external_uspp_d_mtrx_;
+
+    void
+    add_external_projector_d_mtrx(int ia__, mdarray<double, 3>& result__) const;
+    std::unique_ptr<lapw_xc_field_adjoint_t> lapw_xc_derivatives_;
+    std::optional<double> lapw_xc_energy_;
+    mutable std::shared_ptr<LAPW_radial_basis> lapw_basis_;
+    friend void
+    copy(Potential const&, Potential&);
+    /// Grid XC energy using the PAW orbital density without compensation charge.
+
+    void
+    xc_external(Density const& density__);
+
+    void
+    xc_external_points(Density const& density__);
 
     void
     xc_rg_meta(Density const& density__);
 
-    bool external_xc_registered_{false};
-    double external_xc_energy_{0};
-    std::vector<mdarray<double, 3>> external_projector_d_mtrx_;
-    std::vector<mdarray<double, 3>> external_uspp_d_mtrx_;
-    void
-    add_external_projector_d_mtrx(int ia__, mdarray<double, 3>& result__) const;
+    std::vector<std::array<std::vector<double>, 2>>
+    project_core_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const;
+
     void
     generate_d_mtrx(std::vector<Periodic_function<double> const*> const& fields__,
                     std::vector<mdarray<double, 3>>& result__) const;
-    void
-    xc_external(Density const& density__);
 
     /// Local part of pseudopotential.
     std::unique_ptr<Smooth_periodic_function<double>> local_potential_;
@@ -127,6 +148,9 @@ class Potential : public Field4D
 
     /// Hartree contribution to total energy from PAW atoms.
     double paw_hartree_total_energy_{0.0};
+
+    /// Discrete AE-minus-pseudo semilocal meta-GGA energy on PAW spheres.
+    double paw_meta_energy_{0.0};
 
     /// All-electron and pseudopotential parts of PAW potential.
     std::unique_ptr<PAW_field4D<double>> paw_potential_;
@@ -198,12 +222,17 @@ class Potential : public Field4D
 
     /// Compute MT part of the potential and MT multipole moments
     mdarray<std::complex<double>, 2>
-    poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__) const;
+    poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__,
+                Spheric_function_set<double, atom_index_t>& vha_mt__, bool include_nuclei__) const;
+
+    void
+    poisson_solve(Periodic_function<double> const& rho__, Periodic_function<double>& vha__,
+                  bool include_nuclei__) const;
 
     /// Add contribution from the pseudocharge to the plane-wave expansion
     void
-    poisson_add_pseudo_pw(mdarray<std::complex<double>, 2>& qmt__, mdarray<std::complex<double>, 2>& qit__,
-                          std::complex<double>* rho_pw__);
+    poisson_add_pseudo_pw(mdarray<std::complex<double>, 2> const& qmt__, mdarray<std::complex<double>, 2> const& qit__,
+                          std::complex<double>* rho_pw__) const;
 
     /// Generate local part of pseudo potential.
     /** Total local potential is a lattice sum:
@@ -308,15 +337,17 @@ class Potential : public Field4D
     xc_rg_magnetic(Density const& density__, bool use_lapl, const bool calculate_vdw_stress__);
 
   public:
-    /// Explicit external-XC dE/dR and dE/dA at fixed smooth Fourier fields.
-    /** Includes motion of the integration points, weights and atom-block centres.
-     *  Normalization of PW orbitals and the tau metric term belong to Stress.
+    /// Explicit XC geometry response at fixed electronic coefficients and radial fields.
+    /** Includes model coordinates and host quadrature. Basis/projector, MT-boundary
+     *  and orbital-normalization responses must still be supplied by force/stress assembly.
      */
     xc_geometry_derivatives_t
     external_xc_geometry(Density const& density__) const;
 
     /// Constructor
-    Potential(Simulation_context& ctx__);
+    /// Explicit kinetic-potential storage is available for norm-conserving PW operator construction.
+    /// It does not enable a tau-dependent XC functional.
+    Potential(Simulation_context& ctx__, bool kinetic_potential__ = false);
 
     /// Recompute some variables that depend on atomic positions or the muffin-tin radius.
     void
@@ -326,7 +357,7 @@ class Potential : public Field4D
     template <bool free_atom, typename T>
     std::vector<T>
     poisson_vmt(Atom const& atom__, Spheric_function<function_domain_t::spectral, T> const& rho_mt__,
-                Spheric_function<function_domain_t::spectral, T>& vha_mt__) const
+                Spheric_function<function_domain_t::spectral, T>& vha_mt__, bool include_nuclei__ = true) const
     {
         const bool use_r_prefact{false};
 
@@ -344,12 +375,12 @@ class Potential : public Field4D
         double R = atom__.mt_radius();
         int nmtp = atom__.num_mt_points();
 
-        #pragma omp parallel
+#pragma omp parallel
         {
             std::vector<T> g1;
             std::vector<T> g2;
 
-            #pragma omp for
+#pragma omp for
             for (int lm = 0; lm < lmmax_rho; lm++) {
                 int l = l_by_lm_[lm];
 
@@ -397,7 +428,7 @@ class Potential : public Field4D
                 }
             }
         }
-        if (!free_atom) {
+        if (!free_atom && include_nuclei__) {
             /* contribution from nuclear potential -z*(1/r - 1/R) */
             for (int ir = 0; ir < nmtp; ir++) {
 #ifdef __VHA_AUX
@@ -409,7 +440,9 @@ class Potential : public Field4D
             }
         }
         /* nuclear multipole moment */
-        qmt[0] -= atom__.zn() * y00;
+        if (include_nuclei__) {
+            qmt[0] -= atom__.zn() * y00;
+        }
 
         return qmt;
     }
@@ -677,6 +710,10 @@ class Potential : public Field4D
     std::vector<std::vector<double>>
     get_spherical_potential() const;
 
+    /// Raw derivatives of spherical, spin-summed core rho/tau, averaged per atom class.
+    std::vector<std::array<std::vector<double>, 2>>
+    get_core_xc_derivatives() const;
+
     void
     generate_PAW_effective_potential(Density const& density);
 
@@ -775,12 +812,18 @@ class Potential : public Field4D
     auto&
     xc_energy_density()
     {
+        if (external_xc_registered_ || lapw_xc_derivatives_) {
+            RTE_THROW("external XC supplies a total energy, not an energy per particle");
+        }
         return *xc_energy_density_;
     }
 
     auto const&
     xc_energy_density() const
     {
+        if (external_xc_registered_ || lapw_xc_derivatives_) {
+            RTE_THROW("external XC supplies a total energy, not an energy per particle");
+        }
         return *xc_energy_density_;
     }
 
@@ -788,6 +831,41 @@ class Potential : public Field4D
     has_kinetic_potential() const
     {
         return bool(kinetic_potential_);
+    }
+
+    /// Collectively validate the discrete LAPW XC field layout without staging it.
+    void
+    validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const;
+
+    /// Stage discrete LAPW XC derivatives for a fixed-potential Hamiltonian build.
+    /** Supplying the corresponding functional energy also enables energy contractions.
+     *  This does not solve the radial core response. generate() clears this data.
+     *  Local covectors remain uncontracted until the current radial basis is known.
+     */
+    void
+    set_lapw_xc_derivatives(lapw_xc_field_adjoint_t derivatives__, std::optional<double> energy__ = std::nullopt);
+
+    /// Discrete contractions, with no extra sphere mask or radial quadrature.
+    lapw_xc_contractions_t
+    lapw_xc_contractions(Density const& density__) const;
+
+    /// Contract supplied XC covectors without changing the staged potential or energy.
+    lapw_xc_contractions_t
+    lapw_xc_contractions(Density const& density__, lapw_xc_field_adjoint_t const& derivatives__) const;
+
+    auto const*
+    lapw_xc_derivatives() const
+    {
+        return lapw_xc_derivatives_.get();
+    }
+
+    /// Operator-only staging must not silently reuse an unrelated XC energy.
+    void
+    require_xc_energy() const
+    {
+        if (lapw_xc_derivatives_ && !lapw_xc_energy_) {
+            RTE_THROW("LAPW XC derivatives were staged without their functional energy");
+        }
     }
 
     auto&
@@ -811,6 +889,10 @@ class Potential : public Field4D
     double
     energy_vtau(Density const& density__) const
     {
+        require_xc_energy();
+        if (lapw_xc_derivatives_) {
+            return lapw_xc_contractions(density__).tau;
+        }
         double result{0};
         if (kinetic_potential_) {
             for (int j = 0; j < ctx_.num_mag_dims() + 1; j++) {
@@ -832,35 +914,41 @@ class Potential : public Field4D
         return energy_vha_;
     }
 
-    /// XC contraction of the non-electronic uniform neutralizing charge.
-    /** \f$ (q/\Omega)\int V^{XC}(\mathbf r)\,d\mathbf r\f$ uses the current
-     *  real-space potential, whose Fourier buffer need not have been transformed.
-     */
+    /// Remove the neutralizing PP background from external-XC energy contractions.
     double
     external_xc_background_contraction() const
     {
-        return external_xc_registered_
-                       ? ctx_.cfg().parameters().extra_charge() * xc_potential().integrate().total / unit_cell_.omega()
-                       : 0;
+        double charge = ctx_.cfg().parameters().extra_charge();
+        if (!external_xc_registered_ || ctx_.full_potential() || charge == 0) {
+            return 0;
+        }
+        return charge * xc_potential().integrate().total / unit_cell_.omega();
     }
 
-    /// Integral of the electronic density times the XC potential.
+    /// Ultrasoft XC projector contraction not included in the smooth-field integrals.
     double
     energy_external_augmentation(Density const& density__) const
     {
         double result{0};
-        for (int ia = 0; ia < static_cast<int>(external_uspp_d_mtrx_.size()); ia++) {
-            if (external_uspp_d_mtrx_[ia].size()) {
-                auto dm = density__.density_matrix_aux(atom_index_t::global(ia));
-                result += calc_PAW_one_elec_energy(unit_cell_.atom(ia), dm, external_uspp_d_mtrx_[ia]);
+        if (external_xc_registered_ && !ctx_.full_potential()) {
+            for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+                if (!external_uspp_d_mtrx_.empty() && external_uspp_d_mtrx_[ia].size()) {
+                    auto dm = density__.density_matrix_aux(atom_index_t::global(ia));
+                    result += calc_PAW_one_elec_energy(unit_cell_.atom(ia), dm, external_uspp_d_mtrx_[ia]);
+                }
             }
         }
         return result;
     }
 
+    /// Integral of \f$ \rho({\bf r}) V^{XC}({\bf r}) \f$.
     auto
     energy_vxc(Density const& density__) const
     {
+        require_xc_energy();
+        if (lapw_xc_derivatives_) {
+            return lapw_xc_contractions(density__).rho;
+        }
         return inner(density__.rho(), xc_potential()) - external_xc_background_contraction() +
                energy_external_augmentation(density__);
     }
@@ -869,6 +957,10 @@ class Potential : public Field4D
     auto
     energy_vxc_core(Density const& density__) const
     {
+        require_xc_energy();
+        if (ctx_.full_potential()) {
+            RTE_THROW("pseudo-core XC contraction is not defined for full potential");
+        }
         return inner(density__.rho_pseudo_core(), xc_potential().rg());
     }
 
@@ -876,6 +968,10 @@ class Potential : public Field4D
     auto
     energy_exc(Density const& density__) const
     {
+        require_xc_energy();
+        if (lapw_xc_energy_) {
+            return *lapw_xc_energy_;
+        }
         if (external_xc_registered_) {
             return external_xc_energy_;
         }
@@ -986,17 +1082,23 @@ class Potential : public Field4D
     std::shared_ptr<LAPW_radial_basis>
     create_lapw_basis() const;
 
-    friend void
-    copy(Potential const&, Potential&);
+    std::shared_ptr<LAPW_radial_basis>
+    lapw_basis_sptr() const
+    {
+        return lapw_basis_ ? lapw_basis_ : create_lapw_basis();
+    }
 };
 
 inline void
 copy(Potential const& src__, Potential& dest__)
 {
-    if (src__.external_xc_registered_ != dest__.external_xc_registered_) {
-        RTE_THROW("cannot copy potentials with different external XC registration");
+    if (src__.lapw_xc_derivatives() || dest__.lapw_xc_derivatives()) {
+        RTE_THROW("copying staged LAPW XC operators is not implemented");
     }
-    dest__.external_xc_energy_ = src__.external_xc_energy_;
+    if (src__.lapw_basis_ && &src__.ctx() != &dest__.ctx()) {
+        RTE_THROW("LAPW potential copy requires the same context");
+    }
+    dest__.lapw_basis_ = src__.lapw_basis_;
     for (int j = 0; j < src__.ctx().num_mag_dims() + 1; j++) {
         copy(src__.component(j).rg(), dest__.component(j).rg());
         if (src__.ctx().full_potential()) {

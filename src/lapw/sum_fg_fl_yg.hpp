@@ -25,8 +25,8 @@ namespace sirius {
  *  \f]
  */
 inline auto
-sum_fg_fl_yg(Simulation_context const& ctx__, int lmax__, std::complex<double> const* fpw__, mdarray<double, 3>& fl__,
-             matrix<std::complex<double>>& gvec_ylm__)
+sum_fg_fl_yg(Simulation_context const& ctx__, int lmax__, std::complex<double> const* fpw__,
+             mdarray<double, 3> const& fl__, matrix<std::complex<double>> const& gvec_ylm__)
 {
     PROFILE("sirius::sum_fg_fl_yg");
 

@@ -33,9 +33,10 @@ K_point<T>::generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf
 
     auto pcs = env::print_checksum();
 
-    auto bs = ctx_.cyclic_block_size();
+    auto bs        = ctx_.cyclic_block_size();
+    int num_states = evec__.num_wf().get();
     /* store the result of Alm(G) * C_i(G) product */
-    la::dmatrix<std::complex<T>> alm_fv(uc.mt_aw_basis_size(), ctx_.num_fv_states(), blacs_grid, bs, bs);
+    la::dmatrix<std::complex<T>> alm_fv(uc.mt_aw_basis_size(), num_states, blacs_grid, bs, bs);
 
     int atom_begin{0};
     int mt_aw_offset{0};
@@ -60,7 +61,7 @@ K_point<T>::generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf
         }
 
         /* compute F(lm, i) = A(lm, G)^{T} * evec(G, i) for the block of atoms */
-        spla::pgemm_ssb(num_mt_aw, ctx_.num_fv_states(), this->gkvec().count(), SPLA_OP_CONJ_TRANSPOSE, 1.0,
+        spla::pgemm_ssb(num_mt_aw, num_states, this->gkvec().count(), SPLA_OP_CONJ_TRANSPOSE, 1.0,
                         alm.at(ctx_.processing_unit_memory_t()), alm.ld(),
                         evec__.pw_coeffs(wf::spin_index(0)).at(ctx_.processing_unit_memory_t()), evec__.ld(), 0.0,
                         alm_fv.at(memory_t::host), alm_fv.ld(), mt_aw_offset, 0, alm_fv.spla_distribution(),
@@ -75,17 +76,17 @@ K_point<T>::generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf
         num_mt_apw_coeffs[ia] = uc.atom(ia).mt_aw_basis_size();
     }
     wf::Wave_functions_mt<T> alm_fv_slab(this->comm(), num_mt_apw_coeffs, wf::num_mag_dims(0),
-                                         wf::num_bands(ctx_.num_fv_states()), memory_t::host);
+                                         wf::num_bands(num_states), memory_t::host);
 
     auto& one  = la::constant<std::complex<T>>::one();
     auto& zero = la::constant<std::complex<T>>::zero();
 
-    auto layout_in  = alm_fv.grid_layout(0, 0, uc.mt_aw_basis_size(), ctx_.num_fv_states());
-    auto layout_out = alm_fv_slab.grid_layout_mt(wf::spin_index(0), wf::band_range(0, ctx_.num_fv_states()));
+    auto layout_in  = alm_fv.grid_layout(0, 0, uc.mt_aw_basis_size(), num_states);
+    auto layout_out = alm_fv_slab.grid_layout_mt(wf::spin_index(0), wf::band_range(0, num_states));
     costa::transform(layout_in, layout_out, 'N', one, zero, this->comm().native());
 
     #pragma omp parallel for
-    for (int i = 0; i < ctx_.num_fv_states(); i++) {
+    for (int i = 0; i < num_states; i++) {
         /* G+k block */
         auto in_ptr  = &evec__.pw_coeffs(0, wf::spin_index(0), wf::band_index(i));
         auto out_ptr = &wf__.pw_coeffs(0, wf::spin_index(ispn__), wf::band_index(i));
@@ -106,8 +107,8 @@ K_point<T>::generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf
         }
     }
     if (pcs) {
-        auto z1 = wf__.checksum_pw(memory_t::host, wf::spin_index(ispn__), wf::band_range(0, ctx_.num_fv_states()));
-        auto z2 = wf__.checksum_mt(memory_t::host, wf::spin_index(ispn__), wf::band_range(0, ctx_.num_fv_states()));
+        auto z1 = wf__.checksum_pw(memory_t::host, wf::spin_index(ispn__), wf::band_range(0, num_states));
+        auto z2 = wf__.checksum_mt(memory_t::host, wf::spin_index(ispn__), wf::band_range(0, num_states));
         print_checksum("wf_pw", z1, RTE_OUT(this->out(0)));
         print_checksum("wf_mt", z2, RTE_OUT(this->out(0)));
     }

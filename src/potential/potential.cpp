@@ -22,7 +22,7 @@
 
 namespace sirius {
 
-Potential::Potential(Simulation_context& ctx__)
+Potential::Potential(Simulation_context& ctx__, bool kinetic_potential__)
     : Field4D(ctx__, lmax_t(ctx__.lmax_pot()),
               {ctx__.periodic_function_ptr("veff"), ctx__.periodic_function_ptr("bz"),
                ctx__.periodic_function_ptr("bx"), ctx__.periodic_function_ptr("by")})
@@ -94,6 +94,10 @@ Potential::Potential(Simulation_context& ctx__)
     using pf  = Periodic_function<double>;
     using spf = Smooth_periodic_function<double>;
 
+    if (ctx_.cb().external_xc_) {
+        validate_external_xc_context(ctx_);
+        external_xc_registered_ = true;
+    }
     if (ctx_.meta_gga()) {
         int invalid{0};
         std::string error;
@@ -135,11 +139,10 @@ Potential::Potential(Simulation_context& ctx__)
             RTE_THROW("invalid Libxc meta-GGA configuration on a context rank: " + error);
         }
     }
-    external_xc_registered_ = bool(ctx_.cb().external_xc_);
-    if (external_xc_registered_) {
-        validate_external_xc_context(ctx_);
+    if (kinetic_potential__ && (ctx_.full_potential() || unit_cell_.augment())) {
+        RTE_THROW("explicit kinetic-potential storage requires norm-conserving PW orbitals");
     }
-    if (ctx_.meta_gga() || external_xc_registered_) {
+    if (external_xc_registered_ || ctx_.meta_gga() || kinetic_potential__) {
         kinetic_potential_ = std::make_unique<Field4D>(ctx_, lmax_t(ctx_.lmax_pot()));
         kinetic_potential_->zero();
     }
@@ -319,7 +322,19 @@ void
 Potential::generate(Density const& density__, bool use_symmetry__, bool transform_to_rg__)
 {
     PROFILE("sirius::Potential::generate");
+    if (ctx_.full_potential()) {
+        lapw_basis_ = density__.lapw_basis_sptr();
+    }
     power::Profile p1("generate_pot");
+
+    if (bool(ctx_.cb().external_xc_) != external_xc_registered_) {
+        RTE_THROW("external XC registration cannot change after constructing the potential");
+    }
+    if (external_xc_registered_ && ctx_.cb().external_xc_points_ && use_symmetry__) {
+        RTE_THROW("external XC point quadrature requires disabled crystal symmetry");
+    }
+    lapw_xc_derivatives_.reset();
+    lapw_xc_energy_.reset();
 
     if (!ctx_.full_potential()) {
         /* save current effective potential */
@@ -490,7 +505,8 @@ Potential::get_spherical_potential() const
 }
 
 mdarray<std::complex<double>, 2>
-Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__) const
+Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__,
+                       Spheric_function_set<double, atom_index_t>& vha_mt__, bool include_nuclei__) const
 {
     PROFILE("sirius::Potential::poisson_vmt");
 
@@ -500,7 +516,7 @@ Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__
     for (auto it : unit_cell_.spl_num_atoms()) {
         auto ia = it.i;
 
-        auto qmt_re = poisson_vmt<false>(unit_cell_.atom(ia), rhomt__[ia], hartree_potential_->mt()[ia]);
+        auto qmt_re = poisson_vmt<false>(unit_cell_.atom(ia), rhomt__[ia], vha_mt__[ia], include_nuclei__);
 
         SHT::convert(ctx_.lmax_rho(), &qmt_re[0], &qmt(0, ia));
     }
@@ -516,7 +532,9 @@ Potential::create_lapw_basis() const
         return nullptr;
     }
 
-    return std::make_shared<LAPW_radial_basis>(unit_cell_, ctx_.valence_relativity(), this->get_spherical_potential());
+    lapw_basis_ = std::make_shared<LAPW_radial_basis>(unit_cell_, ctx_.valence_relativity(), get_spherical_potential(),
+                                                      get_core_xc_derivatives(), lapw_basis_.get());
+    return lapw_basis_;
 }
 
 } // namespace sirius

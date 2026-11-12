@@ -31,6 +31,13 @@ class Atom;
 class Simulation_context;
 class Potential;
 class Unit_cell;
+class K_point_set;
+struct radial_basis_response_t;
+struct lapw_xc_field_adjoint_t;
+struct xc_geometry_direction_t;
+template <typename T>
+class Periodic_function;
+
 template <typename T>
 class Local_operator;
 template <typename T>
@@ -56,10 +63,9 @@ class Gaunt_coefficients;
 /* forward declaration */
 template <typename T>
 class Hamiltonian_k;
+template <typename T>
+class Hamiltonian0;
 
-/// Represent the k-point independent part of Hamiltonian.
-/** \tparam T   Precision of the wave-functions (float or double).
- */
 template <typename T> // type is real type precision
 class Hamiltonian0
 {
@@ -89,10 +95,10 @@ class Hamiltonian0
     /** This quantities are k-point independent and can be precomputed when H0 is created. */
     std::vector<mdarray<std::complex<T>, 3>> hmt_;
 
-    /// Effective potential, weighted by the unit step-function in LAPW calculations.
+    /// Effective potential after domain restriction (no second mask on discrete XC covectors).
     mdarray<std::complex<T>, 2> veff_pw_;
 
-    /// Spin-resolved kinetic-density potential for exact PW diagonalization.
+    /// Kinetic-density potential for exact PP or LAPW diagonalization.
     mdarray<std::complex<T>, 2> vtau_pw_;
 
     /// Plane-wave coefficients of the inverse relativistic mass weighted by the unit step-function.
@@ -110,6 +116,8 @@ class Hamiltonian0
   public:
     /// Constructor.
     Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radial_basis> lapw_basis__ = nullptr);
+
+    Hamiltonian0(Potential& potential__, bool precompute_lapw__, bool update_lapw_rf__ = true);
 
     ~Hamiltonian0();
 
@@ -184,6 +192,12 @@ class Hamiltonian0
     lapw_basis() const
     {
         return *lapw_basis_;
+    }
+
+    std::shared_ptr<LAPW_radial_basis>
+    lapw_basis_sptr() const
+    {
+        return lapw_basis_;
     }
 
     /// Apply the muffin-tin part of the Hamiltonian to the apw basis functions of an atom.
@@ -489,21 +503,24 @@ class Hamiltonian_k
      *  \f]
      */
     void
-    set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+    set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+               bool physical_overlap__ = false) const;
 
     /// Add interstitial contribution to apw-apw block of Hamiltonian and overlap.
     void
-    set_fv_h_o_it(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+    set_fv_h_o_it(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                  bool physical_overlap__ = false) const;
 
     /// Setup lo-lo block of Hamiltonian and overlap matrices.
     void
-    set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
+    set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                     bool physical_overlap__ = false) const;
 
     /// Setup apw-lo and lo-apw blocks of LAPW Hamiltonian and overlap matrices.
     void
     set_fv_h_o_apw_lo(Atom const& atom, int ia, int isnp__, mdarray<std::complex<T>, 2>& alm_row,
                       mdarray<std::complex<T>, 2>& alm_col, mdarray<std::complex<T>, 2>& h,
-                      mdarray<std::complex<T>, 2>& o) const;
+                      mdarray<std::complex<T>, 2>& o, bool physical_overlap__ = false) const;
 
     /// Apply pseudopotential H and S operators to the wavefunctions.
     /** \tparam F    Type of the subspace matrix.
