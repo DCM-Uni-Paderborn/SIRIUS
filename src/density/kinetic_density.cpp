@@ -502,13 +502,20 @@ Density::generate_dirac_valence(K_point_set const& ks__, std::vector<wf::Wave_fu
         if (!nb) {
             continue;
         }
+        auto guard = psi.memory_guard(ctx_.processing_unit_memory_t(), wf::copy_to::device);
         std::array<wf::Wave_functions_fft<double>, 2> shuffled, delta;
         for (int s : {0, 1}) {
             shuffled[s] = wf::Wave_functions_fft<double>(kp->gkvec_fft_sptr(), psi, wf::spin_index(s),
                                                          wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+            if (shuffled[s].on_device()) {
+                shuffled[s].copy_to(memory_t::host);
+            }
             if (direction) {
                 delta[s] = wf::Wave_functions_fft<double>(kp->gkvec_fft_sptr(), *direction, wf::spin_index(s),
                                                           wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+                if (delta[s].on_device()) {
+                    delta[s].copy_to(memory_t::host);
+                }
             }
         }
         auto& fft      = kp->spfft_transform();
@@ -664,6 +671,9 @@ Density::generate_smooth_kinetic_density(K_point_set const& ks__) const
             psi[ispn] =
                     wf::Wave_functions_fft<T>(kp->gkvec_fft_sptr(), kp->spinor_wave_functions(), wf::spin_index(ispn),
                                               wf::band_range(0, nbnd), wf::shuffle_to::fft_layout);
+            if (psi[ispn].on_device()) {
+                psi[ispn].copy_to(memory_t::host);
+            }
             if (!spinor) {
                 for (int ib = 0; ib < psi[ispn].num_wf_local(); ib++) {
                     auto band = psi[ispn].spl_num_wf().global_index(ib);
