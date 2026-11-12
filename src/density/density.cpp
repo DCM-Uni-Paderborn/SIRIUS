@@ -1346,7 +1346,7 @@ Density::generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> la
                     }
                 }
                 std::string status = (diff > 1e-8) ? "Fail" : "OK";
-                if (ctx_.verbosity() >= 1) {
+                if (ctx_.verbosity() >= 2) {
                     RTE_OUT(ctx_.out()) << "error of density matrix symmetrization: " << diff << " " << status
                                         << std::endl;
                 }
@@ -1363,7 +1363,7 @@ Density::generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> la
                     }
                 }
                 std::string status = (diff1 > 1e-8) ? "Fail" : "OK";
-                if (ctx_.verbosity() >= 1) {
+                if (ctx_.verbosity() >= 2) {
                     RTE_OUT(ctx_.out()) << "error of LDA+U local occupation matrix symmetrization: " << diff1 << " "
                                         << status << std::endl;
                 }
@@ -1377,7 +1377,7 @@ Density::generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> la
                     }
                 }
                 status = (diff2 > 1e-8) ? "Fail" : "OK";
-                if (ctx_.verbosity() >= 1) {
+                if (ctx_.verbosity() >= 2) {
                     RTE_OUT(ctx_.out()) << "error of LDA+U nonlocal occupation matrix symmetrization: " << diff2 << " "
                                         << status << std::endl;
                 }
@@ -1390,7 +1390,7 @@ Density::generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> la
     }
 
     if (occupation_matrix_) {
-        occupation_matrix_->print_occupancies(2);
+        occupation_matrix_->print_occupancies(3);
         /* calculate the lagrange multiplier and resulting error */
         if (ctx_.hubbard_constrained_calculation()) {
             occupation_matrix_->calculate_constraints_and_error();
@@ -2553,7 +2553,7 @@ Density::generate_core_charge_density(std::vector<std::vector<double>> const& vs
     core_leakage_               = std::move(leakage);
     core_eval_sum_              = std::move(eval_sum);
     core_kinetic_density_ready_ = true;
-    RTE_OUT(ctx_.out(2)) << pout.flush(0);
+    RTE_OUT(ctx_.out(3)) << pout.flush(0);
 }
 
 void

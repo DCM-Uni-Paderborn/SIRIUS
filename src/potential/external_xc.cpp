@@ -320,18 +320,26 @@ Potential::xc_external(Density const& density__)
     vtau.zero();
     vgrad.zero();
 
+    for (int ir = 0; ir < nr; ir++) {
+        double n = (1 + add_delta_rho_xc_) *
+                   (density__.rho().rg().value(ir) - ctx_.cfg().parameters().extra_charge() / unit_cell_.omega());
+        double t = density__.kinetic_density().scalar().rg().value(ir);
+        if (ns == 1) {
+            rho(ir, 0) = n;
+            tau(ir, 0) = t;
+        } else {
+            auto mz    = (1 + add_delta_mag_xc_) * density__.mag(0).rg().value(ir);
+            auto tz    = density__.kinetic_density().vector(0).rg().value(ir);
+            rho(ir, 0) = 0.5 * (n + mz);
+            rho(ir, 1) = 0.5 * (n - mz);
+            tau(ir, 0) = 0.5 * (t + tz);
+            tau(ir, 1) = 0.5 * (t - tz);
+        }
+    }
     for (int s = 0; s < ns; s++) {
         Smooth_periodic_function<double> r(fft, ctx_.gvec_fft_sptr());
         for (int ir = 0; ir < nr; ir++) {
-            double n = (1 + add_delta_rho_xc_) *
-                       (density__.rho().rg().value(ir) - ctx_.cfg().parameters().extra_charge() / unit_cell_.omega());
-            double t = density__.kinetic_density().scalar().rg().value(ir);
-            if (ns == 2) {
-                n = 0.5 * (n + (1 - 2 * s) * (1 + add_delta_mag_xc_) * density__.mag(0).rg().value(ir));
-                t = 0.5 * (t + (1 - 2 * s) * density__.kinetic_density().vector(0).rg().value(ir));
-            }
-            rho(ir, s) = r.value(ir) = n;
-            tau(ir, s)               = t;
+            r.value(ir) = rho(ir, s);
         }
         r.fft_transform(-1);
         auto g = to_rg(gradient(r));
@@ -364,14 +372,18 @@ Potential::xc_external(Density const& density__)
         }
         auto div = to_rg(divergence(g));
         for (int ir = 0; ir < nr; ir++) {
-            double v      = vrho(ir, s) - div.value(ir);
-            double factor = ns == 1 ? 1.0 : 0.5;
-            xc_potential_->rg().value(ir) += factor * v;
-            kinetic_potential_->scalar().rg().value(ir) += factor * vtau(ir, s);
-            if (ns == 2) {
-                effective_magnetic_field(0).rg().value(ir) += (1 - 2 * s) * factor * v;
-                kinetic_potential_->vector(0).rg().value(ir) += (1 - 2 * s) * factor * vtau(ir, s);
-            }
+            vrho(ir, s) -= div.value(ir);
+        }
+    }
+    for (int ir = 0; ir < nr; ir++) {
+        if (ns == 1) {
+            xc_potential_->rg().value(ir) += vrho(ir, 0);
+            kinetic_potential_->scalar().rg().value(ir) += vtau(ir, 0);
+        } else {
+            xc_potential_->rg().value(ir) += 0.5 * (vrho(ir, 0) + vrho(ir, 1));
+            effective_magnetic_field(0).rg().value(ir) += 0.5 * (vrho(ir, 0) - vrho(ir, 1));
+            kinetic_potential_->scalar().rg().value(ir) += 0.5 * (vtau(ir, 0) + vtau(ir, 1));
+            kinetic_potential_->vector(0).rg().value(ir) += 0.5 * (vtau(ir, 0) - vtau(ir, 1));
         }
     }
     kinetic_potential_->fft_transform(-1);
@@ -436,7 +448,7 @@ check_external_xc_point_derivative(Density const& density__)
         double plus = evaluate(1 + h), minus = evaluate(1 - h);
         double finite_difference = (plus - minus) / (2 * h);
         error                    = std::abs(analytic - finite_difference) /
-                std::max({1.0, std::abs(analytic), std::abs(finite_difference)});
+                                   std::max({1.0, std::abs(analytic), std::abs(finite_difference)});
         if (ctx.comm().rank() == 0) {
             std::printf("Point XC rho/gradient/tau derivative: %.10e, FD: %.10e, h: %.3e, relative error: %.6e\n",
                         analytic, finite_difference, h, error);
@@ -495,9 +507,9 @@ Potential::xc_external_points(Density const& density__)
         return;
     }
     PAW_xc_field_map map(density__, points);
-    double energy        = evaluate(map);
-    auto adjoint         = map.adjoint(derivatives);
-    external_xc_energy_  = energy;
+    double energy              = evaluate(map);
+    auto adjoint               = map.adjoint(derivatives);
+    external_xc_energy_        = energy;
     external_projector_d_mtrx_ = std::move(adjoint.local_matrices);
     for (int s = 0; s < ns; s++) {
         for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
@@ -617,7 +629,7 @@ Potential::lapw_external_xc_response(Density const& density__, Density const& de
         fields    = quadrature.symmetry(ctx_).apply(fields);
         direction = quadrature.symmetry(ctx_).apply(direction);
     }
-    int nf                = ctx_.num_mag_dims() + 1;
+    int nf = ctx_.num_mag_dims() + 1;
     xc_point_fields_t response(points.size(), nf);
     response.rho.zero();
     response.gradient.zero();
@@ -740,7 +752,7 @@ Potential::lapw_external_xc_geometry_response(Density const& density__,
         point_directions.emplace_back(r[0], r[1], r[2]);
     }
     LAPW_xc_field_map map(density__, points);
-    auto smooth = external_xc_smooth_fields(ctx_, density__);
+    auto smooth     = external_xc_smooth_fields(ctx_, density__);
     auto raw_fields = map.sample(smooth[0], smooth[1]);
     auto fields     = ctx_.use_symmetry() ? q.symmetry(ctx_).apply(raw_fields) : std::move(raw_fields);
     auto direction =

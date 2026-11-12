@@ -145,12 +145,12 @@ external_xc_stress(Simulation_context& ctx, Density const& density, Potential& p
                                         vtau[1].value(ir) * std::real(up - down) +
                                         vtau[2].value(ir) * std::real(cross + reverse) +
                                         vtau[3].value(ir) * std::imag(cross - reverse);
+                            } else if (ctx.num_spins() == 1) {
+                                value = vtau[0].value(ir) * std::real(up);
                             } else {
-                                double v = vtau[0].value(ir);
-                                if (ctx.num_spins() == 2) {
-                                    v += (1 - 2 * s) * vtau[1].value(ir);
-                                }
-                                value = v * std::real(up);
+                                auto v = s == 0 ? vtau[0].value(ir) + vtau[1].value(ir)
+                                                : vtau[0].value(ir) - vtau[1].value(ir);
+                                value  = v * std::real(up);
                             }
                             metric(mu, nu) -= weight * value;
                         }
@@ -811,7 +811,12 @@ Stress::print_info(std::ostream& out__, int verbosity__) const
         }
     };
 
-    const double au2kbar      = 2.94210119E5;
+    const double au2kbar = 2.94210119E5;
+    if (verbosity__ == 1) {
+        print_stress("stress_total [kbar]", stress_total_ * au2kbar);
+        return;
+    }
+
     auto stress_kin           = stress_kin_ * au2kbar;
     auto stress_har           = stress_har_ * au2kbar;
     auto stress_ewald         = stress_ewald_ * au2kbar;

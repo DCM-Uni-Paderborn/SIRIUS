@@ -230,8 +230,8 @@ Force::calc_forces_total(bool add_scf_corr)
                 if (response) {
                     // Differentiate the discrete free energy, including its self-consistent core and valence fields.
                     direction.atoms[ia][x] = 1;
-                    auto radial            = response->radial_geometry_response(direction,
-                                                                                ctx_.cb().external_xc_response_tolerance_, 200);
+                    auto radial = response->radial_geometry_response(direction,
+                                                                     ctx_.cb().external_xc_response_tolerance_, 200);
                     forces_total_(x, ia)   = -response->energy_geometry_derivative(direction, radial, xc_geometry);
                     direction.atoms[ia][x] = 0;
                 } else {
@@ -531,8 +531,8 @@ Force::calc_forces_us()
                             v -= ispin == 0 ? potential_.xc_potential().rg().f_pw_local(igloc)
                                             : potential_.effective_magnetic_field(ispin - 1).rg().f_pw_local(igloc);
                         }
-                        auto z = std::complex<double>(0, -gvc[ivec]) *
-                                 ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) * v;
+                        auto z                   = std::complex<double>(0, -gvc[ivec]) *
+                                                   ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) * v;
                         v_tmp(ia, 2 * igloc)     = z.real();
                         v_tmp(ia, 2 * igloc + 1) = z.imag();
                     }
@@ -1034,7 +1034,7 @@ Force::print_info(std::ostream& out__, int verbosity__)
         print_forces("total Forces in Ha/bohr", forces_total());
     }
 
-    if (verbosity__ >= 2) {
+    if (verbosity__ >= 3) {
         if (ctx_.full_potential()) {
             if (!ctx_.cb().external_xc_) {
                 print_forces("contribution from density", forces_rho());
