@@ -248,6 +248,9 @@ Density::Density(Simulation_context& ctx__, bool kinetic_density__)
     /* core density of the pseudopotential method */
     if (!ctx_.full_potential()) {
         rho_pseudo_core_ = std::make_unique<spf>(ctx_.spfft<double>(), ctx_.gvec_fft_sptr());
+        if (ctx_.meta_gga() && !external_xc_registered_) {
+            tau_pseudo_core_ = std::make_unique<spf>(ctx_.spfft<double>(), ctx_.gvec_fft_sptr());
+        }
     } else {
         ae_core_charge_density_.resize(unit_cell_.num_atom_symmetry_classes());
         ae_core_kinetic_density_.resize(unit_cell_.num_atom_symmetry_classes());
@@ -289,6 +292,10 @@ Density::update()
     PROFILE("sirius::Density::update");
 
     if (!ctx_.full_potential()) {
+        if (tau_pseudo_core_) {
+            generate_pseudo_core_fields();
+            return;
+        }
         rho_pseudo_core_->zero();
         bool is_empty{true};
         for (int iat = 0; iat < unit_cell_.num_atom_types(); iat++) {

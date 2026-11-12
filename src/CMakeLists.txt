@@ -52,6 +52,7 @@ set(_SOURCES
   "potential/external_xc.cpp"
   "potential/meta_gga.cpp"
   "potential/lapw_xc.cpp"
+  "potential/xc_mt_meta.cpp"
   "potential/xc_mt.cpp"
   "potential/potential.cpp"
   "potential/check_xc_potential.cpp"
