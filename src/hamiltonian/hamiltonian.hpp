@@ -107,6 +107,13 @@ class Hamiltonian0
     /// Plane-wave coefficients of the squared inverse relativistic mass weighted by the unit step-function.
     mdarray<std::complex<T>, 1> rm2_inv_pw_;
 
+    /// Prepare canonical Fourier covectors and the full-j atom correction before any local k-point loop.
+    void
+    prepare_dirac_fields();
+
+    std::vector<mdarray<std::complex<T>, 3>>
+    dirac_atom_matrices(std::vector<radial_basis_response_t> const* response__ = nullptr) const;
+
     /* copy constructor is forbidden */
     Hamiltonian0(Hamiltonian0<T> const& src) = delete;
     /* copy assignment operator is forbidden */
@@ -143,6 +150,9 @@ class Hamiltonian0
     Local_operator<T>&
     local_op() const
     {
+        if (!local_op_) {
+            RTE_THROW("Dirac LAPW uses its four-component matrix operator, not the scalar local operator");
+        }
         return *local_op_;
     }
 
@@ -238,6 +248,12 @@ class Hamiltonian0
 
     void
     generate_pw_coefs(Potential const& potential__);
+
+    /// Physical Dirac H/O in two positive-energy PW blocks followed by full-j LOs.
+    /** Field gathers and atom contractions are performed once by the constructor on all context ranks.
+     *  This call is collective only on the supplied G+k communicator. It does not use scalar FV matrices. */
+    std::array<mdarray<std::complex<double>, 2>, 2>
+    dirac_matrices(fft::Gvec const& gkvec__) const;
 };
 
 template <typename T>
@@ -510,6 +526,10 @@ class Hamiltonian_k
     void
     set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
                bool physical_overlap__ = false) const;
+
+    /// Native full-j Dirac H/O, dimension 2*num_gkvec + mt_lo_basis_size, collective on the k-point.
+    void
+    set_dirac_h_o(la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const;
 
     /// Add interstitial contribution to apw-apw block of Hamiltonian and overlap.
     void

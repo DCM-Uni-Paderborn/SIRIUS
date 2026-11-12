@@ -217,13 +217,17 @@ validate_external_xc_context(Simulation_context const& ctx__)
         }
     }
     if (ctx__.full_potential()) {
-        if (spinor_min && !ctx__.cfg().control().use_second_variation()) {
+        bool dirac = ctx__.valence_relativity() == relativity_t::dirac;
+        if (dirac && (ctx__.cfg().control().use_second_variation() || ctx__.so_correction())) {
+            RTE_THROW("external Dirac LAPW XC requires full variation without a separate SOC correction");
+        }
+        if (!dirac && spinor_min && !ctx__.cfg().control().use_second_variation()) {
             RTE_THROW("external LAPW spinor XC requires second variation");
         }
         if (ctx__.cfg().parameters().precision_wf() != "fp64" ||
-            (spinor_min && ctx__.valence_relativity() != relativity_t::none &&
+            (!dirac && spinor_min && ctx__.valence_relativity() != relativity_t::none &&
              ctx__.valence_relativity() != relativity_t::zora)) {
-            RTE_THROW("external LAPW XC requires scalar/collinear, NR/ZORA spinor fp64 valence orbitals");
+            RTE_THROW("external LAPW XC requires scalar/collinear, NR/ZORA spinor or Dirac fp64 valence orbitals");
         }
         if (ctx__.unit_cell().num_core_electrons() != 0 && ctx__.core_relativity() != relativity_t::none &&
             ctx__.core_relativity() != relativity_t::zora && ctx__.core_relativity() != relativity_t::dirac) {

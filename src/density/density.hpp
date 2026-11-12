@@ -340,6 +340,12 @@ class Density : public Field4D
     void
     generate_pseudo_core_fields();
 
+    /// Build physical Dirac fields or their validated orbital/occupation response.
+    void
+    generate_dirac_valence(K_point_set const& ks__,
+                           std::vector<wf::Wave_functions<double>*> const* directions__ = nullptr,
+                           std::vector<mdarray<double, 2>> const* occupations__         = nullptr);
+
   public:
     /// External XC enables tau automatically; it can also be requested for orbital-field diagnostics.
     Density(Simulation_context& ctx__, bool kinetic_density__ = false);
