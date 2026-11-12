@@ -1078,6 +1078,89 @@ lapw_radial_basis_t::generate_radial_functions(relativity_t rel__, bool update_e
     return ierr_aw + ierr_lo;
 }
 
+radial_basis_response_t
+lapw_radial_basis_t::radial_basis_potential_response(std::vector<double> const& direction__,
+                                                     std::array<std::vector<double>, 2> const& xc_directions__,
+                                                     bool update_enu__) const
+{
+    auto rel = atom_type_.parameters().valence_relativity();
+    validate_radial_relativity(rel);
+    bool dirac = atom_type_.indexb().full_j();
+    if (direction__.size() != static_cast<size_t>(atom_type_.num_mt_points()) ||
+        spherical_potential_.size() != direction__.size() ||
+        !std::all_of(direction__.begin(), direction__.end(), [](double x) { return std::isfinite(x); })) {
+        RTE_THROW("invalid radial basis potential direction");
+    }
+    for (auto const& field : xc_directions__) {
+        if (!field.empty() && (field.size() != direction__.size() ||
+                               !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); }))) {
+            RTE_THROW("invalid radial basis XC direction");
+        }
+        if (!field.empty() && atom_type_.num_core_electrons() != 0 && spherical_xc_derivatives_[0].empty()) {
+            RTE_THROW("XC-dependent core response requires initialized core projection");
+        }
+    }
+    mdarray<double, 3> rf({atom_type_.num_mt_points(), atom_type_.mt_radial_basis_size(), dirac ? 4 : 2});
+    mdarray<double, 2> sd({dirac ? 6 : 3, atom_type_.mt_radial_basis_size() - atom_type_.num_lo_descriptors()});
+    rf.zero();
+    sd.zero();
+    radial_basis_response_t result(atom_type_);
+    core_states_t dcore;
+    auto core = generate_core_radial_states(&direction__, &dcore, xc_directions__, &result.core_fields,
+                                            &result.core_eval_sum);
+    enu_response_t denu;
+    if (update_enu__) {
+        for (auto const& entry : enu_search_) {
+            int channel = entry.first.second;
+            int kappa   = dirac ? channel : 0;
+            int l       = kappa ? (kappa < 0 ? -kappa - 1 : kappa) : channel;
+            denu[entry.first] =
+                    linearization_energy_response(atom_type_.zn(), l, atom_type_.radial_grid(), spherical_potential_,
+                                                  entry.second, direction__, rel, kappa);
+        }
+    }
+    if (generate_aw_radial_functions(rel, rf, sd, core, &direction__, &result, &dcore,
+                                     update_enu__ ? &denu : nullptr) ||
+        generate_lo_radial_functions(rel, rf, core, &direction__, &result, &dcore, update_enu__ ? &denu : nullptr)) {
+        RTE_THROW("radial basis potential response construction failed");
+    }
+    if (atom_type_.parameters().cfg().control().ortho_rf()) {
+        orthogonalize_radial_functions(rf, &result.radial_functions);
+    }
+    if (atom_type_.parameters().so_correction() && !dirac) {
+        double soc       = std::pow(2 * speed_of_light, -2);
+        auto const& grid = atom_type_.radial_grid();
+        Spline<double> potential(grid), tangent(grid), integrand(grid), nuclear(grid);
+        for (int ir = 0; ir < grid.num_points(); ir++) {
+            potential(ir) = spherical_potential_[ir] + atom_type_.zn() / grid[ir];
+            tangent(ir)   = direction__[ir];
+        }
+        potential.interpolate();
+        tangent.interpolate();
+        for (int l = 0; l <= atom_type_.indexr().lmax(); l++) {
+            for (int a = 0; a < atom_type_.indexr().max_order(l); a++) {
+                int i = atom_type_.indexr().index_of(angular_momentum(l), a);
+                for (int b = 0; b < atom_type_.indexr().max_order(l); b++) {
+                    int j = atom_type_.indexr().index_of(angular_momentum(l), b);
+                    for (int ir = 0; ir < grid.num_points(); ir++) {
+                        double product = radial_function(ir, i) * radial_function(ir, j);
+                        double dp      = result.radial_functions(ir, i, 0) * radial_function(ir, j) +
+                                         radial_function(ir, i) * result.radial_functions(ir, j, 0);
+                        double mass    = 1 - 2 * soc * spherical_potential_[ir];
+                        double factor  = soc * (dp + 4 * soc * product * direction__[ir] / mass) / (mass * mass);
+                        integrand(ir) =
+                                factor * potential.deriv(1, ir) + soc * product * tangent.deriv(1, ir) / (mass * mass);
+                        nuclear(ir) = factor * atom_type_.zn();
+                    }
+                    result.spin_orbit_integrals(l, a, b) =
+                            integrand.interpolate().integrate(1) + nuclear.interpolate().integrate(-1);
+                }
+            }
+        }
+    }
+    return result;
+}
+
 void
 lapw_radial_basis_t::sync_radial_functions(mpi::Communicator const& comm__, int const rank__)
 {

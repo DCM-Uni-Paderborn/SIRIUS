@@ -233,6 +233,17 @@ class lapw_radial_basis_t
     int
     generate_radial_functions(relativity_t rel__, bool update_enu__ = true);
 
+    /// Differentiate the AW/LO construction without changing the stored basis or energies.
+    /** Directions are changes in the spherical potential and optional raw density/tau XC covectors on the MT
+     *  grid. Empty XC directions mean zero. Core projection includes the induced core-orbital response without
+     *  adding quadrature weights to the covectors. Automatic linearisation energies follow the potential
+     *  unless update_enu__ is false. The free-atom reference remains fixed. Dirac valence functions
+     *  retain both components and require Dirac states for XC-dependent core projection. */
+    radial_basis_response_t
+    radial_basis_potential_response(std::vector<double> const& direction__,
+                                    std::array<std::vector<double>, 2> const& xc_directions__ = {},
+                                    bool update_enu__                                         = true) const;
+
     void
     sync_radial_functions(mpi::Communicator const& comm__, int const rank__);
 

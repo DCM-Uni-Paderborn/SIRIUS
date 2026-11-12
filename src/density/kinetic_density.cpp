@@ -441,6 +441,858 @@ Density::generate_paw_xc_correction(int ia__) const
     return PAW_xc_correction(unit_cell_.atom(ia__).type()).fields(density_matrix(ia__));
 }
 
+std::vector<std::array<std::vector<Flm>, 2>>
+Density::lapw_radial_fields_response(K_point_set& ks__, std::vector<radial_basis_response_t> const& response__) const
+{
+    bool spinor = ctx_.num_mag_dims() == 3;
+    int invalid = &ks__.ctx() != &ctx_ || !ctx_.full_potential() || ctx_.cfg().parameters().precision_wf() != "fp64" ||
+                  (ctx_.so_correction() && !spinor) || ctx_.valence_relativity() != relativity_t::none ||
+                  (unit_cell_.num_core_electrons() != 0 && ctx_.core_relativity() != relativity_t::none) ||
+                  response__.size() != unit_cell_.num_atom_symmetry_classes();
+    if (!invalid) {
+        for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
+            auto const& cls  = lapw_basis().radial_basis_for_class(ic);
+            auto const& type = cls.atom_type();
+            auto const& d    = response__[ic];
+            invalid |= type.num_core_electrons() != 0 && cls.spherical_xc_derivatives()[0].empty();
+            invalid |= d.radial_functions.size(0) != type.num_mt_points() ||
+                       d.radial_functions.size(1) != type.mt_radial_basis_size() || d.radial_functions.size(2) != 2 ||
+                       d.surface_derivatives.size(0) != 3 ||
+                       d.surface_derivatives.size(1) != type.mt_radial_basis_size() - type.num_lo_descriptors();
+            for (size_t i = 0; i < d.radial_functions.size(); i++) {
+                invalid |= !std::isfinite(d.radial_functions[i]);
+            }
+            for (size_t i = 0; i < d.surface_derivatives.size(); i++) {
+                invalid |= !std::isfinite(d.surface_derivatives[i]);
+            }
+            for (auto const& field : d.core_fields) {
+                invalid |= field.size() != type.num_mt_points() ||
+                           !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); });
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW radial fields response requires nonrelativistic fp64 orbitals and compatible finite "
+                  "responses");
+    }
+    int ns = spinor ? 4 : ctx_.num_spins(), blocks = spinor ? 3 : ns;
+    std::vector<mdarray<std::complex<double>, 3>> dm, ddm;
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        int n = unit_cell_.atom(ia).type().mt_basis_size();
+        dm.emplace_back(std::array<index_range, 3>{n, n, blocks});
+        ddm.emplace_back(std::array<index_range, 3>{n, n, blocks});
+        dm.back().zero();
+        ddm.back().zero();
+    }
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto& kp  = *ks__.get<double>(it.i);
+        auto& psi = kp.spinor_wave_functions();
+        if (psi.pw_coeffs(wf::spin_index(0)).on_device()) {
+            psi.copy_to(memory_t::host);
+        }
+        Matching_coefficients matching(unit_cell_, kp.gkvec());
+        std::vector<mdarray<std::complex<double>, 2>> alm, dalm;
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            auto const& atom = unit_cell_.atom(ia);
+            std::array<index_range, 2> shape{kp.gkvec().count(), atom.type().mt_aw_basis_size()};
+            alm.emplace_back(shape);
+            dalm.emplace_back(shape);
+            matching.generate<false>(atom, alm.back(), lapw_basis().radial_basis(atom_index_t::global(ia)));
+            matching.generate_potential_response<false>(atom, response__[atom.symmetry_class().id()], dalm.back(),
+                                                        lapw_basis().radial_basis(atom_index_t::global(ia)));
+        }
+        for (int s = 0; s < ctx_.num_spinors(); s++) {
+            for (int band = 0; band < ctx_.num_bands(); band++) {
+                double weight = kp.weight() * kp.band_occupancy(band, s) / kp.comm().size();
+                if (weight == 0) {
+                    continue;
+                }
+                std::array<std::vector<std::complex<double>>, 2> all;
+                for (int c = 0; c < ctx_.num_spinor_comp(); c++) {
+                    all[c] = kp.spinor_wave_functions().gather(wf::spin_index(spinor ? c : s), wf::band_index(band));
+                }
+                int offset = kp.gkvec().num_gvec();
+                for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+                    auto const& type = unit_cell_.atom(ia).type();
+                    int n = type.mt_basis_size(), naw = type.mt_aw_basis_size();
+                    std::array<std::vector<std::complex<double>>, 2> c, dc;
+                    for (int comp = 0; comp < ctx_.num_spinor_comp(); comp++) {
+                        c[comp].resize(n);
+                        dc[comp].resize(n);
+                        for (int i = 0; i < naw; i++) {
+                            for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                                c[comp][i] += alm[ia](ig, i) * all[comp][kp.gkvec().offset() + ig];
+                                dc[comp][i] += dalm[ia](ig, i) * all[comp][kp.gkvec().offset() + ig];
+                            }
+                        }
+                        kp.comm().allreduce(c[comp].data(), naw);
+                        kp.comm().allreduce(dc[comp].data(), naw);
+                        for (int i = naw; i < n; i++) {
+                            c[comp][i] = all[comp][offset + i];
+                        }
+                    }
+                    for (int block = 0; block < (spinor ? 3 : 1); block++) {
+                        int left = block == 2 ? 1 : block, right = block == 2 ? 0 : block;
+                        for (int j = 0; j < n; j++) {
+                            for (int i = 0; i < n; i++) {
+                                dm[ia](i, j, spinor ? block : s) += weight * std::conj(c[left][i]) * c[right][j];
+                                ddm[ia](i, j, spinor ? block : s) += weight * (std::conj(dc[left][i]) * c[right][j] +
+                                                                               std::conj(c[left][i]) * dc[right][j]);
+                            }
+                        }
+                    }
+                    offset += n;
+                }
+            }
+        }
+    }
+    std::vector<std::array<std::vector<Flm>, 2>> result;
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        ctx_.comm().allreduce(dm[ia].at(memory_t::host), dm[ia].size());
+        ctx_.comm().allreduce(ddm[ia].at(memory_t::host), ddm[ia].size());
+        auto const& atom = unit_cell_.atom(ia);
+        auto const& d    = response__[atom.symmetry_class().id()];
+        LAPW_xc_atom op(atom, lapw_basis().radial_basis(atom_index_t::global(ia)), ctx_.lmax_rho());
+        auto radial = op.fields(dm[ia], &d);
+        result.push_back(op.fields(ddm[ia]));
+        for (int part : {0, 1}) {
+            for (int s = 0; s < ns; s++) {
+                auto& field = result.back()[part][s];
+                for (size_t i = 0; i < field.size(); i++) {
+                    field[i] += radial[part][s][i];
+                }
+                if (!spinor || s == 0) {
+                    for (int ir = 0; ir < atom.type().num_mt_points(); ir++) {
+                        field(0, ir) += d.core_fields[part][ir] / ((spinor ? 1 : ns) * y00);
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+std::unique_ptr<Density>
+Density::lapw_orbital_fields_response(K_point_set& ks__, std::vector<wf::Wave_functions<double>*> const& directions__,
+                                      std::vector<radial_basis_response_t> const& radial__,
+                                      std::vector<mdarray<double, 2>> const& occupation_directions__) const
+{
+    int occupation_response = !occupation_directions__.empty();
+    bool spinor             = ctx_.num_mag_dims() == 3;
+    bool dirac              = ctx_.valence_relativity() == relativity_t::dirac;
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&occupation_response, 1);
+    int invalid = &ks__.ctx() != &ctx_ || !ctx_.full_potential() || !has_kinetic_density() ||
+                  ctx_.cfg().parameters().precision_wf() != "fp64" || (ctx_.so_correction() && !spinor) ||
+                  (dirac && !radial__.empty()) ||
+                  (!dirac && spinor && ctx_.valence_relativity() != relativity_t::none &&
+                   ctx_.valence_relativity() != relativity_t::zora) ||
+                  directions__.size() != ks__.spl_num_kpoints().local_size() ||
+                  (occupation_response && occupation_directions__.size() != directions__.size());
+    if (!invalid) {
+        size_t ik{0};
+        for (auto it : ks__.spl_num_kpoints()) {
+            auto& psi = ks__.get<double>(it.i)->spinor_wave_functions();
+            auto* d   = directions__[ik];
+            invalid |= spinor && ks__.get<double>(it.i)->spfft_transform().type() != SPFFT_TRANS_C2C;
+            if (occupation_response) {
+                auto const& df = occupation_directions__[ik];
+                if (df.size(0) != ctx_.num_bands() || df.size(1) != ctx_.num_spinors() || !df.on_host()) {
+                    invalid = 1;
+                } else {
+                    for (size_t i = 0; i < df.size(); i++) {
+                        invalid |= !std::isfinite(df[i]);
+                    }
+                }
+            }
+            ik++;
+            if (!d || &d->gkvec() != &psi.gkvec() || d->num_sc() != psi.num_sc() ||
+                d->num_wf().get() < ctx_.num_bands() || d->num_mt_coeffs() != psi.num_mt_coeffs()) {
+                invalid = 1;
+                continue;
+            }
+            if (psi.ld() == 0) {
+                continue;
+            }
+            if (psi.pw_coeffs(wf::spin_index(0)).on_device()) {
+                psi.copy_to(memory_t::host);
+            }
+            if (d->pw_coeffs(wf::spin_index(0)).on_device()) {
+                d->copy_to(memory_t::host);
+            }
+            for (int s = 0; s < (dirac ? 2 : ctx_.num_spins()); s++) {
+                if (!psi.pw_coeffs(wf::spin_index(s)).on_host() || !d->pw_coeffs(wf::spin_index(s)).on_host()) {
+                    invalid = 1;
+                    continue;
+                }
+                for (int b = 0; b < ctx_.num_bands(); b++) {
+                    auto p = psi.at(memory_t::host, 0, wf::spin_index(s), wf::band_index(b));
+                    auto q = d->at(memory_t::host, 0, wf::spin_index(s), wf::band_index(b));
+                    for (int i = 0; i < psi.ld(); i++) {
+                        invalid |= !std::isfinite(p[i].real()) || !std::isfinite(p[i].imag()) ||
+                                   !std::isfinite(q[i].real()) || !std::isfinite(q[i].imag());
+                    }
+                }
+            }
+        }
+    }
+    int radial_min = !radial__.empty(), radial_max = radial_min;
+    ctx_.comm().allreduce<int, mpi::op_t::min>(&radial_min, 1);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&radial_max, 1);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid || radial_min != radial_max) {
+        RTE_THROW("LAPW orbital fields response requires matching finite fp64 orbitals and valid directions");
+    }
+    auto result = std::make_unique<Density>(ctx_);
+    result->set_lapw_basis(lapw_basis_sptr());
+    result->zero();
+    result->kinetic_density().zero();
+    if (dirac) {
+        result->generate_dirac_valence(ks__, &directions__, occupation_response ? &occupation_directions__ : nullptr);
+        result->generate_mt_kinetic_density(false);
+        result->fft_transform(1);
+        result->kinetic_density().fft_transform(1);
+        for (int s = 0; s <= ctx_.num_mag_dims(); s++) {
+            result->component(s).mt().sync(unit_cell_.spl_num_atoms());
+        }
+        return result;
+    }
+    int ns = spinor ? 4 : ctx_.num_spins(), nr = ctx_.spfft_coarse<double>().local_slice_size();
+    std::array<std::vector<Smooth_periodic_function<double>>, 2> coarse;
+    for (int part : {0, 1}) {
+        for (int s = 0; s < ns; s++) {
+            coarse[part].emplace_back(ctx_.spfft_coarse<double>(), ctx_.gvec_coarse_fft_sptr());
+        }
+    }
+    std::vector<mdarray<std::complex<double>, 3>> dm;
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        int n = unit_cell_.atom(ia).type().mt_basis_size();
+        dm.emplace_back(std::array<index_range, 3>{n, n, spinor ? 3 : ns});
+        dm.back().zero();
+    }
+    size_t ik{0};
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto& kp       = *ks__.get<double>(it.i);
+        auto& d        = *directions__[ik];
+        auto const* df = occupation_response ? &occupation_directions__[ik] : nullptr;
+        ik++;
+        auto& fft     = kp.spfft_transform();
+        bool real_fft = fft.type() == SPFFT_TRANS_R2C;
+        wf::Kinetic_density_operator<double> kinetic(fft, *kp.gkvec_fft_sptr());
+        if (spinor) {
+            int nb = kp.num_occupied_bands();
+            if (df) {
+                for (int b = nb; b < ctx_.num_bands(); b++) {
+                    if ((*df)(b, 0) != 0) {
+                        nb = b + 1;
+                    }
+                }
+            }
+            if (!nb) {
+                continue;
+            }
+            std::array<wf::Wave_functions_fft<double>, 2> psi, delta;
+            std::array<std::vector<std::complex<double>>, 2> base, direction;
+            for (int s = 0; s < 2; s++) {
+                psi[s]   = wf::Wave_functions_fft<double>(kp.gkvec_fft_sptr(), kp.spinor_wave_functions(),
+                                                          wf::spin_index(s), wf::band_range(0, nb),
+                                                          wf::shuffle_to::fft_layout);
+                delta[s] = wf::Wave_functions_fft<double>(kp.gkvec_fft_sptr(), d, wf::spin_index(s),
+                                                          wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+                if (psi[s].on_device()) {
+                    psi[s].copy_to(memory_t::host);
+                }
+                if (delta[s].on_device()) {
+                    delta[s].copy_to(memory_t::host);
+                }
+                base[s].resize(nr);
+                direction[s].resize(nr);
+            }
+            for (int b = 0; b < psi[0].num_wf_local(); b++) {
+                int band  = psi[0].spl_num_wf().global_index(b);
+                double w  = kp.weight() * kp.band_occupancy(band, 0) / unit_cell_.omega();
+                double dw = df ? kp.weight() * (*df)(band, 0) / unit_cell_.omega() : 0;
+                std::array<std::complex<double> const*, 2> p, q;
+                for (int s = 0; s < 2; s++) {
+                    p[s] = psi[s].at(memory_t::host, 0, wf::band_index(b));
+                    q[s] = delta[s].at(memory_t::host, 0, wf::band_index(b));
+                    for (auto pair : {std::make_pair(p[s], &base[s]), std::make_pair(q[s], &direction[s])}) {
+                        fft.backward(reinterpret_cast<double const*>(pair.first), SPFFT_PU_HOST);
+                        auto ptr = reinterpret_cast<std::complex<double> const*>(fft.space_domain_data(SPFFT_PU_HOST));
+                        if (nr) {
+                            std::copy(ptr, ptr + nr, pair.second->begin());
+                        }
+                    }
+                }
+                for (int ir = 0; ir < nr; ir++) {
+                    double uu =
+                            2 * w * std::real(std::conj(base[0][ir]) * direction[0][ir]) + dw * std::norm(base[0][ir]);
+                    double dd =
+                            2 * w * std::real(std::conj(base[1][ir]) * direction[1][ir]) + dw * std::norm(base[1][ir]);
+                    auto cross = 2 * w *
+                                         (std::conj(direction[0][ir]) * base[1][ir] +
+                                          std::conj(base[0][ir]) * direction[1][ir]) +
+                                 2 * dw * std::conj(base[0][ir]) * base[1][ir];
+                    coarse[0][0].value(ir) += uu + dd;
+                    coarse[0][1].value(ir) += uu - dd;
+                    coarse[0][2].value(ir) += cross.real();
+                    coarse[0][3].value(ir) += cross.imag();
+                }
+                std::array<double*, 4> t;
+                for (int j = 0; j < 4; j++) {
+                    t[j] = nr ? &coarse[1][j].value(0) : nullptr;
+                }
+                kinetic.add_spinor_density_response(w, p, q, t);
+                if (dw) {
+                    kinetic.add_spinor_density(dw, p, t);
+                }
+            }
+            for (int b = 0; b < nb; b++) {
+                double w  = kp.weight() * kp.band_occupancy(b, 0) / kp.comm().size();
+                double dw = df ? kp.weight() * (*df)(b, 0) / kp.comm().size() : 0;
+                std::array<std::vector<std::complex<double>>, 2> p, q;
+                for (int s = 0; s < 2; s++) {
+                    p[s] = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(b));
+                    q[s] = d.gather(wf::spin_index(s), wf::band_index(b));
+                }
+                int offset = kp.gkvec().num_gvec();
+                for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+                    int n = unit_cell_.atom(ia).type().mt_basis_size();
+                    for (int block = 0; block < 3; block++) {
+                        int a = block == 2 ? 1 : block, c = block == 2 ? 0 : block;
+                        for (int j = 0; j < n; j++) {
+                            for (int i = 0; i < n; i++) {
+                                dm[ia](i, j, block) += w * (std::conj(q[a][offset + i]) * p[c][offset + j] +
+                                                            std::conj(p[a][offset + i]) * q[c][offset + j]) +
+                                                       dw * std::conj(p[a][offset + i]) * p[c][offset + j];
+                            }
+                        }
+                    }
+                    offset += n;
+                }
+            }
+            continue;
+        }
+        std::vector<std::complex<double>> base(nr);
+        std::vector<double> tau(nr);
+        for (int s = 0; s < ns; s++) {
+            int nb = kp.num_occupied_bands(s);
+            if (df) {
+                for (int b = nb; b < ctx_.num_bands(); b++) {
+                    if ((*df)(b, s) != 0) {
+                        nb = b + 1;
+                    }
+                }
+            }
+            if (nb == 0) {
+                continue;
+            }
+            wf::Wave_functions_fft<double> psi(kp.gkvec_fft_sptr(), kp.spinor_wave_functions(), wf::spin_index(s),
+                                               wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+            wf::Wave_functions_fft<double> delta(kp.gkvec_fft_sptr(), d, wf::spin_index(s), wf::band_range(0, nb),
+                                                 wf::shuffle_to::fft_layout);
+            if (psi.on_device()) {
+                psi.copy_to(memory_t::host);
+            }
+            if (delta.on_device()) {
+                delta.copy_to(memory_t::host);
+            }
+            std::fill(tau.begin(), tau.end(), 0);
+            for (int b = 0; b < psi.num_wf_local(); b++) {
+                auto band     = psi.spl_num_wf().global_index(b);
+                double weight = kp.weight() * kp.band_occupancy(band, s) / unit_cell_.omega();
+                double dw     = df ? kp.weight() * (*df)(band, s) / unit_cell_.omega() : 0;
+                auto p        = psi.at(memory_t::host, 0, wf::band_index(b));
+                auto q        = delta.at(memory_t::host, 0, wf::band_index(b));
+                fft.backward(reinterpret_cast<double const*>(p), SPFFT_PU_HOST);
+                auto values = fft.space_domain_data(SPFFT_PU_HOST);
+                for (int ir = 0; ir < nr; ir++) {
+                    base[ir] = real_fft ? std::complex<double>(values[ir], 0)
+                                        : reinterpret_cast<std::complex<double> const*>(values)[ir];
+                }
+                fft.backward(reinterpret_cast<double const*>(q), SPFFT_PU_HOST);
+                values = fft.space_domain_data(SPFFT_PU_HOST);
+                for (int ir = 0; ir < nr; ir++) {
+                    auto value = real_fft ? std::complex<double>(values[ir], 0)
+                                          : reinterpret_cast<std::complex<double> const*>(values)[ir];
+                    coarse[0][s].value(ir) +=
+                            2 * weight * std::real(std::conj(base[ir]) * value) + dw * std::norm(base[ir]);
+                }
+                kinetic.add_density_response(weight, p, q, tau.data());
+                if (dw != 0) {
+                    kinetic.add_density(dw, p, tau.data());
+                }
+            }
+            for (int ir = 0; ir < nr; ir++) {
+                coarse[1][s].value(ir) += tau[ir];
+            }
+            for (int b = 0; b < nb; b++) {
+                double weight = kp.weight() * kp.band_occupancy(b, s) / kp.comm().size();
+                double dw     = df ? kp.weight() * (*df)(b, s) / kp.comm().size() : 0;
+                auto p        = kp.spinor_wave_functions().gather(wf::spin_index(s), wf::band_index(b));
+                auto q        = d.gather(wf::spin_index(s), wf::band_index(b));
+                int offset    = kp.gkvec().num_gvec();
+                for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+                    int n = unit_cell_.atom(ia).type().mt_basis_size();
+                    for (int j = 0; j < n; j++) {
+                        for (int i = 0; i < n; i++) {
+                            dm[ia](i, j, s) += weight * (std::conj(q[offset + i]) * p[offset + j] +
+                                                         std::conj(p[offset + i]) * q[offset + j]) +
+                                               dw * std::conj(p[offset + i]) * p[offset + j];
+                        }
+                    }
+                    offset += n;
+                }
+            }
+        }
+    }
+    for (int part : {0, 1}) {
+        auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+        for (int s = 0; s < ns; s++) {
+            auto ptr = nr ? &coarse[part][s].value(0) : nullptr;
+            ctx_.gvec_coarse_fft_sptr()->comm_ortho_fft().allreduce(ptr, nr);
+            coarse[part][s].fft_transform(-1);
+            for (int ig = 0; ig < ctx_.gvec_coarse().count(); ig++) {
+                int fine   = ctx_.gvec().gvec_base_mapping(ig);
+                auto value = coarse[part][s].f_pw_local(ig);
+                target.component(spinor ? s : 0).rg().f_pw_local(fine) += value;
+                if (!spinor && ns == 2) {
+                    target.vector(0).rg().f_pw_local(fine) += double(1 - 2 * s) * value;
+                }
+            }
+        }
+        target.fft_transform(1);
+    }
+    auto radial = radial__.empty() ? std::vector<std::array<std::vector<Flm>, 2>>{}
+                                   : lapw_radial_fields_response(ks__, radial__);
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        ctx_.comm().allreduce(dm[ia].at(memory_t::host), dm[ia].size());
+        auto fields =
+                LAPW_xc_atom(unit_cell_.atom(ia), lapw_basis().radial_basis(atom_index_t::global(ia)), ctx_.lmax_rho())
+                        .fields(dm[ia]);
+        for (int part : {0, 1}) {
+            auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+            for (int s = 0; s < ns; s++) {
+                if (!radial.empty()) {
+                    fields[part][s] += radial[ia][part][s];
+                }
+                target.component(spinor ? s : 0).mt()[ia] += fields[part][s];
+                if (!spinor && ns == 2) {
+                    for (size_t i = 0; i < fields[part][s].size(); i++) {
+                        target.vector(0).mt()[ia][i] += (1 - 2 * s) * fields[part][s][i];
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+std::unique_ptr<Density>
+Density::lapw_density_matrix_fields(K_point_set& ks__,
+                                    std::vector<mdarray<std::complex<double>, 3>> const& matrices__) const
+{
+    return lapw_density_matrix_fields_impl(ks__, matrices__, nullptr, nullptr);
+}
+
+std::unique_ptr<Density>
+Density::lapw_density_matrix_radial_response(K_point_set& ks__,
+                                             std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                             std::vector<radial_basis_response_t> const& radial__) const
+{
+    return lapw_density_matrix_fields_impl(ks__, matrices__, &radial__, nullptr);
+}
+
+std::unique_ptr<Density>
+Density::lapw_density_matrix_geometry_response(K_point_set& ks__,
+                                               std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                               xc_geometry_direction_t const& direction__) const
+{
+    return lapw_density_matrix_fields_impl(ks__, matrices__, nullptr, &direction__);
+}
+
+std::unique_ptr<Density>
+Density::lapw_density_matrix_fields_impl(K_point_set& ks__,
+                                         std::vector<mdarray<std::complex<double>, 3>> const& matrices__,
+                                         std::vector<radial_basis_response_t> const* radial__,
+                                         xc_geometry_direction_t const* geometry__) const
+{
+    bool spinor = ctx_.num_mag_dims() == 3;
+    bool dirac  = ctx_.valence_relativity() == relativity_t::dirac;
+    int ns      = dirac ? ctx_.num_mag_dims() + 1 : (spinor ? 4 : ctx_.num_spins());
+    int blocks  = dirac ? 1 : ns;
+    int invalid = &ks__.ctx() != &ctx_ || !ctx_.full_potential() || !has_kinetic_density() ||
+                  ctx_.cfg().parameters().precision_wf() != "fp64" || (ctx_.so_correction() && !spinor) ||
+                  (radial__ && geometry__) ||
+                  (spinor && !dirac && ctx_.valence_relativity() != relativity_t::none &&
+                   ctx_.valence_relativity() != relativity_t::zora) ||
+                  ctx_.gvec_coarse().reduced() || matrices__.size() != ks__.spl_num_kpoints().local_size();
+    std::vector<double> geometry_values;
+    if (geometry__) {
+        invalid |= geometry__->atoms.size() != unit_cell_.num_atoms();
+        geometry_values.assign(geometry__->lattice.begin(), geometry__->lattice.end());
+        for (auto const& atom : geometry__->atoms) {
+            geometry_values.insert(geometry_values.end(), atom.begin(), atom.end());
+        }
+        for (auto x : geometry_values) {
+            invalid |= !std::isfinite(x);
+        }
+    }
+    if (radial__) {
+        invalid |= (unit_cell_.num_core_electrons() != 0 && ctx_.core_relativity() != relativity_t::none &&
+                    ctx_.core_relativity() != relativity_t::zora && ctx_.core_relativity() != relativity_t::dirac) ||
+                   radial__->size() != unit_cell_.num_atom_symmetry_classes();
+        if (!invalid) {
+            for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
+                auto const& type = unit_cell_.atom_symmetry_class(ic).atom_type();
+                auto const& d    = (*radial__)[ic];
+                if (!d.radial_functions.on_host() || !d.surface_derivatives.on_host()) {
+                    invalid = 1;
+                    continue;
+                }
+                invalid |= d.radial_functions.size(0) != type.num_mt_points() ||
+                           d.radial_functions.size(1) != type.mt_radial_basis_size() ||
+                           d.radial_functions.size(2) != (dirac ? 4 : 2) ||
+                           d.surface_derivatives.size(0) != (dirac ? 6 : 3) ||
+                           d.surface_derivatives.size(1) != type.mt_radial_basis_size() - type.num_lo_descriptors();
+                for (size_t i = 0; i < d.radial_functions.size(); i++) {
+                    invalid |= !std::isfinite(d.radial_functions[i]);
+                }
+                for (size_t i = 0; i < d.surface_derivatives.size(); i++) {
+                    invalid |= !std::isfinite(d.surface_derivatives[i]);
+                }
+                for (auto const& field : d.core_fields) {
+                    invalid |= field.size() != type.num_mt_points() ||
+                               !std::all_of(field.begin(), field.end(), [](double x) { return std::isfinite(x); });
+                }
+            }
+        }
+    }
+    if (!invalid) {
+        size_t ik{0};
+        for (auto it : ks__.spl_num_kpoints()) {
+            auto const& p  = matrices__[ik++];
+            auto const& kp = *ks__.get<double>(it.i);
+            int n          = dirac ? 2 * kp.num_gkvec() + unit_cell_.mt_lo_basis_size() : kp.gklo_basis_size();
+            if (p.size(0) != n || p.size(1) != n || p.size(2) != blocks || !p.on_host()) {
+                invalid = 1;
+                continue;
+            }
+            double peak{0}, error{0};
+            for (int s = 0; s < blocks; s++) {
+                for (int j = 0; j < n; j++) {
+                    for (int i = 0; i < n; i++) {
+                        auto value = p(i, j, s);
+                        invalid |= !std::isfinite(value.real()) || !std::isfinite(value.imag());
+                        peak  = std::max(peak, std::abs(value));
+                        error = std::max(error, std::abs(value - std::conj(p(j, i, s))));
+                    }
+                }
+            }
+            invalid |= error > 1e-11 * std::max(1.0, peak);
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW coefficient fields require finite Hermitian host fp64 PW/LO matrices "
+                  "and matching finite radial/geometry directions");
+    }
+    r3::matrix<double> strain;
+    mdarray<double, 2> atom_directions;
+    if (geometry__) {
+        auto root = geometry_values;
+        ctx_.comm().bcast(root.data(), root.size(), 0);
+        invalid = root != geometry_values;
+        ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+        if (invalid) {
+            RTE_THROW("LAPW field geometry directions must agree across the context communicator");
+        }
+        r3::matrix<double> lattice;
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                lattice(x, y) = geometry__->lattice[x + 3 * y];
+            }
+        }
+        strain          = dot(lattice, unit_cell_.inverse_lattice_vectors());
+        atom_directions = mdarray<double, 2>({3, unit_cell_.num_atoms()});
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            for (int x = 0; x < 3; x++) {
+                atom_directions(x, ia) = geometry__->atoms[ia][x];
+            }
+        }
+    }
+    double volume_response = strain(0, 0) + strain(1, 1) + strain(2, 2);
+    size_t matrix_k{0};
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto const& kp = *ks__.get<double>(it.i);
+        auto const& p  = matrices__[matrix_k++];
+        if (kp.comm().size() > 1) {
+            std::vector<std::complex<double>> reference(p.at(memory_t::host), p.at(memory_t::host) + p.size());
+            kp.comm().bcast(reference.data(), reference.size(), 0);
+            for (size_t i = 0; i < p.size(); i++) {
+                invalid |= std::abs(p[i] - reference[i]) > 1e-12 * std::max(1.0, std::abs(reference[i]));
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW coefficient density matrices must agree across each k-point communicator");
+    }
+    int ng = ctx_.gvec_coarse().num_gvec();
+    std::array<mdarray<std::complex<double>, 2>, 2> fourier{mdarray<std::complex<double>, 2>({ng, ns}),
+                                                            mdarray<std::complex<double>, 2>({ng, ns})};
+    for (auto& field : fourier) {
+        field.zero();
+    }
+    std::vector<mdarray<std::complex<double>, 3>> dm, ddm;
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        int n = unit_cell_.atom(ia).type().mt_basis_size();
+        dm.emplace_back(std::array<index_range, 3>{n, n, blocks});
+        dm.back().zero();
+        if (radial__ || geometry__) {
+            ddm.emplace_back(std::array<index_range, 3>{n, n, blocks});
+            ddm.back().zero();
+        }
+    }
+    auto const one = la::constant<std::complex<double>>::one(), zero = la::constant<std::complex<double>>::zero();
+    size_t ik{0};
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto const& kp = *ks__.get<double>(it.i);
+        auto const& p  = matrices__[ik++];
+        int npw        = kp.gkvec().num_gvec();
+        int n          = dirac ? 2 * npw + unit_cell_.mt_lo_basis_size() : kp.gklo_basis_size();
+        std::unique_ptr<Dirac_lapw_basis> dirac_basis;
+        if (dirac) {
+            dirac_basis = std::make_unique<Dirac_lapw_basis>(unit_cell_, kp.gkvec(), lapw_basis());
+        }
+        if (dirac && !radial__) {
+            std::vector<std::array<std::complex<double>, 4>> spinors(2 * npw), tangent(2 * npw);
+            for (int s : {0, 1}) {
+                for (int ig = 0; ig < npw; ig++) {
+                    auto q = kp.gkvec().gkvec_cart(gvec_index_t::global(ig));
+                    Dirac_plane_wave pw(q);
+                    spinors[s * npw + ig] = pw.spinors()[s];
+                    if (geometry__) {
+                        tangent[s * npw + ig] = pw.response(dot(transpose(strain), q) * -1.0)[s];
+                    }
+                }
+            }
+            for (int i = 0; i < kp.gkvec().count(); i++) {
+                int row  = kp.gkvec().offset() + i;
+                auto gi  = kp.gkvec().gvec(gvec_index_t::local(i));
+                auto qi  = kp.gkvec().gkvec_cart(gvec_index_t::local(i));
+                auto dqi = geometry__ ? dot(transpose(strain), qi) * -1.0 : r3::vector<double>{0, 0, 0};
+                for (int j = 0; j < npw; j++) {
+                    int ig = ctx_.gvec_coarse().index_by_gvec(gi - kp.gkvec().gvec(gvec_index_t::global(j)));
+                    if (ig < 0) {
+                        invalid = 1;
+                        continue;
+                    }
+                    auto qj        = kp.gkvec().gkvec_cart(gvec_index_t::global(j));
+                    auto dqj       = geometry__ ? dot(transpose(strain), qj) * -1.0 : r3::vector<double>{0, 0, 0};
+                    double kinetic = 0.5 * dot(qi, qj), dkinetic = 0.5 * (dot(dqi, qj) + dot(qi, dqj));
+                    for (int a : {0, 1}) {
+                        for (int b : {0, 1}) {
+                            auto const& u   = spinors[a * npw + row];
+                            auto const& v   = spinors[b * npw + j];
+                            auto weight     = kp.weight() * p(a * npw + row, b * npw + j, 0) / unit_cell_.omega();
+                            auto accumulate = [&](auto const& left, auto const& right, double rho, double tau) {
+                                for (int lower : {0, 1}) {
+                                    int up = 2 * lower, down = up + 1;
+                                    double sign = lower ? -1 : 1;
+                                    auto uu = left[up] * std::conj(right[up]), dd = left[down] * std::conj(right[down]);
+                                    auto ud = left[up] * std::conj(right[down]), du = left[down] * std::conj(right[up]);
+                                    std::array<std::complex<double>, 4> fields{
+                                            uu + dd, sign * (uu - dd), sign * (ud + du),
+                                            sign * std::complex<double>(0, 1) * (ud - du)};
+                                    for (int s = 0; s < ns; s++) {
+                                        fourier[0](ig, s) += rho * weight * fields[s];
+                                        fourier[1](ig, s) += tau * weight * fields[s];
+                                    }
+                                }
+                            };
+                            if (geometry__) {
+                                accumulate(u, v, -volume_response, dkinetic - volume_response * kinetic);
+                                accumulate(tangent[a * npw + row], v, 1.0, kinetic);
+                                accumulate(u, tangent[b * npw + j], 1.0, kinetic);
+                            } else {
+                                accumulate(u, v, 1.0, kinetic);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (int i = 0; !dirac && !radial__ && i < kp.gkvec().count(); i++) {
+            int row  = kp.gkvec().offset() + i;
+            auto gi  = kp.gkvec().gvec(gvec_index_t::local(i));
+            auto qi  = kp.gkvec().gkvec_cart(gvec_index_t::local(i));
+            auto dqi = geometry__ ? dot(transpose(strain), qi) * -1.0 : r3::vector<double>{0, 0, 0};
+            for (int j = 0; j < npw; j++) {
+                int ig = ctx_.gvec_coarse().index_by_gvec(gi - kp.gkvec().gvec(gvec_index_t::global(j)));
+                if (ig < 0) {
+                    invalid = 1;
+                    continue;
+                }
+                auto qj         = kp.gkvec().gkvec_cart(gvec_index_t::global(j));
+                double kinetic  = 0.5 * dot(qi, qj);
+                double dkinetic = geometry__ ? 0.5 * (dot(dqi, qj) - dot(qi, dot(transpose(strain), qj))) : 0;
+                for (int s = 0; s < ns; s++) {
+                    auto value = kp.weight() * p(row, j, s) / unit_cell_.omega();
+                    fourier[0](ig, s) += (geometry__ ? -volume_response : 1.0) * value;
+                    fourier[1](ig, s) += (geometry__ ? dkinetic - volume_response * kinetic : kinetic) * value;
+                }
+            }
+        }
+        Matching_coefficients matching(unit_cell_, kp.gkvec());
+        int lo_offset = npw;
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            auto const& atom = unit_cell_.atom(ia);
+            int mt = atom.type().mt_basis_size(), naw = atom.type().mt_aw_basis_size();
+            mdarray<std::complex<double>, 2> alm({kp.gkvec().count(), naw}), map({mt, n});
+            if (!dirac) {
+                matching.generate<false>(atom, alm, lapw_basis().radial_basis(atom_index_t::global(ia)));
+            }
+            mdarray<std::complex<double>, 2> delta_map;
+            if (radial__ || geometry__) {
+                if (dirac) {
+                    delta_map = geometry__
+                                        ? dirac_basis->atom_coefficients_geometry_response(ia, atom_directions, strain)
+                                        : dirac_basis->atom_coefficients_response(ia, *radial__);
+                } else {
+                    mdarray<std::complex<double>, 2> dalm({kp.gkvec().count(), naw});
+                    if (radial__) {
+                        matching.generate_potential_response<false>(
+                                atom, (*radial__)[atom.symmetry_class().id()], dalm,
+                                lapw_basis().radial_basis(atom_index_t::global(ia)));
+                    } else {
+                        auto const& d = geometry__->atoms[ia];
+                        matching.generate_geometry_response<false>(atom, {d[0], d[1], d[2]}, strain, dalm,
+                                                                   lapw_basis().radial_basis(atom_index_t::global(ia)));
+                    }
+                    delta_map = mdarray<std::complex<double>, 2>({mt, n});
+                    delta_map.zero();
+                    for (int i = 0; i < naw; i++) {
+                        for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                            delta_map(i, kp.gkvec().offset() + ig) = dalm(ig, i);
+                        }
+                    }
+                    kp.comm().allreduce(delta_map.at(memory_t::host), delta_map.size());
+                }
+            }
+            map.zero();
+            if (dirac) {
+                auto const& full = dirac_basis->atom_coefficients(ia);
+                std::copy_n(full.at(memory_t::host), full.size(), map.at(memory_t::host));
+            } else {
+                for (int i = 0; i < naw; i++) {
+                    for (int ig = 0; ig < kp.gkvec().count(); ig++) {
+                        map(i, kp.gkvec().offset() + ig) = alm(ig, i);
+                    }
+                }
+                kp.comm().allreduce(map.at(memory_t::host), map.size());
+                for (int i = naw; i < mt; i++) {
+                    map(i, lo_offset++) = 1;
+                }
+            }
+            if (ia % kp.comm().size() != kp.comm().rank()) {
+                continue;
+            }
+            mdarray<std::complex<double>, 2> work({mt, n}), local({mt, mt});
+            for (int s = 0; s < blocks; s++) {
+                la::wrap(la::lib_t::blas)
+                        .gemm('N', 'N', mt, n, n, &one, map.at(memory_t::host), map.ld(), p.at(memory_t::host, 0, 0, s),
+                              p.ld(), &zero, work.at(memory_t::host), work.ld());
+                if (!geometry__) {
+                    la::wrap(la::lib_t::blas)
+                            .gemm('N', 'C', mt, mt, n, &one, work.at(memory_t::host), work.ld(), map.at(memory_t::host),
+                                  map.ld(), &zero, local.at(memory_t::host), local.ld());
+                    for (int j = 0; j < mt; j++) {
+                        for (int i = 0; i < mt; i++) {
+                            // The atom operator stores conj(c_i) c_j, the transpose of ket/bra P.
+                            dm[ia](i, j, s) += kp.weight() * local(j, i);
+                        }
+                    }
+                }
+                if (radial__ || geometry__) {
+                    la::wrap(la::lib_t::blas)
+                            .gemm('N', 'C', mt, mt, n, &one, work.at(memory_t::host), work.ld(),
+                                  delta_map.at(memory_t::host), delta_map.ld(), &zero, local.at(memory_t::host),
+                                  local.ld());
+                    for (int j = 0; j < mt; j++) {
+                        for (int i = 0; i < mt; i++) {
+                            ddm[ia](i, j, s) += kp.weight() * (local(j, i) + std::conj(local(i, j)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("LAPW PW products lie outside the density reciprocal grid");
+    }
+    auto result = std::make_unique<Density>(ctx_);
+    result->set_lapw_basis(lapw_basis_sptr());
+    result->zero();
+    result->kinetic_density().zero();
+    for (int part : {0, 1}) {
+        ctx_.comm().allreduce(fourier[part].at(memory_t::host), fourier[part].size());
+        for (size_t i = 0; i < fourier[part].size(); i++) {
+            invalid |= !std::isfinite(fourier[part][i].real()) || !std::isfinite(fourier[part][i].imag());
+        }
+        if (invalid) {
+            RTE_THROW("nonfinite LAPW coefficient Fourier fields");
+        }
+        auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+        for (int s = 0; s < ns; s++) {
+            for (int ig = 0; ig < ctx_.gvec_coarse().count(); ig++) {
+                int fine   = ctx_.gvec().gvec_base_mapping(ig);
+                auto value = fourier[part](ctx_.gvec_coarse().offset() + ig, s);
+                target.component(spinor || dirac ? s : 0).rg().f_pw_local(fine) += value;
+                if (!spinor && !dirac && ns == 2) {
+                    target.vector(0).rg().f_pw_local(fine) += double(1 - 2 * s) * value;
+                }
+            }
+        }
+        target.fft_transform(1);
+    }
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        auto& matrix = geometry__ ? ddm[ia] : dm[ia];
+        ctx_.comm().allreduce(matrix.at(memory_t::host), matrix.size());
+        auto const& atom = unit_cell_.atom(ia);
+        LAPW_xc_atom op(atom, lapw_basis().radial_basis(atom_index_t::global(ia)), ctx_.lmax_rho());
+        auto fields = op.fields(matrix, radial__ ? &(*radial__)[atom.symmetry_class().id()] : nullptr);
+        if (radial__) {
+            ctx_.comm().allreduce(ddm[ia].at(memory_t::host), ddm[ia].size());
+            auto matching = op.fields(ddm[ia]);
+            for (int part : {0, 1}) {
+                for (int s = 0; s < ns; s++) {
+                    fields[part][s] += matching[part][s];
+                    if (!(spinor || dirac) || s == 0) {
+                        for (int ir = 0; ir < atom.type().num_mt_points(); ir++) {
+                            fields[part][s](0, ir) += (*radial__)[atom.symmetry_class().id()].core_fields[part][ir] /
+                                                      (((spinor || dirac) ? 1 : ns) * y00);
+                        }
+                    }
+                }
+            }
+        }
+        for (int part : {0, 1}) {
+            auto& target = part == 0 ? static_cast<Field4D&>(*result) : result->kinetic_density();
+            for (int s = 0; s < ns; s++) {
+                target.component(spinor || dirac ? s : 0).mt()[ia] += fields[part][s];
+                if (!spinor && !dirac && ns == 2) {
+                    for (size_t i = 0; i < fields[part][s].size(); i++) {
+                        target.vector(0).mt()[ia][i] += (1 - 2 * s) * fields[part][s][i];
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
 void
 Density::generate_dirac_valence(K_point_set const& ks__, std::vector<wf::Wave_functions<double>*> const* directions__,
                                 std::vector<mdarray<double, 2>> const* occupations__)

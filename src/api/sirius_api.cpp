@@ -7265,7 +7265,7 @@ sirius_set_xc_callback:
     after completing all callback collectives. Do not unwind across the C ABI.
     The caller owns user_data and keeps it alive until the context is destroyed.
     A null function pointer disables the callback before context initialization.
-    Currently supported for CPU norm-conserving PW calculations without core
+    Currently supported for CPU/GPU norm-conserving PW calculations without core
     charge, SOC, or noncollinear magnetism. Forces and stress are not supported.
   arguments:
     handler:
@@ -7301,11 +7301,15 @@ sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data
                 if (ctx.initialized()) {
                     RTE_THROW("register external XC before initializing the context");
                 }
+                ctx.cb().external_xc_spinor_               = false;
+                ctx.cb().external_xc_geometry_             = nullptr;
+                ctx.cb().external_xc_pullback_             = nullptr;
+                ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                ctx.cb().external_xc_response_             = nullptr;
+                ctx.cb().external_xc_geometry_response_    = false;
                 if (!fptr__) {
                     ctx.cb().external_xc_ = nullptr;
                     ctx.cb().external_xc_points_.reset();
-                    ctx.cb().external_xc_geometry_ = nullptr;
-                    ctx.cb().external_xc_pullback_ = nullptr;
                     return;
                 }
                 using callback_t =
@@ -7313,9 +7317,7 @@ sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data
                                  double const*, double const*, double*, double*, double*, double*, int*);
                 auto callback = reinterpret_cast<callback_t>(fptr__);
                 ctx.cb().external_xc_points_.reset();
-                ctx.cb().external_xc_geometry_ = nullptr;
-                ctx.cb().external_xc_pullback_ = nullptr;
-                ctx.cb().external_xc_          = [callback, user_data__](auto const& c, auto const& in, auto& out) {
+                ctx.cb().external_xc_ = [callback, user_data__](auto const& c, auto const& in, auto& out) {
                     if (in.points) {
                         RTE_THROW("the FFT XC callback cannot evaluate an arbitrary point set");
                     }
@@ -7376,11 +7378,12 @@ sirius_set_xc_point_callback:
     PW, PAW and ultrasoft are supported on CPU/GPU. PAW and nonlinear core corrections
     require explicitly supplied positive core tau. FP-LAPW fields are supported on
     CPU/GPU with scalar-relativistic or native Dirac radial functions.
-    PW, PAW and ultrasoft forces and stress require the point geometry callbacks.
-    FP-LAPW supports energy and orbital derivatives, but not forces or stress.
+    PW, PAW and ultrasoft atomic forces and stress additionally require the point geometry callbacks.
+    FP-LAPW forces and total stress also require joint Hessian and quadrature-direction
+    callbacks and CPU/GPU fp64 orbitals. Scalar and collinear states use full variation.
     Noncollinear states use NR/ZORA second variation with SOC or native Dirac full
-    variation. Explicit cores support NR, ZORA and Dirac relativity with scalar
-    valence radial functions. Native Dirac valence requires Dirac cores.
+    variation, including the radial-basis response. Explicit cores support NR, ZORA
+    and Dirac relativity with scalar valence radial functions; native Dirac valence requires Dirac cores.
   arguments:
     handler:
       type: ctx_handler
@@ -7447,18 +7450,24 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                     RTE_THROW("register external point XC before initializing the context");
                 }
                 if (!fptr__) {
-                    ctx.cb().external_xc_spinor_   = false;
-                    ctx.cb().external_xc_geometry_ = nullptr;
-                    ctx.cb().external_xc_pullback_ = nullptr;
-                    ctx.cb().external_xc_          = nullptr;
+                    ctx.cb().external_xc_spinor_               = false;
+                    ctx.cb().external_xc_geometry_             = nullptr;
+                    ctx.cb().external_xc_pullback_             = nullptr;
+                    ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                    ctx.cb().external_xc_response_             = nullptr;
+                    ctx.cb().external_xc_geometry_response_    = false;
+                    ctx.cb().external_xc_                      = nullptr;
                     ctx.cb().external_xc_points_.reset();
                     return;
                 }
                 auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
                                                 descriptor_weights__, block_sizes__, block_centres__);
-                ctx.cb().external_xc_spinor_   = false;
-                ctx.cb().external_xc_geometry_ = nullptr;
-                ctx.cb().external_xc_pullback_ = nullptr;
+                ctx.cb().external_xc_spinor_               = false;
+                ctx.cb().external_xc_geometry_             = nullptr;
+                ctx.cb().external_xc_pullback_             = nullptr;
+                ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                ctx.cb().external_xc_response_             = nullptr;
+                ctx.cb().external_xc_geometry_response_    = false;
                 using callback_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
                                             int const*, double const*, double const*, double const*, double const*,
                                             double*, double*, double*, double*, int*);
@@ -7490,12 +7499,17 @@ sirius_set_xc_spinor_mode:
   doc: >-
     Opt into total/z/x/y fields for all registered point XC callbacks before
     initializing the context. Their ns argument becomes four; array storage
-    remains (nr,ns) and (nr,3,ns). The energy and any geometry callback must use
-    the same convention. No local spin-axis rotation is applied.
-    FP-LAPW spinors use NR/ZORA second variation including SOC or native Dirac
-    full variation without a separate SOC correction.
-    Scalar and collinear registrations retain their total and up/down fields
-    when this mode is disabled.
+    remains (nr,ns) and (nr,3,ns). Energy, response and geometry callbacks must
+    implement this convention together. No local spin-axis rotation is applied.
+    Supported for norm-conserving PW and PAW spinors, including SOC,
+    forces and stress with the point
+    geometry callbacks.
+    FP-LAPW spinors support energy, orbital derivatives and field Hessian actions on
+    CPU/GPU with NR/ZORA second variation including SOC, or native Dirac full variation
+    without a separate SOC correction. Complete forces and stress, including radial-basis
+    motion, require CPU/GPU fp64 orbitals and the joint Hessian and quadrature-direction callbacks.
+    Scalar/collinear registrations
+    retain their original total/up-down convention when this mode is disabled.
     Registering a new energy callback resets the mode to disabled.
     Called collectively on the context communicator with the same enabled value.
   arguments:
@@ -7616,8 +7630,6 @@ sirius_set_xc_point_geometry_callbacks:
     point XC callback, with four additional double pointers before status.
     These return raw coordinate (3,nr), energy-weight (nr), descriptor-weight
     (nr) and block-centre (3,nb) derivatives at fixed physical fields.
-    Evaluate the same discrete energy and field derivatives as the point callback.
-    All explicit atom/cell dependence must enter through these quadrature inputs.
     The pullback callback has C signature
     void pullback(void* user_data, int nr, int nb, int natom, int fcomm,
     const int* block_sizes, const double* dcoordinates, const double* denergy_weights,
@@ -7627,12 +7639,14 @@ sirius_set_xc_point_geometry_callbacks:
     The host returns globally summed Cartesian atom (3,natom) and cell (3,3)
     derivatives, identical on every rank. Lattice vectors are columns and the
     cell derivative holds Cartesian atoms fixed. Apply no force sign or volume
-    normalization. SIRIUS adds the Fourier cell response and the PW normalization
-    and kinetic-density metric terms when evaluating total stress.
+    normalization. SIRIUS adds explicit atom-local and Fourier cell responses.
     Callbacks are collective, including empty ranks. Outputs start at zero.
     Set status nonzero on failure without unwinding across the C ABI.
-    Both null pointers disable geometry evaluation. The initial scope matches
-    the CPU scalar/collinear norm-conserving point XC evaluator.
+    Both null pointers disable geometry evaluation. For PW and PAW, these callbacks
+    supply the explicit XC contribution to atomic forces and stress. FP-LAPW forces
+    and total stress additionally require the joint Hessian and quadrature-direction
+    callbacks for the self-consistent valence and tau-dependent core response.
+    Supported relativity combinations are specified in sirius_set_xc_point_callback.
   arguments:
     handler:
       type: ctx_handler
@@ -7717,6 +7731,340 @@ sirius_set_xc_point_geometry_callbacks(void* const* handler__, void (*field_fptr
                              out.atoms.empty() ? nullptr : out.atoms.front().data(), out.lattice.data(), &status);
                     if (status) {
                         RTE_THROW("external XC quadrature pullback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_quadrature_direction_callback:
+  doc: >-
+    Register a host quadrature forward derivative after the point XC evaluator
+    and before context initialization. Its C signature is
+    void direction(void* user_data, int nr, int nb, int natom, int fcomm,
+    const int* block_sizes, const double* delta_atoms, const double* delta_lattice,
+    double* delta_coordinates, double* delta_energy_weights,
+    double* delta_descriptor_weights, double* delta_block_centres, int* status).
+    Atom (3,natom) and lattice-column (3,3) directions are replicated Cartesian
+    bohr arrays. They are independent, with no implicit affine atom motion.
+    Outputs have the local point callback's Fortran shapes and start at zero.
+    Differentiate both independent weights at fixed row topology and radial/angular
+    rules. The callback is collective, including empty ranks. Set status nonzero
+    on failure without unwinding across the C ABI. A null pointer disables it.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable host quadrature direction callback.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_quadrature_direction_callback(void* const* handler__, void (*fptr__)(), void* user_data__,
+                                            int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx = get_sim_ctx(handler__);
+                int invalid =
+                        ctx.initialized() || (fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int enabled_min = bool(fptr__), enabled_max = enabled_min;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || enabled_min != enabled_max) {
+                    RTE_THROW(
+                            "register the quadrature direction collectively after point XC and before initialization");
+                }
+                if (!fptr__) {
+                    ctx.cb().external_xc_quadrature_direction_ = nullptr;
+                    return;
+                }
+                using direction_t = void (*)(void*, int, int, int, int, int const*, double const*, double const*,
+                                             double*, double*, double*, double*, int*);
+                auto callback     = reinterpret_cast<direction_t>(fptr__);
+                ctx.cb().external_xc_quadrature_direction_ = [callback, user_data__](auto const& c, auto const& p,
+                                                                                     auto const& d, auto& out) {
+                    int status{0};
+                    callback(user_data__, static_cast<int>(p.coordinates.size()),
+                             static_cast<int>(p.block_sizes.size()), c.unit_cell().num_atoms(),
+                             MPI_Comm_c2f(c.comm().native()), p.block_sizes.data(),
+                             d.atoms.empty() ? nullptr : d.atoms.front().data(), d.lattice.data(),
+                             out.coordinates.empty() ? nullptr : out.coordinates.front().data(),
+                             out.energy_weights.data(), out.descriptor_weights.data(),
+                             out.block_centres.empty() ? nullptr : out.block_centres.front().data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC quadrature direction returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_point_response_callback:
+  doc: >-
+    Register a fixed-geometry XC Hessian-vector evaluator after the point XC
+    callback and before context initialization. Its C signature is
+    void response(void* user_data, int nr, int ns, int nb, int fcomm,
+    const double* coordinates, const double* energy_weights,
+    const double* descriptor_weights, const int* block_sizes,
+    const double* block_centres, const double* rho, const double* gradient,
+    const double* tau, const double* delta_rho, const double* delta_gradient,
+    const double* delta_tau, double* delta_vrho, double* delta_vgradient,
+    double* delta_vtau, int* status).
+    Fields and directions have the point callback's Fortran array shapes.
+    Return raw directional derivatives of the entire discrete XC energy's
+    field covectors, including nonlocal coupling. The call is collective,
+    including empty ranks. Outputs start at zero. Set status nonzero on failure
+    without unwinding across the C ABI. A null pointer disables the response.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable XC response evaluator.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_point_response_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx = get_sim_ctx(handler__);
+                int invalid =
+                        ctx.initialized() || (fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int enabled_min = bool(fptr__), enabled_max = enabled_min;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || enabled_min != enabled_max) {
+                    RTE_THROW("register the XC response collectively after point XC and before initialization");
+                }
+                ctx.cb().external_xc_geometry_response_ = false;
+                if (!fptr__) {
+                    ctx.cb().external_xc_response_ = nullptr;
+                    return;
+                }
+                using response_t =
+                        void (*)(void*, int, int, int, int, double const*, double const*, double const*, int const*,
+                                 double const*, double const*, double const*, double const*, double const*,
+                                 double const*, double const*, double*, double*, double*, int*);
+                auto response                  = reinterpret_cast<response_t>(fptr__);
+                ctx.cb().external_xc_response_ = [response, user_data__](auto const& c, auto const& in, auto const& d,
+                                                                         auto& out) {
+                    int invalid = d.geometry || out.geometry;
+                    c.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+                    if (invalid) {
+                        RTE_THROW("the fixed-geometry XC response callback cannot differentiate quadrature inputs");
+                    }
+                    auto const& p = *in.points;
+                    int status{0};
+                    response(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
+                             MPI_Comm_c2f(c.comm().native()),
+                             p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
+                             p.descriptor_weights.data(), p.block_sizes.data(),
+                             p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
+                             in.tau, d.rho, d.gradient, d.tau, out.vrho, out.vgradient, out.vtau, &status);
+                    if (status) {
+                        RTE_THROW("external XC response callback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_response_tolerance:
+  doc: >-
+    Set the relative residual tolerance of the coupled LAPW response solve
+    before context initialization. Default is 1e-8. The tolerance must be finite,
+    positive, less than one and identical on every context rank. Choose it
+    consistently with the numerical precision of the host XC Hessian evaluator.
+    It also bounds relative differences between the stored bands and the frozen
+    response Hamiltonian after the final SCF potential update.
+    It does not change the SCF or XC evaluation tolerances.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    tolerance:
+      type: double
+      attr: in, required
+      doc: Relative rho/tau response residual tolerance.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_response_tolerance(void* const* handler__, double const* tolerance__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx        = get_sim_ctx(handler__);
+                double tolerance = tolerance__ ? *tolerance__ : 0;
+                auto root        = tolerance;
+                ctx.comm().bcast(&root, 1, 0);
+                int invalid = ctx.initialized() || !std::isfinite(tolerance) || tolerance <= 0 || tolerance >= 1 ||
+                              tolerance != root;
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid) {
+                    RTE_THROW("set a common XC response tolerance between zero and one before initialization");
+                }
+                ctx.cb().external_xc_response_tolerance_ = tolerance;
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_point_hessian_callback:
+  doc: >-
+    Register a joint field and quadrature XC Hessian-vector evaluator after the
+    point XC callback and before context initialization. Replaces the fixed-geometry
+    response callback without changing its ABI. Its C signature is
+    void response(void* user_data, int nr, int ns, int nb, int fcomm,
+    const double* coordinates, const double* energy_weights,
+    const double* descriptor_weights, const int* block_sizes,
+    const double* block_centres, const double* rho, const double* gradient,
+    const double* tau, const double* delta_rho, const double* delta_gradient,
+    const double* delta_tau, const double* delta_coordinates,
+    const double* delta_energy_weights, const double* delta_descriptor_weights,
+    const double* delta_block_centres, double* delta_vrho,
+    double* delta_vgradient, double* delta_vtau, double* delta_dcoordinates,
+    double* delta_denergy_weights, double* delta_ddescriptor_weights,
+    double* delta_dblock_centres, int* status).
+    Arrays have the point callback's Fortran shapes. Return the Hessian of the
+    entire discrete energy applied to these independent directions, including
+    mixed field/geometry and nonlocal terms. All output covectors are raw,
+    without field sampling, gradient adjoints, forces or stress factors.
+    The call is collective, including empty ranks. Outputs start at zero.
+    Set status nonzero on failure without unwinding across the C ABI.
+    A null pointer disables the response.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable joint XC Hessian-vector evaluator.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_point_hessian_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx = get_sim_ctx(handler__);
+                int invalid =
+                        ctx.initialized() || (fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int enabled_min = bool(fptr__), enabled_max = enabled_min;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || enabled_min != enabled_max) {
+                    RTE_THROW("register the joint XC Hessian collectively after point XC and before initialization");
+                }
+                ctx.cb().external_xc_geometry_response_ = bool(fptr__);
+                if (!fptr__) {
+                    ctx.cb().external_xc_response_ = nullptr;
+                    return;
+                }
+                using response_t =
+                        void (*)(void*, int, int, int, int, double const*, double const*, double const*, int const*,
+                                 double const*, double const*, double const*, double const*, double const*,
+                                 double const*, double const*, double const*, double const*, double const*,
+                                 double const*, double*, double*, double*, double*, double*, double*, double*, int*);
+                auto response                  = reinterpret_cast<response_t>(fptr__);
+                ctx.cb().external_xc_response_ = [response, user_data__](auto const& c, auto const& in, auto const& d,
+                                                                         auto& out) {
+                    auto const& p = *in.points;
+                    std::unique_ptr<xc_point_derivatives_t> zero, unused;
+                    if (!d.geometry) {
+                        zero = std::make_unique<xc_point_derivatives_t>(p);
+                    }
+                    if (!out.geometry) {
+                        unused = std::make_unique<xc_point_derivatives_t>(p);
+                    }
+                    auto const& g      = d.geometry ? *d.geometry : *zero;
+                    auto& v            = out.geometry ? *out.geometry : *unused;
+                    auto shape_matches = [&](auto const& a) {
+                        return a.coordinates.size() == p.coordinates.size() &&
+                               a.block_centres.size() == p.block_centres.size() &&
+                               a.energy_weights.size() == p.energy_weights.size() &&
+                               a.descriptor_weights.size() == p.descriptor_weights.size();
+                    };
+                    int invalid = !shape_matches(g) || !shape_matches(v);
+                    for (auto const* a : {&g.coordinates, &g.block_centres}) {
+                        for (auto const& r : *a) {
+                            for (auto x : r) {
+                                invalid |= !std::isfinite(x);
+                            }
+                        }
+                    }
+                    for (auto const* a : {&g.energy_weights, &g.descriptor_weights}) {
+                        for (auto x : *a) {
+                            invalid |= !std::isfinite(x);
+                        }
+                    }
+                    c.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+                    if (invalid) {
+                        RTE_THROW("invalid or nonfinite XC quadrature response direction on a context rank");
+                    }
+                    int status{0};
+                    response(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
+                             MPI_Comm_c2f(c.comm().native()),
+                             p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
+                             p.descriptor_weights.data(), p.block_sizes.data(),
+                             p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
+                             in.tau, d.rho, d.gradient, d.tau,
+                             g.coordinates.empty() ? nullptr : g.coordinates.front().data(), g.energy_weights.data(),
+                             g.descriptor_weights.data(),
+                             g.block_centres.empty() ? nullptr : g.block_centres.front().data(), out.vrho,
+                             out.vgradient, out.vtau, v.coordinates.empty() ? nullptr : v.coordinates.front().data(),
+                             v.energy_weights.data(), v.descriptor_weights.data(),
+                             v.block_centres.empty() ? nullptr : v.block_centres.front().data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC Hessian callback returned status " + std::to_string(status));
                     }
                 };
             },

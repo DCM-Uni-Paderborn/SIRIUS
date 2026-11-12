@@ -23,6 +23,7 @@
 #include "hamiltonian/hamiltonian.hpp"
 #include "symmetry/symmetrize_forces.hpp"
 #include "lapw/step_function.hpp"
+#include "dft/lapw_response.hpp"
 #include <string>
 #include <iomanip>
 #include <vector>
@@ -196,12 +197,18 @@ Force::calc_forces_total()
 mdarray<double, 2> const&
 Force::calc_forces_total(bool add_scf_corr)
 {
-    xc_geometry_derivatives_t geometry(ctx_.unit_cell().num_atoms());
+    xc_geometry_derivatives_t xc_geometry(ctx_.unit_cell().num_atoms());
     if (ctx_.cb().external_xc_) {
-        geometry = potential_.external_xc_geometry(density_);
+        xc_geometry = potential_.external_xc_geometry(density_);
     }
     if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
         RTE_THROW("meta-GGA geometry derivatives are not connected to forces yet");
+    }
+    forces_xc_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
+    for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
+        for (int x = 0; x < 3; x++) {
+            forces_xc_(x, ia) = -xc_geometry.atoms[ia][x];
+        }
     }
     forces_total_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
 
@@ -209,12 +216,29 @@ Force::calc_forces_total(bool add_scf_corr)
     calc_forces_dftd4();
 
     if (ctx_.full_potential()) {
-        calc_forces_rho();
-        calc_forces_hf();
-        calc_forces_ibs();
+        std::unique_ptr<LAPW_response> response;
+        if (ctx_.cb().external_xc_) {
+            response = std::make_unique<LAPW_response>(kset_, density_, potential_);
+        } else {
+            calc_forces_rho();
+            calc_forces_hf();
+            calc_forces_ibs();
+        }
+        xc_geometry_direction_t direction(ctx_.unit_cell().num_atoms());
         for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
             for (int x : {0, 1, 2}) {
-                forces_total_(x, ia) = forces_ibs_(x, ia) + forces_hf_(x, ia) + forces_rho_(x, ia);
+                if (response) {
+                    // Differentiate the discrete free energy, including its self-consistent core and valence fields.
+                    direction.atoms[ia][x] = 1;
+                    auto radial = response->radial_geometry_response(direction,
+                                                                     ctx_.cb().external_xc_response_tolerance_, 200);
+                    forces_total_(x, ia)   = -response->energy_geometry_derivative(direction, radial, xc_geometry);
+                    direction.atoms[ia][x] = 0;
+                } else {
+                    forces_total_(x, ia) =
+                            forces_ibs_(x, ia) + forces_hf_(x, ia) + forces_rho_(x, ia) + forces_xc_(x, ia);
+                }
+                forces_total_(x, ia) += forces_dftd3_(x, ia) + forces_dftd4_(x, ia);
             }
         }
     } else {
@@ -237,12 +261,9 @@ Force::calc_forces_total(bool add_scf_corr)
                 if (add_scf_corr) {
                     forces_total_(x, ia) += forces_scf_corr_(x, ia);
                 }
+                // Projector response is already in the nonlocal force through D_ij.
+                forces_total_(x, ia) += forces_xc_(x, ia);
             }
-        }
-    }
-    for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
-        for (int x = 0; x < 3; x++) {
-            forces_total_(x, ia) -= geometry.atoms[ia][x];
         }
     }
     return forces_total_;
@@ -254,9 +275,9 @@ Force::calc_forces_ibs()
     forces_ibs_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
     forces_ibs_.zero();
 
-    if (ctx_.cfg().control().use_second_variation() == false) {
-        RTE_WARNING("IBS forces are not implemented for full variational diagonalization!");
-        return forces_ibs_;
+    bool second = ctx_.cfg().control().use_second_variation();
+    if (!second && ctx_.valence_relativity() != relativity_t::none) {
+        RTE_THROW("full-variational IBS forces require nonrelativistic valence states");
     }
 
     mdarray<double, 2> ffac({ctx_.unit_cell().num_atom_types(), ctx_.gvec().num_shells()});
@@ -268,12 +289,14 @@ Force::calc_forces_ibs()
         }
     }
 
-    auto lapw_basis = potential_.create_lapw_basis();
+    auto lapw_basis = density_.lapw_basis_sptr();
 
     Hamiltonian0<double> H0(potential_, lapw_basis);
     for (auto it : kset_.spl_num_kpoints()) {
         auto hk = H0(*kset_.get<double>(it.i));
-        add_ibs_force(kset_.get<double>(it.i), hk, ffac, forces_ibs_);
+        for (int s = 0; s < (second ? 1 : ctx_.num_spins()); s++) {
+            add_ibs_force(kset_.get<double>(it.i), hk, ffac, forces_ibs_, s);
+        }
     }
     ctx_.comm().allreduce(&forces_ibs_(0, 0), (int)forces_ibs_.size());
     symmetrize_forces(ctx_.unit_cell(), forces_ibs_);
@@ -602,8 +625,9 @@ Force::calc_forces_core()
 
     forces_core_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
     forces_core_.zero();
+    // External XC differentiates the PAW AE core and NC pseudo core in its
+    // atom-local point reconstruction, not in the smooth Fourier field.
     if (ctx_.cb().external_xc_) {
-        // Frozen core motion is included in the external XC geometry adjoint.
         return forces_core_;
     }
 
@@ -793,7 +817,7 @@ Force::calc_forces_usnl()
 
 void
 Force::add_ibs_force(K_point<double>* kp__, Hamiltonian_k<double>& Hk__, mdarray<double, 2>& ffac__,
-                     mdarray<double, 2>& forcek__) const
+                     mdarray<double, 2>& forcek__, int ispn__) const
 {
     PROFILE("sirius::Force::ibs_force");
 
@@ -803,16 +827,40 @@ Force::add_ibs_force(K_point<double>* kp__, Hamiltonian_k<double>& Hk__, mdarray
 
     auto bs = ctx_.cyclic_block_size();
 
-    auto nfv = ctx_.num_fv_states();
+    bool second = ctx_.cfg().control().use_second_variation();
+    auto nfv    = second ? ctx_.num_fv_states() : ctx_.num_bands();
 
     auto ngklo = kp__->gklo_basis_size();
 
     /* compute density matrix for a k-point */
     la::dmatrix<std::complex<double>> dm(nfv, nfv, bg, bs, bs);
-    compute_dmat(kp__, dm);
+    la::dmatrix<std::complex<double>> canonical_evec;
+    if (second) {
+        compute_dmat(kp__, dm);
+    } else {
+        dm.zero();
+        canonical_evec = la::dmatrix<std::complex<double>>(ngklo, nfv, bg, bs, bs);
+        // Actual LAPW orbitals store AW and LO coefficients, while the eigenproblem
+        // contains only PW and LO coefficients. AW coefficients are not independent.
+        for (int b = 0; b < nfv; b++) {
+            dm.set(b, b, kp__->band_occupancy(b, ispn__));
+            auto c = kp__->spinor_wave_functions().gather(wf::spin_index(ispn__), wf::band_index(b));
+            int ng = kp__->gkvec().num_gvec();
+            for (int ig = 0; ig < ng; ig++) {
+                canonical_evec.set(ig, b, c[ig]);
+            }
+            int row = ng, offset = ng;
+            for (int ia = 0; ia < uc.num_atoms(); ia++) {
+                auto const& type = uc.atom(ia).type();
+                for (int xi = 0; xi < type.mt_lo_basis_size(); xi++) {
+                    canonical_evec.set(row++, b, c[offset + type.mt_aw_basis_size() + xi]);
+                }
+                offset += type.mt_basis_size();
+            }
+        }
+    }
 
-    /* first-variational eigen-vectors in scalapack distribution */
-    auto& fv_evec = kp__->fv_eigen_vectors();
+    auto& fv_evec = second ? kp__->fv_eigen_vectors() : canonical_evec;
 
     la::dmatrix<std::complex<double>> h(ngklo, ngklo, bg, bs, bs);
     la::dmatrix<std::complex<double>> o(ngklo, ngklo, bg, bs, bs);
@@ -826,6 +874,20 @@ Force::add_ibs_force(K_point<double>* kp__, Hamiltonian_k<double>& Hk__, mdarray
     mdarray<std::complex<double>, 2> alm_row({kp__->num_gkvec_row(), uc.max_mt_aw_basis_size()});
     mdarray<std::complex<double>, 2> alm_col({kp__->num_gkvec_col(), uc.max_mt_aw_basis_size()});
     mdarray<std::complex<double>, 2> halm_col({kp__->num_gkvec_col(), uc.max_mt_aw_basis_size()});
+
+    auto multiply = [&](char trans, int m, int n, int k, auto const& a, auto const& b, std::complex<double> beta,
+                        auto& c) {
+        auto const& one = la::constant<std::complex<double>>::one();
+        if (bg.comm().size() == 1) {
+            la::wrap(la::lib_t::blas)
+                    .gemm(trans, 'N', m, n, k, &one, a.at(memory_t::host), a.ld(), b.at(memory_t::host), b.ld(), &beta,
+                          c.at(memory_t::host), c.ld());
+        } else {
+            la::wrap(la::lib_t::scalapack).gemm(trans, 'N', m, n, k, &one, a, 0, 0, b, 0, 0, &beta, c, 0, 0);
+        }
+    };
+    // Sequential eigensolvers replicate their matrices on the band communicator.
+    double weight = kp__->weight() * bg.comm().size() / kp__->comm().size();
 
     for (int ia = 0; ia < uc.num_atoms(); ia++) {
         h.zero();
@@ -841,10 +903,10 @@ Force::add_ibs_force(K_point<double>* kp__, Hamiltonian_k<double>& Hk__, mdarray
         kp__->alm_coeffs_col().generate<false>(atom, alm_col, rb);
 
         /* setup apw-lo and lo-apw blocks */
-        Hk__.set_fv_h_o_apw_lo(atom, ia, 0, alm_row, alm_col, h, o);
+        Hk__.set_fv_h_o_apw_lo(atom, ia, ispn__, alm_row, alm_col, h, o);
 
         /* apply MT Hamiltonian to column coefficients */
-        Hk__.H0().apply_hmt_to_apw(device_t::CPU, ia, 0, kp__->num_gkvec_col(), alm_col, halm_col);
+        Hk__.H0().apply_hmt_to_apw(device_t::CPU, ia, ispn__, kp__->num_gkvec_col(), alm_col, halm_col);
 
         /* apw-apw block of the overlap matrix */
         la::wrap(la::lib_t::blas)
@@ -933,29 +995,23 @@ Force::add_ibs_force(K_point<double>* kp__, Hamiltonian_k<double>& Hk__, mdarray
             }
 
             /* zm1 = dO * V */
-            la::wrap(la::lib_t::scalapack)
-                    .gemm('N', 'N', ngklo, nfv, ngklo, &la::constant<std::complex<double>>::one(), o1, 0, 0, fv_evec, 0,
-                          0, &la::constant<std::complex<double>>::zero(), zm1, 0, 0);
+            multiply('N', ngklo, nfv, ngklo, o1, fv_evec, 0.0, zm1);
             /* multiply by energy: zm1 = E * (dO * V)  */
             for (int i = 0; i < zm1.num_cols_local(); i++) {
                 int ist = zm1.icol(i);
                 for (int j = 0; j < kp__->gklo_basis_size_row(); j++) {
-                    zm1(j, i) *= kp__->fv_eigen_value(ist);
+                    zm1(j, i) *= second ? kp__->fv_eigen_value(ist) : kp__->band_energy(ist, ispn__);
                 }
             }
             /* compute zm1 = dH * V - E * (dO * V) */
-            la::wrap(la::lib_t::scalapack)
-                    .gemm('N', 'N', ngklo, nfv, ngklo, &la::constant<std::complex<double>>::one(), h1, 0, 0, fv_evec, 0,
-                          0, &la::constant<std::complex<double>>::m_one(), zm1, 0, 0);
+            multiply('N', ngklo, nfv, ngklo, h1, fv_evec, -1.0, zm1);
 
             /* compute zf = V^{+} * zm1 = V^{+} * (dH * V - E * (dO * V)) */
-            la::wrap(la::lib_t::scalapack)
-                    .gemm('C', 'N', nfv, nfv, ngklo, &la::constant<std::complex<double>>::one(), fv_evec, 0, 0, zm1, 0,
-                          0, &la::constant<std::complex<double>>::zero(), zf, 0, 0);
+            multiply('C', nfv, nfv, ngklo, fv_evec, zm1, 0.0, zf);
 
             for (int i = 0; i < dm.num_cols_local(); i++) {
                 for (int j = 0; j < dm.num_rows_local(); j++) {
-                    forcek__(x, ia) += kp__->weight() * std::real(dm(j, i) * zf(j, i));
+                    forcek__(x, ia) += weight * std::real(dm(j, i) * zf(j, i));
                 }
             }
         } // x
@@ -980,11 +1036,11 @@ Force::print_info(std::ostream& out__, int verbosity__)
 
     if (verbosity__ >= 3) {
         if (ctx_.full_potential()) {
-            print_forces("contribution from density", forces_rho());
-
-            print_forces("contribution from Hartree potential", forces_hf());
-
-            print_forces("contribution from IBS", forces_ibs());
+            if (!ctx_.cb().external_xc_) {
+                print_forces("contribution from density", forces_rho());
+                print_forces("contribution from Hartree potential", forces_hf());
+                print_forces("contribution from IBS", forces_ibs());
+            }
         } else {
             print_forces("ultrasoft contribution from Qij", forces_us());
 
@@ -993,6 +1049,10 @@ Force::print_info(std::ostream& out__, int verbosity__)
             print_forces("contribution from local potential", forces_vloc());
 
             print_forces("contribution from core density", forces_core());
+
+            if (ctx_.cb().external_xc_) {
+                print_forces("explicit contribution from external XC", forces_xc_);
+            }
 
             print_forces("Ewald forces from ions", forces_ewald());
 
