@@ -92,7 +92,13 @@ external_xc_smooth_fields(Simulation_context const& ctx, Density const& density)
             if (ctx.unit_cell().augment()) {
                 r -= augmentation(ig, 0);
             }
-            if (ctx.num_mag_dims() == 1) {
+            if (ctx.num_mag_dims() == 3 && s > 0) {
+                r = density.mag(s - 1).rg().f_pw_local(ig);
+                t = density.kinetic_density().vector(s - 1).rg().f_pw_local(ig);
+                if (ctx.unit_cell().augment()) {
+                    r -= augmentation(ig, s);
+                }
+            } else if (ctx.num_mag_dims() == 1) {
                 auto m = density.mag(0).rg().f_pw_local(ig);
                 if (ctx.unit_cell().augment()) {
                     m -= augmentation(ig, 1);
@@ -185,8 +191,18 @@ validate_external_xc_context(Simulation_context const& ctx__)
     if ((ctx__.full_potential() || ctx__.unit_cell().augment()) && !points) {
         RTE_THROW("external XC: PAW and full potential require reconstructed point quadrature");
     }
-    if (ctx__.num_mag_dims() == 3 || ctx__.so_correction()) {
-        RTE_THROW("external XC requires scalar or collinear spin");
+    int spinor_min = ctx__.cb().external_xc_spinor_, spinor_max = spinor_min;
+    ctx__.comm().allreduce<int, mpi::op_t::min>(&spinor_min, 1);
+    ctx__.comm().allreduce<int, mpi::op_t::max>(&spinor_max, 1);
+    if (spinor_min != spinor_max) {
+        RTE_THROW("external XC field convention differs between context ranks");
+    }
+    if (spinor_min) {
+        if (ctx__.num_mag_dims() != 3 || !points) {
+            RTE_THROW("external spinor XC requires reconstructed total/z/x/y fields");
+        }
+    } else if (ctx__.num_mag_dims() == 3 || ctx__.so_correction()) {
+        RTE_THROW("external XC spinors require explicit four-component callback registration");
     }
     if (!ctx__.xc_functionals().empty() || ctx__.cb().veff_) {
         RTE_THROW("external XC cannot be combined with built-in XC or an effective-potential callback");
@@ -201,8 +217,13 @@ validate_external_xc_context(Simulation_context const& ctx__)
         }
     }
     if (ctx__.full_potential()) {
-        if (ctx__.cfg().parameters().precision_wf() != "fp64") {
-            RTE_THROW("external LAPW XC requires fp64 valence orbitals");
+        if (spinor_min && !ctx__.cfg().control().use_second_variation()) {
+            RTE_THROW("external LAPW spinor XC requires second variation");
+        }
+        if (ctx__.cfg().parameters().precision_wf() != "fp64" ||
+            (spinor_min && ctx__.valence_relativity() != relativity_t::none &&
+             ctx__.valence_relativity() != relativity_t::zora)) {
+            RTE_THROW("external LAPW XC requires scalar/collinear, NR/ZORA spinor fp64 valence orbitals");
         }
         if (ctx__.unit_cell().num_core_electrons() != 0 && ctx__.core_relativity() != relativity_t::none &&
             ctx__.core_relativity() != relativity_t::zora && ctx__.core_relativity() != relativity_t::dirac) {
@@ -379,6 +400,12 @@ Potential::xc_external_points(Density const& density__)
     external_projector_d_mtrx_ = std::move(adjoint.local_matrices);
     for (int s = 0; s < ns; s++) {
         for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
+            if (ns == 4) {
+                auto& v          = s == 0 ? xc_potential_->rg() : effective_magnetic_field(s - 1).rg();
+                v.f_pw_local(ig) = adjoint.rho[s].f_pw_local(ig);
+                kinetic_potential_->component(s).rg().f_pw_local(ig) = adjoint.tau[s].f_pw_local(ig);
+                continue;
+            }
             auto v = adjoint.rho[s].f_pw_local(ig) / double(ns);
             auto t = adjoint.tau[s].f_pw_local(ig) / double(ns);
             xc_potential_->rg().f_pw_local(ig) += v;

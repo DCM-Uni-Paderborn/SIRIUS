@@ -108,6 +108,121 @@ class Kinetic_density_operator
         }
     }
 
+    /// Accumulate a spinor's tau in Field4D order: scalar, z, x, y.
+    /** Inputs and outputs are host arrays; spinors require a complex FFT, including at Gamma. */
+    void
+    add_spinor_density(T weight__, std::array<std::complex<T> const*, 2> phi__, std::array<T*, 4> tau__)
+    {
+        if (fft_.type() != SPFFT_TRANS_C2C) {
+            RTE_THROW("spinor kinetic density requires a complex FFT");
+        }
+        std::vector<std::complex<T>> up(fft_.local_slice_size());
+        for (int x = 0; x < 3; x++) {
+            gradient(phi__[0], x);
+            auto ptr = reinterpret_cast<std::complex<T> const*>(fft_.space_domain_data(SPFFT_PU_HOST));
+            if (!up.empty()) {
+                std::copy(ptr, ptr + up.size(), up.begin());
+            }
+            gradient(phi__[1], x);
+            ptr = reinterpret_cast<std::complex<T> const*>(fft_.space_domain_data(SPFFT_PU_HOST));
+            #pragma omp parallel for schedule(static)
+            for (int ir = 0; ir < fft_.local_slice_size(); ir++) {
+                T uu = T(0.5) * weight__ * std::norm(up[ir]), dd = T(0.5) * weight__ * std::norm(ptr[ir]);
+                auto cross = weight__ * std::conj(up[ir]) * ptr[ir];
+                tau__[0][ir] += uu + dd;
+                tau__[1][ir] += uu - dd;
+                tau__[2][ir] += cross.real();
+                tau__[3][ir] += cross.imag();
+            }
+        }
+    }
+
+    /// Accumulate a spinor orbital direction in the same scalar/z/x/y convention.
+    void
+    add_spinor_density_response(T weight__, std::array<std::complex<T> const*, 2> phi__,
+                                std::array<std::complex<T> const*, 2> direction__, std::array<T*, 4> tau__)
+    {
+        if (fft_.type() != SPFFT_TRANS_C2C) {
+            RTE_THROW("spinor kinetic-density response requires a complex FFT");
+        }
+        int nr = fft_.local_slice_size();
+        std::array<std::vector<std::complex<T>>, 2> base;
+        std::vector<std::complex<T>> up(nr);
+        for (auto& values : base) {
+            values.resize(nr);
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int s = 0; s < 2; s++) {
+                gradient(phi__[s], x);
+                auto ptr = reinterpret_cast<std::complex<T> const*>(fft_.space_domain_data(SPFFT_PU_HOST));
+                if (nr) {
+                    std::copy(ptr, ptr + nr, base[s].begin());
+                }
+            }
+            gradient(direction__[0], x);
+            auto ptr = reinterpret_cast<std::complex<T> const*>(fft_.space_domain_data(SPFFT_PU_HOST));
+            if (nr) {
+                std::copy(ptr, ptr + nr, up.begin());
+            }
+            gradient(direction__[1], x);
+            ptr = reinterpret_cast<std::complex<T> const*>(fft_.space_domain_data(SPFFT_PU_HOST));
+            #pragma omp parallel for schedule(static)
+            for (int ir = 0; ir < nr; ir++) {
+                T uu       = weight__ * std::real(std::conj(base[0][ir]) * up[ir]);
+                T dd       = weight__ * std::real(std::conj(base[1][ir]) * ptr[ir]);
+                auto cross = weight__ * (std::conj(up[ir]) * base[1][ir] + std::conj(base[0][ir]) * ptr[ir]);
+                tau__[0][ir] += uu + dd;
+                tau__[1][ir] += uu - dd;
+                tau__[2][ir] += cross.real();
+                tau__[3][ir] += cross.imag();
+            }
+        }
+    }
+
+    /// Apply -1/2 D_k . (v_0 I + v . sigma) D_k in Field4D order.
+    void
+    add_spinor_potential(std::array<T const*, 4> vtau__, std::array<std::complex<T> const*, 2> phi__,
+                         std::array<std::complex<T>*, 2> hphi__)
+    {
+        if (fft_.type() != SPFFT_TRANS_C2C) {
+            RTE_THROW("spinor kinetic-density potential requires a complex FFT");
+        }
+        int overlap = gkvec_.count() && (hphi__[0] == hphi__[1] || phi__[0] == hphi__[0] || phi__[1] == hphi__[0] ||
+                                         phi__[0] == hphi__[1] || phi__[1] == hphi__[1]);
+        mpi::Communicator(fft_.communicator()).allreduce<int, mpi::op_t::max>(&overlap, 1);
+        if (overlap) {
+            RTE_THROW("spinor kinetic-density operator requires distinct input and output arrays");
+        }
+        int nr = fft_.local_slice_size();
+        std::array<std::vector<std::complex<T>>, 2> grad;
+        for (auto& values : grad) {
+            values.resize(nr);
+        }
+        for (int x = 0; x < 3; x++) {
+            for (int s = 0; s < 2; s++) {
+                gradient(phi__[s], x);
+                auto ptr = reinterpret_cast<std::complex<T> const*>(fft_.space_domain_data(SPFFT_PU_HOST));
+                if (nr) {
+                    std::copy(ptr, ptr + nr, grad[s].begin());
+                }
+            }
+            for (int s = 0; s < 2; s++) {
+                auto ptr = reinterpret_cast<std::complex<T>*>(fft_.space_domain_data(SPFFT_PU_HOST));
+                #pragma omp parallel for schedule(static)
+                for (int ir = 0; ir < nr; ir++) {
+                    auto off_diagonal = std::complex<T>(vtau__[2][ir], (2 * s - 1) * vtau__[3][ir]);
+                    ptr[ir]           = (vtau__[0][ir] + (1 - 2 * s) * vtau__[1][ir]) * grad[s][ir] +
+                                        off_diagonal * grad[1 - s][ir];
+                }
+                fft_.forward(SPFFT_PU_HOST, reinterpret_cast<T*>(work_.at(memory_t::host)), SPFFT_FULL_SCALING);
+                #pragma omp parallel for schedule(static)
+                for (int ig = 0; ig < gkvec_.count(); ig++) {
+                    hphi__[s][ig] += std::complex<T>(0, static_cast<T>(-0.5 * gkvec_.gkvec_cart(ig)[x])) * work_[ig];
+                }
+            }
+        }
+    }
+
     /// Add the generalized-Kohn-Sham contribution of a real v_tau to host PW coefficients.
     /** Input and output coefficient arrays must not overlap. The FFT workspace is overwritten. */
     void

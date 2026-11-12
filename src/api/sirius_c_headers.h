@@ -3731,7 +3731,9 @@ sirius_set_xc_point_callback:
     double* dtau, int* status).
     Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr.
     Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1
-    total fields or ns=2 up/down fields.
+    total fields or ns=2 up/down fields. Explicit sirius_set_xc_spinor_mode
+    registration instead supplies ns=4 total/z/x/y fields for norm-conserving PW,
+    PAW, ultrasoft, and FP-LAPW. They are jointly reconstructed before the callback.
     The energy and descriptor weights do not scale those fields.
     Return raw covectors of the complete discrete energy, including model weights,
     without dividing by quadrature weights or applying host adjoints. Return the
@@ -3746,6 +3748,7 @@ sirius_set_xc_point_callback:
     CPU with scalar-relativistic radial functions.
     PW, PAW and ultrasoft forces and stress require the point geometry callbacks.
     FP-LAPW supports energy and orbital derivatives, but not forces or stress.
+    Noncollinear states use NR/ZORA second variation with SOC.
     Explicit cores support NR, ZORA and Dirac relativity.
   arguments:
     handler:
@@ -3798,6 +3801,35 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                              int const* num_blocks__, double const* coordinates__, double const* energy_weights__,
                              double const* descriptor_weights__, int const* block_sizes__,
                              double const* block_centres__, int* error_code__);
+
+/*
+sirius_set_xc_spinor_mode:
+  doc: >-
+    Opt into total/z/x/y fields for all registered point XC callbacks before
+    initializing the context. Their ns argument becomes four; array storage
+    remains (nr,ns) and (nr,3,ns). The energy and any geometry callback must use
+    the same convention. No local spin-axis rotation is applied.
+    FP-LAPW spinors use NR/ZORA second variation including SOC.
+    Scalar and collinear registrations retain their total and up/down fields
+    when this mode is disabled.
+    Registering a new energy callback resets the mode to disabled.
+    Called collectively on the context communicator with the same enabled value.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    enabled:
+      type: bool
+      attr: in, required
+      doc: Enable the four-component point callback convention.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+*/
+void
+sirius_set_xc_spinor_mode(void* const* handler__, bool const* enabled__, int* error_code__);
 
 /*
 sirius_update_xc_point_set:
