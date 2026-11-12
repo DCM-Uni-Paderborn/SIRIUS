@@ -14,10 +14,15 @@
 #include <memory>
 #include "potential/potential.hpp"
 #include "lapw/interstitial_functions.hpp"
+#include "lapw/step_function.hpp"
+#include "density/lapw_xc_atom.hpp"
 #include "local_operator.hpp"
 #include "hamiltonian.hpp"
 
 namespace sirius {
+namespace {
+
+} // namespace
 
 // TODO: radial integrals for the potential should be computed here; the problem is that they also can be set
 //       externally by the host code
@@ -58,194 +63,53 @@ generate_h_L(Atom_type const& type__, lapw_radial_basis_t const& rb__,
 
     auto l_by_lm = sf::l_by_lm(lmax_pot);
 
-    //if (type__.parameters().cfg().settings().simple_lapw_ri()) {
-    if (true) {
-        #pragma omp parallel for
-        for (int lm = 0; lm < lmmax; lm++) {
-            int l = l_by_lm[lm];
+    bool simple = type__.parameters().cfg().settings().simple_lapw_ri();
+    std::vector<Spline<double>> radial;
+    if (!simple) {
+        for (int i = 0; i < nrf; i++) {
+            radial.emplace_back(type__.radial_grid());
+            for (int ir = 0; ir < nmtp; ir++) {
+                radial.back()(ir) = rb__.radial_function(ir, i);
+            }
+            radial.back().interpolate();
+        }
+    }
 
-            for (int i2 = 0; i2 < type__.indexr().size(); i2++) {
+#pragma omp parallel for
+    for (int lm = 0; lm < lmmax; lm++) {
+        int l = l_by_lm[lm];
+        for (int component = 0; component <= num_mag_dims; component++) {
+            int field_index = component ? idx_map[component - 1] : 0;
+            Spline<double> field(type__.radial_grid()), integrand(type__.radial_grid());
+            if (!simple) {
+                for (int ir = 0; ir < nmtp; ir++) {
+                    field(ir) = (*vns__[field_index])[ia__](lm, ir);
+                }
+                field.interpolate();
+            }
+            for (int i2 = 0; i2 < nrf; i2++) {
                 int l2 = type__.indexr(i2).am.l();
                 for (int i1 = 0; i1 <= i2; i1++) {
                     int l1 = type__.indexr(i1).am.l();
-                    if ((l + l1 + l2) % 2 == 0) {
-                        if (lm) {
-                            Spline<double> s(type__.radial_grid());
-                            for (int ir = 0; ir < nmtp; ir++) {
-                                auto const& veff = (*vns__[0])[ia__](lm, ir);
-                                s(ir) = veff * rb__.radial_functions_(ir, i1, 0) * rb__.radial_functions_(ir, i2, 0) *
-                                        std::pow(type__.radial_grid(ir), 2);
-                            }
-                            h_L(lm, 0, i1, i2) = h_L(lm, 0, i2, i1) = s.interpolate().integrate(0);
-                        } else {
-                            /* copy spherical part */
-                            h_L(lm, 0, i1, i2) = rb__.h_spherical_integrals_(i1, i2);
-                            h_L(lm, 0, i2, i1) = rb__.h_spherical_integrals_(i2, i1);
-                        }
-                        for (int j = 0; j < num_mag_dims; j++) {
-                            Spline<double> s(type__.radial_grid());
-                            for (int ir = 0; ir < nmtp; ir++) {
-                                auto const& beff = (*vns__[idx_map[j]])[ia__](lm, ir);
-                                s(ir) = beff * rb__.radial_functions_(ir, i1, 0) * rb__.radial_functions_(ir, i2, 0) *
-                                        std::pow(type__.radial_grid(ir), 2);
-                            }
-                            h_L(lm, 1 + j, i1, i2) = h_L(lm, 1 + j, i2, i1) = s.interpolate().integrate(0);
-                        }
+                    if ((l + l1 + l2) % 2 != 0) {
+                        continue;
                     }
+                    double value;
+                    if (!component && !lm) {
+                        value = rb__.h_spherical_integral(i1, i2);
+                    } else if (simple) {
+                        for (int ir = 0; ir < nmtp; ir++) {
+                            integrand(ir) = (*vns__[field_index])[ia__](lm, ir) * rb__.radial_function(ir, i1) *
+                                            rb__.radial_function(ir, i2) * std::pow(type__.radial_grid(ir), 2);
+                        }
+                        value = integrand.interpolate().integrate(0);
+                    } else {
+                        value = inner(radial[i1], radial[i2] * field, 2);
+                    }
+                    h_L(lm, component, i1, i2) = h_L(lm, component, i2, i1) = value;
                 }
             }
         }
-    } else {
-        //        splindex_block<> spl_lm(lmmax, n_blocks(comm__.size()), block_id(comm__.rank()));
-        //
-        //        /* copy radial functions to spline objects */
-        //        std::vector<Spline<double>> rf_spline(nrf);
-        //        #pragma omp parallel for
-        //        for (int i = 0; i < nrf; i++) {
-        //            rf_spline[i] = Spline<double>(type().radial_grid());
-        //            for (int ir = 0; ir < nmtp; ir++) {
-        //                rf_spline[i](ir) = symmetry_class().radial_function(ir, i);
-        //            }
-        //        }
-        //
-        //        /* copy effective potential components to spline objects */
-        //        std::vector<Spline<double>> v_spline(lmmax * (1 + num_mag_dims));
-        //        #pragma omp parallel for
-        //        for (int lm = 0; lm < lmmax; lm++) {
-        //            v_spline[lm] = Spline<double>(type().radial_grid());
-        //            for (int ir = 0; ir < nmtp; ir++) {
-        //                v_spline[lm](ir) = veff_(lm, ir);
-        //            }
-        //
-        //            for (int j = 0; j < num_mag_dims; j++) {
-        //                v_spline[lm + (j + 1) * lmmax] = Spline<double>(type().radial_grid());
-        //                for (int ir = 0; ir < nmtp; ir++) {
-        //                    v_spline[lm + (j + 1) * lmmax](ir) = beff_[j](lm, ir);
-        //                }
-        //            }
-        //        }
-        //
-        //        /* interpolate potential multiplied by a radial function */
-        //        std::vector<Spline<double>> vrf_spline(lmmax * nrf * (1 + num_mag_dims));
-        //
-        //        auto& idx_ri = type().idx_radial_integrals();
-        //
-        //        mdarray<double, 1> result({idx_ri.size(1)});
-        //
-        //        if (pu__ == device_t::GPU) {
-        //#if defined(SIRIUS_GPU)
-        //            auto& rgrid    = type().radial_grid();
-        //            auto& rf_coef  = type().rf_coef();
-        //            auto& vrf_coef = type().vrf_coef();
-        //
-        //            PROFILE_START("sirius::Atom::generate_radial_integrals|interp");
-        //            #pragma omp parallel
-        //            {
-        //                #pragma omp for
-        //                for (int i = 0; i < nrf; i++) {
-        //                    rf_spline[i].interpolate();
-        //                    std::copy(rf_spline[i].coeffs().at(memory_t::host),
-        //                              rf_spline[i].coeffs().at(memory_t::host) + nmtp * 4, rf_coef.at(memory_t::host, 0, 0, i));
-        //                    // cuda_async_copy_to_device(rf_coef.at<GPU>(0, 0, i), rf_coef.at<CPU>(0, 0, i), nmtp * 4 *
-        //                    // sizeof(double), tid);
-        //                }
-        //                #pragma omp for
-        //                for (int i = 0; i < lmmax * (1 + num_mag_dims); i++) {
-        //                    v_spline[i].interpolate();
-        //                }
-        //            }
-        //            rf_coef.copy_to(memory_t::device, acc::stream_id(-1));
-        //
-        //            #pragma omp parallel for
-        //            for (int lm = 0; lm < lmmax; lm++) {
-        //                for (int i = 0; i < nrf; i++) {
-        //                    for (int j = 0; j < num_mag_dims + 1; j++) {
-        //                        int idx         = lm + lmmax * i + lmmax * nrf * j;
-        //                        vrf_spline[idx] = rf_spline[i] * v_spline[lm + j * lmmax];
-        //                        std::memcpy(vrf_coef.at(memory_t::host, 0, 0, idx), vrf_spline[idx].coeffs().at(memory_t::host),
-        //                                    nmtp * 4 * sizeof(double));
-        //                        // cuda_async_copy_to_device(vrf_coef.at<GPU>(0, 0, idx), vrf_coef.at<CPU>(0, 0, idx), nmtp * 4
-        //                        // *sizeof(double), tid);
-        //                    }
-        //                }
-        //            }
-        //            vrf_coef.copy_to(memory_t::device);
-        //            PROFILE_STOP("sirius::Atom::generate_radial_integrals|interp");
-        //
-        //            result.allocate(memory_t::device);
-        //            spline_inner_product_gpu_v3(idx_ri.at(memory_t::device), (int)idx_ri.size(1), nmtp,
-        //                                        rgrid.x().at(memory_t::device), rgrid.dx().at(memory_t::device),
-        //                                        rf_coef.at(memory_t::device), vrf_coef.at(memory_t::device),
-        //                                        result.at(memory_t::device));
-        //            acc::sync();
-        //            // if (type().parameters().control().print_performance_) {
-        //            //     double tval = t2.stop();
-        //            //     DUMP("spline GPU integration performance: %12.6f GFlops",
-        //            //          1e-9 * double(idx_ri.size(1)) * nmtp * 85 / tval);
-        //            // }
-        //            result.copy_to(memory_t::host);
-        //            result.deallocate(memory_t::device);
-        //#endif
-        //        }
-        //        if (pu__ == device_t::CPU) {
-        //            PROFILE_START("sirius::Atom::generate_radial_integrals|interp");
-        //            #pragma omp parallel
-        //            {
-        //                #pragma omp for
-        //                for (int i = 0; i < nrf; i++) {
-        //                    rf_spline[i].interpolate();
-        //                }
-        //                #pragma omp for
-        //                for (int i = 0; i < lmmax * (1 + num_mag_dims); i++) {
-        //                    v_spline[i].interpolate();
-        //                }
-        //
-        //                #pragma omp for
-        //                for (int lm = 0; lm < lmmax; lm++) {
-        //                    for (int i = 0; i < nrf; i++) {
-        //                        for (int j = 0; j < num_mag_dims + 1; j++) {
-        //                            vrf_spline[lm + lmmax * i + lmmax * nrf * j] = rf_spline[i] * v_spline[lm + j * lmmax];
-        //                        }
-        //                    }
-        //                }
-        //            }
-        //            PROFILE_STOP("sirius::Atom::generate_radial_integrals|interp");
-        //
-        //            PROFILE("sirius::Atom::generate_radial_integrals|inner");
-        //            #pragma omp parallel for
-        //            for (int j = 0; j < (int)idx_ri.size(1); j++) {
-        //                result(j) = inner(rf_spline[idx_ri(0, j)], vrf_spline[idx_ri(1, j)], 2);
-        //            }
-        //            // if (type().parameters().control().print_performance_) {
-        //            //     double tval = t2.stop();
-        //            //     DUMP("spline CPU integration performance: %12.6f GFlops",
-        //            //          1e-9 * double(idx_ri.size(1)) * nmtp * 85 / tval);
-        //            // }
-        //        }
-        //
-        //        int n{0};
-        //        for (int lm = 0; lm < lmmax; lm++) {
-        //            int l = l_by_lm[lm];
-        //
-        //            for (int i2 = 0; i2 < type().indexr().size(); i2++) {
-        //                int l2 = type().indexr(i2).am.l();
-        //                for (int i1 = 0; i1 <= i2; i1++) {
-        //                    int l1 = type().indexr(i1).am.l();
-        //                    if ((l + l1 + l2) % 2 == 0) {
-        //                        if (lm) {
-        //                            h_radial_integrals_(lm, i1, i2) = h_radial_integrals_(lm, i2, i1) = result(n++);
-        //                        } else {
-        //                            h_radial_integrals_(0, i1, i2) = symmetry_class().h_spherical_integral(i1, i2);
-        //                            h_radial_integrals_(0, i2, i1) = symmetry_class().h_spherical_integral(i2, i1);
-        //                        }
-        //                        for (int j = 0; j < num_mag_dims; j++) {
-        //                            b_radial_integrals_(lm, i1, i2, j) = b_radial_integrals_(lm, i2, i1, j) = result(n++);
-        //                        }
-        //                    }
-        //                }
-        //            }
-        //        }
-        //
     }
     return h_L;
 }
@@ -451,6 +315,10 @@ Hamiltonian0<T>::Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radia
 {
     PROFILE("sirius::Hamiltonian0");
 
+    if (ctx_.full_potential() && !lapw_basis_) {
+        lapw_basis_ = potential__.create_lapw_basis();
+    }
+
     local_op_ =
             std::make_unique<Local_operator<T>>(ctx_, ctx_.spfft_coarse<T>(), ctx_.gvec_coarse_fft_sptr(), potential__);
 
@@ -461,7 +329,7 @@ Hamiltonian0<T>::Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radia
             this->generate_pw_coefs(potential__);
         }
     } else {
-        if (!lapw_basis__) {
+        if (!lapw_basis_) {
             RTE_THROW("LAPW radial basis is not provided");
         }
 
@@ -532,7 +400,7 @@ Hamiltonian0<T>::Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radia
             auto& atom = ctx_.unit_cell().atom(ia);
             auto& type = atom.type();
 
-            auto const& rb = lapw_basis__->radial_basis(atom_index_t::global(ia));
+            auto const& rb = lapw_basis_->radial_basis(atom_index_t::global(ia));
 
             auto h_L = generate_h_L(type, rb, vns, ia);
 
@@ -550,8 +418,7 @@ Hamiltonian0<T>::Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radia
                     switch (ctx_.num_mag_dims()) {
                         case 3: {
                             // spin-block index is consistent with non-local pseudopotential operator
-                            // 0: V - Bz
-                            // 1: V + Bz
+                            // 0, 1: V, Bz in second variation; V + Bz, V - Bz otherwise
                             // 2: Bx - i By
                             // 3: Bx + i By
 
@@ -602,11 +469,41 @@ Hamiltonian0<T>::Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radia
         for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
             int rank = unit_cell_.spl_num_atoms().location(typename atom_index_t::global(ia)).ib;
             unit_cell_.comm().bcast(hmt_[ia].at(memory_t::host), static_cast<int>(hmt_[ia].size()), rank);
-            if (pu == device_t::GPU) {
+        }
+        if (auto const* d = potential__.lapw_xc_derivatives()) {
+            // Contract after any radial-basis update, using raw sample covectors.
+            for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+                LAPW_xc_atom op(unit_cell_.atom(ia), lapw_basis().radial_basis(atom_index_t::global(ia)),
+                                ctx_.lmax_rho());
+                for (int s = 0; s < ctx_.num_spins(); s++) {
+                    auto matrix = op.matrix_elements(d->local[ia][0][s], d->local[ia][1][s]);
+                    for (int j = 0; j < unit_cell_.atom(ia).type().mt_basis_size(); j++) {
+                        for (int i = 0; i < unit_cell_.atom(ia).type().mt_basis_size(); i++) {
+                            if (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) {
+                                hmt_[ia](i, j, 0) += static_cast<std::complex<T>>(0.5 * matrix(i, j));
+                                hmt_[ia](i, j, 1) += static_cast<std::complex<T>>(0.5 * (1 - 2 * s) * matrix(i, j));
+                            } else {
+                                hmt_[ia](i, j, s) += static_cast<std::complex<T>>(matrix(i, j));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (pu == device_t::GPU) {
+            for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
                 hmt_[ia].allocate(memory_t::device).copy_to(memory_t::device);
             }
         }
     }
+}
+
+template <typename T>
+Hamiltonian0<T>::Hamiltonian0(Potential& potential__, bool precompute_lapw__, bool update_lapw_rf__)
+    : Hamiltonian0(potential__, !potential__.ctx().full_potential()     ? nullptr
+                                : precompute_lapw__ && update_lapw_rf__ ? potential__.create_lapw_basis()
+                                                                        : potential__.lapw_basis_sptr())
+{
 }
 
 template <typename T>
@@ -850,6 +747,22 @@ Hamiltonian0<T>::generate_pw_coefs(Potential const& potential__)
             }
             default: {
                 break;
+            }
+        }
+    }
+    if (auto const* d = potential__.lapw_xc_derivatives()) {
+        bool second = ctx_.cfg().control().use_second_variation();
+        vtau_pw_    = mdarray<std::complex<T>, 2>({ctx_.gvec().num_gvec(), second ? 1 : ctx_.num_spins()});
+        vtau_pw_.zero();
+        for (int s = 0; s < ctx_.num_spins(); s++) {
+            auto v       = d->rho[s].gather_f_pw();
+            auto t       = d->tau[s].gather_f_pw();
+            int column   = second ? 0 : s;
+            double scale = second ? 1.0 / ctx_.num_spins() : 1.0;
+            for (int ig = 0; ig < ctx_.gvec().num_gvec(); ig++) {
+                // These Fourier covectors already exclude the MT quadrature points.
+                veff_pw_(ig, column) += static_cast<std::complex<T>>(scale * v[ig]);
+                vtau_pw_(ig, column) += static_cast<std::complex<T>>(scale * t[ig]);
             }
         }
     }

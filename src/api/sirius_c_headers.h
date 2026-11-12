@@ -1852,7 +1852,7 @@ sirius_generate_coulomb_potential(void* const* gs_handler__, double* vh_el__, in
 
 /*
 sirius_generate_xc_potential:
-  doc: Generate XC potential using LibXC
+  doc: Generate XC potential using LibXC or the registered external evaluator.
   arguments:
     gs_handler:
       type: gs_handler
@@ -3720,7 +3720,7 @@ sirius_set_xc_point_callback:
     These are real-space integration points, not k points. SIRIUS reconstructs
     the fields from its orbitals. The caller evaluates XC in the same process
     and returns the energy and primitive-field derivatives. SIRIUS maps these
-    derivatives back to the PW Hamiltonian.
+    derivatives back to the PW, PAW or LAPW Hamiltonian.
     Each complete atom block is owned once across the context communicator.
     Empty local arrays are permitted. The callback has the C signature
     void callback(void* user_data, int nr, int ns, int nb, int fcomm,
@@ -3730,23 +3730,23 @@ sirius_set_xc_point_callback:
     const double* tau, double* energy, double* drho, double* dgradient,
     double* dtau, int* status).
     Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr.
-    Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units.
-    ns=1 denotes total fields and ns=2 up/down fields. Weights do not scale
-    the physical fields. Return the same globally summed energy on every rank
-    and raw derivatives of the complete discrete energy, including nonlocal
-    descriptor contributions and weights. Do not divide by quadrature weights
-    or apply the sampling/gradient adjoint in the callback.
-    Output arrays and status are initially zero. On failure set status nonzero
-    after completing callback collectives. Never unwind across the C ABI.
-    The caller retains user_data until the context is destroyed.
-    Supports CPU scalar/collinear fp64 norm-conserving, PAW and ultrasoft
-    calculations without SOC or symmetry reduction. PAW requires setup-consistent
-    AE core tau. Ultrasoft requires the independent kinetic augmentation tables.
-    For nonlinear core correction,
-    supply the matching spin-summed pseudo-core kinetic density as ps_core_tau
-    or core_kinetic_density in the pseudopotential JSON. SIRIUS adds both
-    frozen-core fields before evaluation. Forces and stress require the
-    additional point geometry callbacks.
+    Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1
+    total fields or ns=2 up/down fields.
+    The energy and descriptor weights do not scale those fields.
+    Return raw covectors of the complete discrete energy, including model weights,
+    without dividing by quadrature weights or applying host adjoints. Return the
+    same globally summed energy on every rank, including empty ranks. Arrays and
+    status are initially zero. Set status nonzero on failure after completing
+    callback collectives. Never unwind across the C ABI. The caller retains
+    user_data until the context is destroyed. Geometry changes invalidate the
+    supplied quadrature. Disable crystal symmetry for point XC.
+    Ultrasoft setups additionally supply independent r^2 T_ij^L tables.
+    PW, PAW and ultrasoft are supported on CPU. PAW and nonlinear core corrections
+    require explicitly supplied positive core tau. FP-LAPW fields are supported on
+    CPU with scalar-relativistic radial functions.
+    PW, PAW and ultrasoft forces and stress require the point geometry callbacks.
+    FP-LAPW supports energy and orbital derivatives, but not forces or stress.
+    Explicit cores support NR, ZORA and Dirac relativity.
   arguments:
     handler:
       type: ctx_handler

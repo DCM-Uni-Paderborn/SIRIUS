@@ -42,6 +42,51 @@ periodic_function_property()
                                                          rotate_function);
 }
 
+/// Coulomb-regularized relativistic LAPW tau norm, with unchanged physical mixer algebra.
+FunctionProperties<Periodic_function<double>>
+periodic_function_property_tau()
+{
+    auto property  = periodic_function_property();
+    property.inner = [](Periodic_function<double> const& x, Periodic_function<double> const& y) {
+        auto const& ctx = x.ctx();
+        if (!ctx.full_potential() ||
+            (ctx.valence_relativity() == relativity_t::none &&
+             (ctx.core_relativity() == relativity_t::none || ctx.unit_cell().num_core_electrons() == 0))) {
+            return inner(x, y);
+        }
+        auto result = sirius::inner_local(x.rg(), y.rg(), [&](int ir) { return ctx.theta(ir); });
+        ctx.comm_fft().allreduce(&result, 1);
+        double local{0};
+        for (auto atom : ctx.unit_cell().spl_num_atoms()) {
+            int ia            = atom.i;
+            auto const& type  = ctx.unit_cell().atom(ia).type();
+            bool relativistic = ctx.valence_relativity() != relativity_t::none ||
+                                (type.num_core_electrons() != 0 && ctx.core_relativity() != relativity_t::none);
+            if (!relativistic || type.zn() == 0) {
+                local += inner(x.mt()[ia], y.mt()[ia]);
+                continue;
+            }
+            auto const& grid = type.radial_grid();
+            double gamma     = std::sqrt(1 - std::pow(type.zn() / speed_of_light, 2));
+            Spline<double> product(grid);
+            int lmmax = std::min(x.mt()[ia].angular_domain_size(), y.mt()[ia].angular_domain_size());
+            // Tau can behave as r^(2*gamma-4), which is not square integrable.
+            // Regularize only the mixer norm, matching the ordinary norm at the MT boundary.
+            for (int ir = 0; ir < grid.num_points(); ir++) {
+                double factor = std::pow(grid[ir] / grid.last(), 4 - 2 * gamma);
+                for (int lm = 0; lm < lmmax; lm++) {
+                    product(ir) += (factor * x.mt()[ia](lm, ir)) * (factor * y.mt()[ia](lm, ir));
+                }
+                product(ir) *= grid[ir] * grid[ir];
+            }
+            local += product.interpolate().integrate(0);
+        }
+        ctx.comm().allreduce(&local, 1);
+        return result + local;
+    };
+    return property;
+}
+
 /// Only for the PP-PW case.
 FunctionProperties<Periodic_function<double>>
 periodic_function_property_rho_pw(bool use_coarse_gvec__)

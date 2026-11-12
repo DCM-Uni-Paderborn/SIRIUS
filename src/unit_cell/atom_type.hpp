@@ -198,7 +198,9 @@ class Atom_type
     /// Pseudo-core charge density (used by PP-PW method in non-linear core correction).
     std::vector<double> ps_core_charge_density_;
 
-    /// Spin-summed positive pseudo-core kinetic energy density on the radial grid.
+    /// Setup-supplied spin-summed positive pseudo-core tau for nonlinear XC corrections.
+    /** Point values in bohr^-5, including occupations and 1/2, without radial
+     *  or angular weights. This is distinct from the AE frozen-core tau. */
     std::vector<double> ps_core_kinetic_density_;
 
     /// Total pseudo-charge density (used by PP-PW method to setup initial density).
@@ -586,38 +588,42 @@ class Atom_type
         return ps_core_charge_density_;
     }
 
-    auto const&
-    ps_core_kinetic_density() const
-    {
-        return ps_core_kinetic_density_;
-    }
-
     bool
     has_ps_core_kinetic_density() const
     {
         return !ps_core_kinetic_density_.empty();
     }
 
-    void
-    check_ps_core_kinetic_density() const
+    std::vector<double> const&
+    ps_core_kinetic_density() const
     {
-        auto const& rho = ps_core_charge_density_;
-        bool has_charge = std::any_of(rho.begin(), rho.end(), [](double n) { return n != 0; });
-        auto nr         = static_cast<size_t>(num_mt_points());
-        if (rho.size() > nr || std::any_of(rho.begin(), rho.end(), [](double n) { return !std::isfinite(n); }) ||
-            ((has_charge || has_ps_core_kinetic_density()) && (nr < 4 || ps_core_kinetic_density_.size() != nr))) {
-            RTE_THROW("external XC with core charge requires matching pseudo-core kinetic density");
+        if (!has_ps_core_kinetic_density() || ps_core_kinetic_density_.size() != static_cast<size_t>(num_mt_points())) {
+            RTE_THROW("positive pseudo-core kinetic density is unavailable on the current radial grid");
         }
+        return ps_core_kinetic_density_;
     }
 
     void
     ps_core_kinetic_density(std::vector<double> values__)
     {
-        if (values__.empty() ||
+        if (values__.empty() || values__.size() != static_cast<size_t>(num_mt_points()) ||
             std::any_of(values__.begin(), values__.end(), [](double t) { return !std::isfinite(t) || t < 0; })) {
-            RTE_THROW("pseudo-core kinetic density must be finite and nonnegative");
+            RTE_THROW("positive pseudo-core kinetic density must be finite, nonnegative and cover the radial grid");
         }
         ps_core_kinetic_density_ = std::move(values__);
+    }
+
+    void
+    check_ps_core_kinetic_density() const
+    {
+        auto const& rho = ps_core_charge_density_;
+        if ((!rho.empty() && rho.size() != static_cast<size_t>(num_mt_points())) ||
+            std::any_of(rho.begin(), rho.end(), [](double n) { return !std::isfinite(n) || n < 0; })) {
+            RTE_THROW("pseudo-core charge density must be finite, nonnegative and cover the radial grid");
+        }
+        if (std::any_of(rho.begin(), rho.end(), [](double n) { return n != 0; }) || has_ps_core_kinetic_density()) {
+            ps_core_kinetic_density();
+        }
     }
 
     inline std::vector<double>&
@@ -834,6 +840,10 @@ class Atom_type
     {
         return num_core_electrons_;
     }
+
+    /// Extend the spherical MT potential with the shifted free-atom tail for core states.
+    std::pair<Radial_grid<double>, std::vector<double>>
+    core_radial_problem(std::vector<double> const& spherical_potential__) const;
 
     inline double
     num_valence_electrons() const

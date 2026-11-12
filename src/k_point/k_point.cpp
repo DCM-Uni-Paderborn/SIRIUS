@@ -354,6 +354,7 @@ K_point<T>::generate_gkvec(double gk_cutoff__)
     splindex_block_cyclic<> spl_ngk_col(num_gkvec(), n_blocks(num_ranks_col_), block_id(rank_col_),
                                         ctx_.cyclic_block_size());
     num_gkvec_col_ = spl_ngk_col.local_size();
+
     mdarray<int, 2> gkvec_col({3, num_gkvec_col_});
 
     for (int rank = 0; rank < comm().size(); rank++) {
@@ -389,6 +390,9 @@ K_point<T>::update()
 
     gkvec_->lattice_vectors(unit_cell_.reciprocal_lattice_vectors());
     gkvec_partition_->update_gkvec_cart();
+    // Matrix construction and projectors use separate block-cyclic copies.
+    gkvec_row_->lattice_vectors(unit_cell_.reciprocal_lattice_vectors());
+    gkvec_col_->lattice_vectors(unit_cell_.reciprocal_lattice_vectors());
 
     if (ctx_.full_potential()) {
         bool all_atoms = {false};
@@ -530,6 +534,7 @@ template <typename T>
 void
 K_point<T>::save(std::string const& name__, int id__) const
 {
+    int num_slots = ctx_.num_spins();
     std::unique_ptr<HDF5_tree> fout;
     /* rank 0 opens a file and writes common data */
     if (comm().rank() == 0) {
@@ -558,7 +563,7 @@ K_point<T>::save(std::string const& name__, int id__) const
         for (int i = 0; i < ctx_.num_bands(); i++) {
             out["K_point_set"][id__]["bands"].create_node(i);
             out["K_point_set"][id__]["bands"][i].create_node("spinor_wave_function");
-            for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+            for (int ispn = 0; ispn < num_slots; ispn++) {
                 out["K_point_set"][id__]["bands"][i]["spinor_wave_function"].create_node(ispn);
                 ///* new format */
                 //fout["K_point_set"][id__]["bands"][i].create_node(ispn);
@@ -568,7 +573,7 @@ K_point<T>::save(std::string const& name__, int id__) const
 
     /* store wave-functions */
     for (int i = 0; i < ctx_.num_bands(); i++) {
-        for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+        for (int ispn = 0; ispn < num_slots; ispn++) {
             /* gather wave-functions */
             auto wf = this->spinor_wave_functions().gather(wf::spin_index(ispn), wf::band_index(i));
             if (comm().rank() == 0) {
@@ -588,6 +593,7 @@ template <typename T>
 void
 K_point<T>::load(HDF5_tree h5in__)
 {
+    int num_slots = ctx_.num_spins();
     h5in__.read("band_energies", band_energies_);
     h5in__.read("band_occupancies", band_occupancies_);
     int num_gkvec_in;
@@ -607,7 +613,7 @@ K_point<T>::load(HDF5_tree h5in__)
     std::vector<std::complex<T>> tmp(num_gkvec());
 
     for (int i = 0; i < ctx_.num_bands(); i++) {
-        for (int ispn = 0; ispn < ctx_.num_spins(); ispn++) {
+        for (int ispn = 0; ispn < num_slots; ispn++) {
             /* gather wave-functions */
             std::vector<std::complex<T>> wf(num_gkvec() + unit_cell_.mt_aw_basis_size() +
                                             unit_cell_.mt_lo_basis_size());

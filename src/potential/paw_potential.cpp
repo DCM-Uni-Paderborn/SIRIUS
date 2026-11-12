@@ -12,6 +12,7 @@
  */
 
 #include "potential.hpp"
+#include "density/paw_local_fields.hpp"
 #include "symmetry/symmetrize_mt_function.hpp"
 
 namespace sirius {
@@ -58,6 +59,7 @@ Potential::generate_PAW_effective_potential(Density const& density)
     paw_ps_exc_->zero();
 
     paw_hartree_total_energy_ = 0.0;
+    paw_meta_energy_          = 0.0;
 
     /* calculate xc and hartree for atoms */
     for (auto it : unit_cell_.spl_num_paw_atoms()) {
