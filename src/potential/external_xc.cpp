@@ -467,12 +467,315 @@ Potential::xc_external_points(Density const& density__)
     }
 }
 
+void
+Potential::external_xc_point_response(xc_callback_input_t const& input__, xc_callback_direction_t const& direction__,
+                                      xc_callback_response_t& output__) const
+{
+    int failed = !ctx_.cb().external_xc_response_ || !input__.points || input__.num_points < 0 ||
+                 input__.num_spins != ctx_.num_mag_dims() + 1 ||
+                 ((direction__.geometry || output__.geometry) && !ctx_.cb().external_xc_geometry_response_);
+    if (input__.points) {
+        failed |= size_t(input__.num_points) != input__.points->coordinates.size();
+    }
+    auto geometry_matches = [&](auto const* g) {
+        return !g || (input__.points && g->coordinates.size() == input__.points->coordinates.size() &&
+                      g->block_centres.size() == input__.points->block_centres.size() &&
+                      g->energy_weights.size() == input__.points->energy_weights.size() &&
+                      g->descriptor_weights.size() == input__.points->descriptor_weights.size());
+    };
+    failed |= !geometry_matches(direction__.geometry) || !geometry_matches(output__.geometry);
+    auto finite = [&](double const* p, size_t n) {
+        if (!p && n) {
+            return false;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (!std::isfinite(p[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
+    size_t n = size_t(std::max(0, input__.num_points)) * (ctx_.num_mag_dims() + 1);
+    failed |= !finite(input__.rho, n) || !finite(input__.gradient, 3 * n) || !finite(input__.tau, n) ||
+              !finite(direction__.rho, n) || !finite(direction__.gradient, 3 * n) || !finite(direction__.tau, n) ||
+              (!output__.vrho && n) || (!output__.vgradient && n) || (!output__.vtau && n);
+    auto finite_geometry = [&](auto const* g) {
+        if (!g) {
+            return true;
+        }
+        for (auto const* a : {&g->coordinates, &g->block_centres}) {
+            for (auto const& r : *a) {
+                if (!finite(r.data(), 3)) {
+                    return false;
+                }
+            }
+        }
+        return finite(g->energy_weights.data(), g->energy_weights.size()) &&
+               finite(g->descriptor_weights.data(), g->descriptor_weights.size());
+    };
+    failed |= !finite_geometry(direction__.geometry);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("invalid external XC point response inputs or unsupported quadrature direction");
+    }
+    std::string message;
+    try {
+        ctx_.cb().external_xc_response_(ctx_, input__, direction__, output__);
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    failed |= !finite(output__.vrho, n) || !finite(output__.vgradient, 3 * n) || !finite(output__.vtau, n) ||
+              !finite_geometry(output__.geometry);
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external XC point response failed or returned nonfinite output on a context rank: " + message);
+    }
+}
+
+lapw_xc_field_adjoint_t
+Potential::lapw_external_xc_response(Density const& density__, Density const& density_response__) const
+{
+    PROFILE("sirius::Potential::lapw_external_xc_response");
+    int failed = !ctx_.full_potential() || !ctx_.cb().external_xc_ || !ctx_.cb().external_xc_points_ ||
+                 !ctx_.cb().external_xc_response_ || &density__.ctx() != &ctx_ || &density_response__.ctx() != &ctx_ ||
+                 !density__.has_kinetic_density() || !density_response__.has_kinetic_density() ||
+                 add_delta_rho_xc_ != 0 || add_delta_mag_xc_ != 0;
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external LAPW XC response requires matching physical fields and a point-response callback");
+    }
+    validate_external_xc_context(ctx_);
+    auto const& quadrature = *ctx_.cb().external_xc_points_;
+    std::vector<r3::vector<double>> points;
+    for (auto const& r : quadrature.coordinates) {
+        points.emplace_back(r[0], r[1], r[2]);
+    }
+    LAPW_xc_field_map map(density__, points), direction_map(density_response__, points);
+    auto smooth           = external_xc_smooth_fields(ctx_, density__);
+    auto smooth_direction = external_xc_smooth_fields(ctx_, density_response__);
+    auto fields           = map.sample(smooth[0], smooth[1]);
+    auto direction        = direction_map.sample(smooth_direction[0], smooth_direction[1]);
+    if (ctx_.use_symmetry()) {
+        fields    = quadrature.symmetry(ctx_).apply(fields);
+        direction = quadrature.symmetry(ctx_).apply(direction);
+    }
+    int nf = ctx_.num_mag_dims() + 1;
+    xc_point_fields_t response(points.size(), nf);
+    response.rho.zero();
+    response.gradient.zero();
+    response.tau.zero();
+    xc_callback_input_t input{static_cast<int>(points.size()),
+                              nf,
+                              0,
+                              fields.rho.at(memory_t::host),
+                              fields.gradient.at(memory_t::host),
+                              fields.tau.at(memory_t::host),
+                              &quadrature};
+    xc_callback_direction_t delta{direction.rho.at(memory_t::host), direction.gradient.at(memory_t::host),
+                                  direction.tau.at(memory_t::host)};
+    xc_callback_response_t output{response.rho.at(memory_t::host), response.gradient.at(memory_t::host),
+                                  response.tau.at(memory_t::host)};
+    external_xc_point_response(input, delta, output);
+    if (ctx_.use_symmetry()) {
+        response = quadrature.symmetry(ctx_).apply(response, true);
+    }
+    return map.adjoint(response);
+}
+
+xc_point_derivatives_t
+Potential::external_xc_quadrature_direction(xc_geometry_direction_t const& direction__) const
+{
+    int failed = !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_quadrature_direction_ ||
+                 direction__.atoms.size() != static_cast<size_t>(ctx_.unit_cell().num_atoms());
+    std::vector<double> lo(direction__.lattice.begin(), direction__.lattice.end());
+    for (auto const& r : direction__.atoms) {
+        lo.insert(lo.end(), r.begin(), r.end());
+    }
+    for (auto x : lo) {
+        failed |= !std::isfinite(x);
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("quadrature direction requires a host callback and finite matching atom/cell directions");
+    }
+    auto hi = lo;
+    ctx_.comm().allreduce<double, mpi::op_t::min>(lo.data(), lo.size());
+    ctx_.comm().allreduce<double, mpi::op_t::max>(hi.data(), hi.size());
+    if (lo != hi) {
+        RTE_THROW("quadrature atom/cell directions differ between context ranks");
+    }
+    auto const& q = *ctx_.cb().external_xc_points_;
+    q.validate(ctx_);
+    xc_point_derivatives_t result(q);
+    std::string message;
+    try {
+        ctx_.cb().external_xc_quadrature_direction_(ctx_, q, direction__, result);
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    failed |= result.coordinates.size() != q.coordinates.size() ||
+              result.block_centres.size() != q.block_centres.size() ||
+              result.energy_weights.size() != q.energy_weights.size() ||
+              result.descriptor_weights.size() != q.descriptor_weights.size();
+    for (auto const* a : {&result.coordinates, &result.block_centres}) {
+        for (auto const& r : *a) {
+            for (auto x : r) {
+                failed |= !std::isfinite(x);
+            }
+        }
+    }
+    for (auto const* a : {&result.energy_weights, &result.descriptor_weights}) {
+        for (auto x : *a) {
+            failed |= !std::isfinite(x);
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("host quadrature direction failed or returned invalid output: " + message);
+    }
+    return result;
+}
+
+lapw_xc_field_adjoint_t
+Potential::lapw_external_xc_geometry_response(Density const& density__,
+                                              xc_geometry_direction_t const& direction__) const
+{
+    auto quadrature = external_xc_quadrature_direction(direction__);
+    mdarray<double, 2> atoms({3, ctx_.unit_cell().num_atoms()});
+    r3::matrix<double> lattice;
+    for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
+        for (int x = 0; x < 3; x++) {
+            atoms(x, ia) = direction__.atoms[ia][x];
+        }
+    }
+    for (int y = 0; y < 3; y++) {
+        for (int x = 0; x < 3; x++) {
+            lattice(x, y) = direction__.lattice[x + 3 * y];
+        }
+    }
+    return lapw_external_xc_geometry_response(density__, quadrature, atoms, lattice);
+}
+
+lapw_xc_field_adjoint_t
+Potential::lapw_external_xc_geometry_response(Density const& density__,
+                                              xc_point_derivatives_t const& quadrature_direction__,
+                                              mdarray<double, 2> const& atom_directions__,
+                                              r3::matrix<double> const& lattice_direction__) const
+{
+    PROFILE("sirius::Potential::lapw_external_xc_geometry_response");
+    int failed = !ctx_.full_potential() || !ctx_.cb().external_xc_ || !ctx_.cb().external_xc_points_ ||
+                 !ctx_.cb().external_xc_response_ || !ctx_.cb().external_xc_geometry_response_ ||
+                 &density__.ctx() != &ctx_ || !density__.has_kinetic_density() || add_delta_rho_xc_ != 0 ||
+                 add_delta_mag_xc_ != 0;
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external LAPW XC geometry response requires physical fields and a joint point Hessian");
+    }
+    validate_external_xc_context(ctx_);
+    auto const& q = *ctx_.cb().external_xc_points_;
+    std::vector<r3::vector<double>> points, point_directions;
+    for (auto const& r : q.coordinates) {
+        points.emplace_back(r[0], r[1], r[2]);
+    }
+    for (auto const& r : quadrature_direction__.coordinates) {
+        point_directions.emplace_back(r[0], r[1], r[2]);
+    }
+    LAPW_xc_field_map map(density__, points);
+    auto smooth     = external_xc_smooth_fields(ctx_, density__);
+    auto raw_fields = map.sample(smooth[0], smooth[1]);
+    auto fields     = ctx_.use_symmetry() ? q.symmetry(ctx_).apply(raw_fields) : std::move(raw_fields);
+    auto direction =
+            map.geometry_response(smooth[0], smooth[1], point_directions, atom_directions__, lattice_direction__);
+    if (ctx_.use_symmetry()) {
+        direction     = q.symmetry(ctx_).apply(direction);
+        auto rotation = q.symmetry(ctx_).apply(raw_fields, false, &lattice_direction__);
+        for (size_t i = 0; i < direction.gradient.size(); i++) {
+            direction.gradient[i] += rotation.gradient[i];
+        }
+    }
+    int nf = ctx_.num_mag_dims() + 1;
+    xc_point_fields_t response(points.size(), nf), base(points.size(), nf);
+    response.rho.zero();
+    response.gradient.zero();
+    response.tau.zero();
+    base.rho.zero();
+    base.gradient.zero();
+    base.tau.zero();
+    xc_callback_input_t input{
+            static_cast<int>(points.size()), nf, 0, fields.rho.at(memory_t::host), fields.gradient.at(memory_t::host),
+            fields.tau.at(memory_t::host),   &q};
+    xc_callback_direction_t delta{direction.rho.at(memory_t::host), direction.gradient.at(memory_t::host),
+                                  direction.tau.at(memory_t::host), &quadrature_direction__};
+    xc_callback_response_t output{response.rho.at(memory_t::host), response.gradient.at(memory_t::host),
+                                  response.tau.at(memory_t::host)};
+    external_xc_point_response(input, delta, output);
+    xc_callback_output_t v{0, base.rho.at(memory_t::host), base.gradient.at(memory_t::host),
+                           base.tau.at(memory_t::host)};
+    std::string message;
+    try {
+        ctx_.cb().external_xc_(ctx_, input, v);
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    failed |= !std::isfinite(v.energy);
+    for (auto const* f : {&base.rho, &base.tau}) {
+        for (size_t i = 0; i < f->size(); i++) {
+            failed |= !std::isfinite((*f)[i]);
+        }
+    }
+    for (size_t i = 0; i < base.gradient.size(); i++) {
+        failed |= !std::isfinite(base.gradient[i]);
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external XC callback failed during the sampling-transpose geometry response: " + message);
+    }
+    if (ctx_.use_symmetry()) {
+        response      = q.symmetry(ctx_).apply(response, true);
+        auto rotation = q.symmetry(ctx_).apply(base, true, &lattice_direction__);
+        for (size_t i = 0; i < response.gradient.size(); i++) {
+            response.gradient[i] += rotation.gradient[i];
+        }
+        base = q.symmetry(ctx_).apply(base, true);
+    }
+    auto result   = map.adjoint(response);
+    auto sampling = map.geometry_adjoint_response(base, point_directions, atom_directions__, lattice_direction__);
+    for (int s = 0; s < nf; s++) {
+        for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
+            result.rho[s].f_pw_local(ig) += sampling.rho[s].f_pw_local(ig);
+            result.tau[s].f_pw_local(ig) += sampling.tau[s].f_pw_local(ig);
+            for (auto z : {result.rho[s].f_pw_local(ig), result.tau[s].f_pw_local(ig)}) {
+                failed |= !std::isfinite(z.real()) || !std::isfinite(z.imag());
+            }
+        }
+    }
+    for (size_t ia = 0; ia < result.local.size(); ia++) {
+        for (int part = 0; part < 2; part++) {
+            for (int s = 0; s < nf; s++) {
+                for (size_t i = 0; i < result.local[ia][part][s].size(); i++) {
+                    result.local[ia][part][s][i] += sampling.local[ia][part][s][i];
+                    failed |= !std::isfinite(result.local[ia][part][s][i]);
+                }
+            }
+            for (size_t i = 0; i < result.core[ia][part].size(); i++) {
+                result.core[ia][part][i] += sampling.core[ia][part][i];
+                failed |= !std::isfinite(result.core[ia][part][i]);
+            }
+        }
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external LAPW XC geometry response returned nonfinite combined covectors");
+    }
+    return result;
+}
+
 xc_geometry_derivatives_t
 Potential::external_xc_geometry(Density const& density__) const
 {
-    if (ctx_.full_potential()) {
-        RTE_THROW("external XC geometry derivatives are not available for FP-LAPW");
-    }
     int failed = !ctx_.cb().external_xc_ || !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_geometry_ ||
                  !ctx_.cb().external_xc_pullback_ || !density__.has_kinetic_density() || add_delta_rho_xc_ != 0 ||
                  add_delta_mag_xc_ != 0;
@@ -512,7 +815,8 @@ Potential::external_xc_geometry(Density const& density__) const
         }
         return map.geometry_adjoint(smooth[0], smooth[1], derivatives);
     };
-    auto mapped = evaluate(PAW_xc_field_map(density__, points));
+    auto mapped = ctx_.full_potential() ? evaluate(LAPW_xc_field_map(density__, points))
+                                        : evaluate(PAW_xc_field_map(density__, points));
     for (size_t p = 0; p < points.size(); p++) {
         for (int x = 0; x < 3; x++) {
             geometry.coordinates[p][x] += mapped.points[p][x];

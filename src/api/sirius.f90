@@ -7086,7 +7086,7 @@ endif
 end subroutine sirius_set_dftd4_correction
 
 !
-!> @brief Register an external XC evaluator before initializing the context. SIRIUS supplies fields generated from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. The callback is collective on the context communicator and has the C signature void callback(void* user_data, int nr, int ns, const int* grid_dims, int z_offset, int fcomm_context, int fcomm_fft, const double* lattice, double weight, const double* rho, const double* gradient, const double* tau, double* energy, double* vrho, double* vgradient, double* vtau, int* status). All fields use atomic units. Scalar arrays have Fortran shape (nr,ns), gradients (nr,3,ns), and lattice (3,3) with lattice vectors in columns. grid_dims contains the three global FFT dimensions. Local points are a contiguous z slab starting at zero-based z_offset, with x varying fastest. ns=1 denotes total density and tau, ns=2 denotes up and down channels. weight is the volume per FFT point. Return the same total XC energy on every context rank, including ranks with an empty slab. FFT replicas must not be counted twice. fcomm_fft partitions one complete grid. Return derivatives of the full discrete energy divided by weight. SIRIUS applies the gradient adjoint and tau operator itself. Output arrays and status are initially zero. On failure set status nonzero after completing all callback collectives. Do not unwind across the C ABI. The caller owns user_data and keeps it alive until the context is destroyed. A null function pointer disables the callback before context initialization. Currently supported for CPU norm-conserving PW calculations without core charge, SOC, or noncollinear magnetism. Forces and stress are not supported.
+!> @brief Register an external XC evaluator before initializing the context. SIRIUS supplies fields generated from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. The callback is collective on the context communicator and has the C signature void callback(void* user_data, int nr, int ns, const int* grid_dims, int z_offset, int fcomm_context, int fcomm_fft, const double* lattice, double weight, const double* rho, const double* gradient, const double* tau, double* energy, double* vrho, double* vgradient, double* vtau, int* status). All fields use atomic units. Scalar arrays have Fortran shape (nr,ns), gradients (nr,3,ns), and lattice (3,3) with lattice vectors in columns. grid_dims contains the three global FFT dimensions. Local points are a contiguous z slab starting at zero-based z_offset, with x varying fastest. ns=1 denotes total density and tau, ns=2 denotes up and down channels. weight is the volume per FFT point. Return the same total XC energy on every context rank, including ranks with an empty slab. FFT replicas must not be counted twice. fcomm_fft partitions one complete grid. Return derivatives of the full discrete energy divided by weight. SIRIUS applies the gradient adjoint and tau operator itself. Output arrays and status are initially zero. On failure set status nonzero after completing all callback collectives. Do not unwind across the C ABI. The caller owns user_data and keeps it alive until the context is destroyed. A null function pointer disables the callback before context initialization. Currently supported for CPU/GPU norm-conserving PW calculations without core charge, SOC, or noncollinear magnetism. Forces and stress are not supported.
 !> @param [in] handler Simulation context handler.
 !> @param [in] fptr Pointer to a C-interoperable XC callback.
 !> @param [in] user_data Opaque callback state, which may be null.
@@ -7123,7 +7123,7 @@ call sirius_set_xc_callback_aux(handler_ptr,fptr,user_data,error_code_ptr)
 end subroutine sirius_set_xc_callback
 
 !
-!> @brief Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature before initializing the context, after defining all atoms and lattice vectors. These are real-space integration points, not k points. SIRIUS reconstructs the fields from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. SIRIUS maps these derivatives back to the PW, PAW or LAPW Hamiltonian. Each complete atom block is owned once across the context communicator. Empty local arrays are permitted. The callback has the C signature void callback(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, double* energy, double* drho, double* dgradient, double* dtau, int* status). Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr. Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1 total fields or ns=2 up/down fields. Explicit sirius_set_xc_spinor_mode registration instead supplies ns=4 total/z/x/y fields for norm-conserving PW, PAW, ultrasoft, and FP-LAPW. They are jointly reconstructed before the callback. The energy and descriptor weights do not scale those fields. Return raw covectors of the complete discrete energy, including model weights, without dividing by quadrature weights or applying host adjoints. Return the same globally summed energy on every rank, including empty ranks. Arrays and status are initially zero. Set status nonzero on failure after completing callback collectives. Never unwind across the C ABI. The caller retains user_data until the context is destroyed. Geometry changes invalidate the supplied quadrature. Crystal symmetry requires a symmetry-closed atom quadrature, preserving both weight arrays. The complete point set is retained while k-points may be reduced. Ultrasoft setups additionally supply independent r^2 T_ij^L tables. PW, PAW and ultrasoft are supported on CPU/GPU. PAW and nonlinear core corrections require explicitly supplied positive core tau. FP-LAPW fields are supported on CPU/GPU with scalar-relativistic or native Dirac radial functions. PW, PAW and ultrasoft forces and stress require the point geometry callbacks. FP-LAPW supports energy and orbital derivatives, but not forces or stress. Noncollinear states use NR/ZORA second variation with SOC or native Dirac full variation. Explicit cores support NR, ZORA and Dirac relativity with scalar valence radial functions. Native Dirac valence requires Dirac cores.
+!> @brief Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature before initializing the context, after defining all atoms and lattice vectors. These are real-space integration points, not k points. SIRIUS reconstructs the fields from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. SIRIUS maps these derivatives back to the PW, PAW or LAPW Hamiltonian. Each complete atom block is owned once across the context communicator. Empty local arrays are permitted. The callback has the C signature void callback(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, double* energy, double* drho, double* dgradient, double* dtau, int* status). Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr. Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1 total fields or ns=2 up/down fields. Explicit sirius_set_xc_spinor_mode registration instead supplies ns=4 total/z/x/y fields for norm-conserving PW, PAW, ultrasoft, and FP-LAPW. They are jointly reconstructed before the callback. The energy and descriptor weights do not scale those fields. Return raw covectors of the complete discrete energy, including model weights, without dividing by quadrature weights or applying host adjoints. Return the same globally summed energy on every rank, including empty ranks. Arrays and status are initially zero. Set status nonzero on failure after completing callback collectives. Never unwind across the C ABI. The caller retains user_data until the context is destroyed. Geometry changes invalidate the supplied quadrature. Crystal symmetry requires a symmetry-closed atom quadrature, preserving both weight arrays. The complete point set is retained while k-points may be reduced. Ultrasoft setups additionally supply independent r^2 T_ij^L tables. PW, PAW and ultrasoft are supported on CPU/GPU. PAW and nonlinear core corrections require explicitly supplied positive core tau. FP-LAPW fields are supported on CPU/GPU with scalar-relativistic or native Dirac radial functions. PW, PAW and ultrasoft atomic forces and stress additionally require the point geometry callbacks. FP-LAPW forces and total stress also require joint Hessian and quadrature-direction callbacks and CPU/GPU fp64 orbitals. Scalar and collinear states use full variation. Noncollinear states use NR/ZORA second variation with SOC or native Dirac full variation, including the radial-basis response. Explicit cores support NR, ZORA and Dirac relativity with scalar valence radial functions; native Dirac valence requires Dirac cores.
 !> @param [in] handler Simulation context handler.
 !> @param [in] fptr C-interoperable point callback. Null disables external XC.
 !> @param [in] user_data Opaque callback state, which may be null.
@@ -7206,7 +7206,7 @@ call sirius_set_xc_point_callback_aux(handler_ptr,fptr,user_data,num_points_ptr,
 end subroutine sirius_set_xc_point_callback
 
 !
-!> @brief Opt into total/z/x/y fields for all registered point XC callbacks before initializing the context. Their ns argument becomes four; array storage remains (nr,ns) and (nr,3,ns). The energy and any geometry callback must use the same convention. No local spin-axis rotation is applied. FP-LAPW spinors use NR/ZORA second variation including SOC or native Dirac full variation without a separate SOC correction. Scalar and collinear registrations retain their total and up/down fields when this mode is disabled. Registering a new energy callback resets the mode to disabled. Called collectively on the context communicator with the same enabled value.
+!> @brief Opt into total/z/x/y fields for all registered point XC callbacks before initializing the context. Their ns argument becomes four; array storage remains (nr,ns) and (nr,3,ns). Energy, response and geometry callbacks must implement this convention together. No local spin-axis rotation is applied. Supported for norm-conserving PW and PAW spinors, including SOC, forces and stress with the point geometry callbacks. FP-LAPW spinors support energy, orbital derivatives and field Hessian actions on CPU/GPU with NR/ZORA second variation including SOC, or native Dirac full variation without a separate SOC correction. Complete forces and stress, including radial-basis motion, require CPU/GPU fp64 orbitals and the joint Hessian and quadrature-direction callbacks. Scalar/collinear registrations retain their original total/up-down convention when this mode is disabled. Registering a new energy callback resets the mode to disabled. Called collectively on the context communicator with the same enabled value.
 !> @param [in] handler Simulation context handler.
 !> @param [in] enabled Enable the four-component point callback convention.
 !> @param [out] error_code Error code.
@@ -7321,7 +7321,7 @@ call sirius_update_xc_point_set_aux(handler_ptr,num_points_ptr,num_blocks_ptr,co
 end subroutine sirius_update_xc_point_set
 
 !
-!> @brief Register optional geometry callbacks after the point XC evaluator and before context initialization. The field callback has the same C arguments as the point XC callback, with four additional double pointers before status. These return raw coordinate (3,nr), energy-weight (nr), descriptor-weight (nr) and block-centre (3,nb) derivatives at fixed physical fields. Evaluate the same discrete energy and field derivatives as the point callback. All explicit atom/cell dependence must enter through these quadrature inputs. The pullback callback has C signature void pullback(void* user_data, int nr, int nb, int natom, int fcomm, const int* block_sizes, const double* dcoordinates, const double* denergy_weights, const double* ddescriptor_weights, const double* dblock_centres, double* datoms, double* dlattice, int* status). SIRIUS adds field-sampling derivatives to dcoordinates before the pullback. The host returns globally summed Cartesian atom (3,natom) and cell (3,3) derivatives, identical on every rank. Lattice vectors are columns and the cell derivative holds Cartesian atoms fixed. Apply no force sign or volume normalization. SIRIUS adds the Fourier cell response and the PW normalization and kinetic-density metric terms when evaluating total stress. Callbacks are collective, including empty ranks. Outputs start at zero. Set status nonzero on failure without unwinding across the C ABI. Both null pointers disable geometry evaluation. The initial scope matches the CPU scalar/collinear norm-conserving point XC evaluator.
+!> @brief Register optional geometry callbacks after the point XC evaluator and before context initialization. The field callback has the same C arguments as the point XC callback, with four additional double pointers before status. These return raw coordinate (3,nr), energy-weight (nr), descriptor-weight (nr) and block-centre (3,nb) derivatives at fixed physical fields. The pullback callback has C signature void pullback(void* user_data, int nr, int nb, int natom, int fcomm, const int* block_sizes, const double* dcoordinates, const double* denergy_weights, const double* ddescriptor_weights, const double* dblock_centres, double* datoms, double* dlattice, int* status). SIRIUS adds field-sampling derivatives to dcoordinates before the pullback. The host returns globally summed Cartesian atom (3,natom) and cell (3,3) derivatives, identical on every rank. Lattice vectors are columns and the cell derivative holds Cartesian atoms fixed. Apply no force sign or volume normalization. SIRIUS adds explicit atom-local and Fourier cell responses. Callbacks are collective, including empty ranks. Outputs start at zero. Set status nonzero on failure without unwinding across the C ABI. Both null pointers disable geometry evaluation. For PW and PAW, these callbacks supply the explicit XC contribution to atomic forces and stress. FP-LAPW forces and total stress additionally require the joint Hessian and quadrature-direction callbacks for the self-consistent valence and tau-dependent core response. Supported relativity combinations are specified in sirius_set_xc_point_callback.
 !> @param [in] handler Simulation context handler.
 !> @param [in] field_fptr C-interoperable field and geometry evaluator.
 !> @param [in] pullback_fptr C-interoperable quadrature pullback.
@@ -7362,6 +7362,156 @@ endif
 call sirius_set_xc_point_geometry_callbacks_aux(handler_ptr,field_fptr,pullback_fptr,&
 &user_data,error_code_ptr)
 end subroutine sirius_set_xc_point_geometry_callbacks
+
+!
+!> @brief Register a host quadrature forward derivative after the point XC evaluator and before context initialization. Its C signature is void direction(void* user_data, int nr, int nb, int natom, int fcomm, const int* block_sizes, const double* delta_atoms, const double* delta_lattice, double* delta_coordinates, double* delta_energy_weights, double* delta_descriptor_weights, double* delta_block_centres, int* status). Atom (3,natom) and lattice-column (3,3) directions are replicated Cartesian bohr arrays. They are independent, with no implicit affine atom motion. Outputs have the local point callback's Fortran shapes and start at zero. Differentiate both independent weights at fixed row topology and radial/angular rules. The callback is collective, including empty ranks. Set status nonzero on failure without unwinding across the C ABI. A null pointer disables it.
+!> @param [in] handler Simulation context handler.
+!> @param [in] fptr C-interoperable host quadrature direction callback.
+!> @param [in] user_data Caller-owned state retained until context destruction.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_quadrature_direction_callback(handler,fptr,user_data,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+type(C_FUNPTR), value, intent(in) :: fptr
+type(C_PTR), value, intent(in) :: user_data
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_quadrature_direction_callback_aux(handler,fptr,user_data,&
+&error_code)&
+&bind(C, name="sirius_set_xc_quadrature_direction_callback")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_FUNPTR), value :: fptr
+type(C_PTR), value :: user_data
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_quadrature_direction_callback_aux(handler_ptr,fptr,user_data,&
+&error_code_ptr)
+end subroutine sirius_set_xc_quadrature_direction_callback
+
+!
+!> @brief Register a fixed-geometry XC Hessian-vector evaluator after the point XC callback and before context initialization. Its C signature is void response(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, const double* delta_rho, const double* delta_gradient, const double* delta_tau, double* delta_vrho, double* delta_vgradient, double* delta_vtau, int* status). Fields and directions have the point callback's Fortran array shapes. Return raw directional derivatives of the entire discrete XC energy's field covectors, including nonlocal coupling. The call is collective, including empty ranks. Outputs start at zero. Set status nonzero on failure without unwinding across the C ABI. A null pointer disables the response.
+!> @param [in] handler Simulation context handler.
+!> @param [in] fptr C-interoperable XC response evaluator.
+!> @param [in] user_data Caller-owned state retained until context destruction.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_point_response_callback(handler,fptr,user_data,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+type(C_FUNPTR), value, intent(in) :: fptr
+type(C_PTR), value, intent(in) :: user_data
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_point_response_callback_aux(handler,fptr,user_data,error_code)&
+&bind(C, name="sirius_set_xc_point_response_callback")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_FUNPTR), value :: fptr
+type(C_PTR), value :: user_data
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_point_response_callback_aux(handler_ptr,fptr,user_data,error_code_ptr)
+end subroutine sirius_set_xc_point_response_callback
+
+!
+!> @brief Set the relative residual tolerance of the coupled LAPW response solve before context initialization. Default is 1e-8. The tolerance must be finite, positive, less than one and identical on every context rank. Choose it consistently with the numerical precision of the host XC Hessian evaluator. It also bounds relative differences between the stored bands and the frozen response Hamiltonian after the final SCF potential update. It does not change the SCF or XC evaluation tolerances.
+!> @param [in] handler Simulation context handler.
+!> @param [in] tolerance Relative rho/tau response residual tolerance.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_response_tolerance(handler,tolerance,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+real(8), target, intent(in) :: tolerance
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: tolerance_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_response_tolerance_aux(handler,tolerance,error_code)&
+&bind(C, name="sirius_set_xc_response_tolerance")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_PTR), value :: tolerance
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+tolerance_ptr = C_NULL_PTR
+tolerance_ptr = C_LOC(tolerance)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_response_tolerance_aux(handler_ptr,tolerance_ptr,error_code_ptr)
+end subroutine sirius_set_xc_response_tolerance
+
+!
+!> @brief Register a joint field and quadrature XC Hessian-vector evaluator after the point XC callback and before context initialization. Replaces the fixed-geometry response callback without changing its ABI. Its C signature is void response(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, const double* delta_rho, const double* delta_gradient, const double* delta_tau, const double* delta_coordinates, const double* delta_energy_weights, const double* delta_descriptor_weights, const double* delta_block_centres, double* delta_vrho, double* delta_vgradient, double* delta_vtau, double* delta_dcoordinates, double* delta_denergy_weights, double* delta_ddescriptor_weights, double* delta_dblock_centres, int* status). Arrays have the point callback's Fortran shapes. Return the Hessian of the entire discrete energy applied to these independent directions, including mixed field/geometry and nonlocal terms. All output covectors are raw, without field sampling, gradient adjoints, forces or stress factors. The call is collective, including empty ranks. Outputs start at zero. Set status nonzero on failure without unwinding across the C ABI. A null pointer disables the response.
+!> @param [in] handler Simulation context handler.
+!> @param [in] fptr C-interoperable joint XC Hessian-vector evaluator.
+!> @param [in] user_data Caller-owned state retained until context destruction.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_point_hessian_callback(handler,fptr,user_data,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+type(C_FUNPTR), value, intent(in) :: fptr
+type(C_PTR), value, intent(in) :: user_data
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_point_hessian_callback_aux(handler,fptr,user_data,error_code)&
+&bind(C, name="sirius_set_xc_point_hessian_callback")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_FUNPTR), value :: fptr
+type(C_PTR), value :: user_data
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_point_hessian_callback_aux(handler_ptr,fptr,user_data,error_code_ptr)
+end subroutine sirius_set_xc_point_hessian_callback
 
 !
 !> @brief Evaluate explicit XC atom and cell energy derivatives for the current fields. Requires point geometry callbacks. Smooth Fourier coefficients are fixed. Complete PW stress also includes orbital normalization and kinetic-density metric terms, which are added by the total-stress calculation. Outputs are globally summed on every rank. No force sign or volume factor is applied. Cell columns vary at fixed Cartesian atoms.
