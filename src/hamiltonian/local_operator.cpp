@@ -526,6 +526,15 @@ Local_operator<T>::apply_h(fft::spfft_transform_type<T>& spfftk__, std::shared_p
     }
     if (tau_op) {
         // Add -1/2 div(v_tau grad(psi)), including the spin-matrix form when needed.
+        // Stage each band block once. The ordinary GPU Hamiltonian has already updated hphi.
+        for (auto s = spins__.begin(); s != spins__.end(); s++) {
+            if (phi_fft[s.get()].on_device()) {
+                phi_fft[s.get()].copy_to(memory_t::host);
+            }
+            if (hphi_fft[s.get()].on_device()) {
+                hphi_fft[s.get()].copy_to(memory_t::host);
+            }
+        }
         for (int i = 0; i < spl_num_wf.local_size(); i++) {
             if (ctx_.num_mag_dims() == 3) {
                 tau_op->add_spinor_potential(
@@ -540,6 +549,11 @@ Local_operator<T>::apply_h(fft::spfft_transform_type<T>& spfftk__, std::shared_p
                 tau_op->add_potential(vtau_vec_[s]->values().at(memory_t::host),
                                       phi_fft[s].at(memory_t::host, 0, wf::band_index(i)),
                                       hphi_fft[s].at(memory_t::host, 0, wf::band_index(i)));
+            }
+        }
+        for (auto s = spins__.begin(); s != spins__.end(); s++) {
+            if (hphi_fft[s.get()].on_device()) {
+                hphi_fft[s.get()].copy_to(memory_t::device);
             }
         }
     }
@@ -719,6 +733,15 @@ Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::sha
         }
     }
     if (kinetic) {
+        // Stage the completed GPU operators once, then add tau through host-buffer SpFFT transforms.
+        if (phi_fft.on_device()) {
+            phi_fft.copy_to(memory_t::host);
+        }
+        for (int i : {0, 2, 3}) {
+            if (wf_fft[i].on_device()) {
+                wf_fft[i].copy_to(memory_t::host);
+            }
+        }
         for (int j = 0; j < spl_num_wf.local_size(); j++) {
             auto const* phi = phi_fft.at(memory_t::host, 0, wf::band_index(j));
             if (hphi__) {
@@ -734,6 +757,11 @@ Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::sha
                 kinetic->add_potential(vtau_vec_[2]->values().at(memory_t::host), phi, out);
                 kinetic->add_potential(vtau_vec_[3]->values().at(memory_t::host), phi, out,
                                        std::complex<T>(0, conjugate_bxy__ ? 1 : -1));
+            }
+        }
+        for (int i : {0, 2, 3}) {
+            if (wf_fft[i].on_device()) {
+                wf_fft[i].copy_to(memory_t::device);
             }
         }
     }
