@@ -83,7 +83,9 @@ Hamiltonian_k<T>::Hamiltonian_k(Hamiltonian0<T> const& H0__, K_point<T>& kp__)
     , kp_(kp__)
 {
     PROFILE("sirius::Hamiltonian_k");
-    H0_.local_op().prepare_k(kp_.gkvec_fft());
+    if (H0_.ctx().valence_relativity() != relativity_t::dirac || !H0_.ctx().full_potential()) {
+        H0_.local_op().prepare_k(kp_.gkvec_fft());
+    }
     if (!H0_.ctx().full_potential()) {
         if (H0_.ctx().hubbard_correction()) {
             u_op_ = std::make_shared<U_operator<T>>(H0__.ctx(), H0__.potential().hubbard_potential(), kp__.vk());
@@ -374,10 +376,39 @@ Hamiltonian_k<T>::get_h_o_diag_lapw() const
 
 template <typename T>
 void
+Hamiltonian_k<T>::set_dirac_h_o(la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const
+{
+    auto const& ctx = H0_.ctx();
+    int n           = 2 * kp_.num_gkvec() + ctx.unit_cell().mt_lo_basis_size();
+    int invalid     = !std::is_same_v<T, double> || !ctx.full_potential() ||
+                      ctx.valence_relativity() != relativity_t::dirac || &h__ == &o__;
+    for (auto const* matrix : {&h__, &o__}) {
+        invalid |= matrix->num_rows() != n || matrix->num_cols() != n || matrix->bs_row() != ctx.cyclic_block_size() ||
+                   matrix->bs_col() != ctx.cyclic_block_size() || !matrix->has_blacs_grid() ||
+                   &matrix->blacs_grid() != &ctx.blacs_grid() || (matrix->size_local() && !matrix->on_host());
+    }
+    kp_.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("Dirac H/O require compatible full-j matrices with two positive-energy PW blocks");
+    }
+    auto matrices = H0_.dirac_matrices(kp_.gkvec());
+    for (int j = 0; j < h__.num_cols_local(); j++) {
+        for (int i = 0; i < h__.num_rows_local(); i++) {
+            h__(i, j) = static_cast<std::complex<T>>(matrices[0](h__.irow(i), h__.icol(j)));
+            o__(i, j) = static_cast<std::complex<T>>(matrices[1](o__.irow(i), o__.icol(j)));
+        }
+    }
+}
+
+template <typename T>
+void
 Hamiltonian_k<T>::set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
                              bool physical_overlap__) const
 {
     PROFILE("sirius::Hamiltonian_k::set_fv_h_o");
+    if (H0_.ctx().valence_relativity() == relativity_t::dirac) {
+        RTE_THROW("Dirac LAPW requires set_dirac_h_o, not scalar first-variation assembly");
+    }
 
     /* alias to unit cell */
     auto& uc = H0_.ctx().unit_cell();

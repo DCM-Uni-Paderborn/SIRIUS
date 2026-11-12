@@ -23,7 +23,95 @@
 
 namespace sirius {
 
-/// Match augmented plane waves to the muffin-tin radial basis.
+/// Orthonormal positive-energy free Dirac spinors, in Hartree with the rest energy subtracted.
+class Dirac_plane_wave
+{
+  private:
+    r3::vector<double> q_;
+    double energy_, ratio_, normalization_;
+
+  public:
+    using spinors_t = std::array<std::array<std::complex<double>, 4>, 2>;
+
+    explicit Dirac_plane_wave(r3::vector<double> const& q__)
+        : q_(q__)
+    {
+        for (double q : q_) {
+            if (!std::isfinite(q)) {
+                RTE_THROW("Dirac plane wave: nonfinite momentum");
+            }
+        }
+        double d       = std::hypot(1.0, q_.length() / speed_of_light);
+        energy_        = q_.length2() / (d + 1);
+        ratio_         = 1 / (speed_of_light * (d + 1));
+        normalization_ = std::sqrt((d + 1) / (2 * d));
+        if (!std::isfinite(energy_)) {
+            RTE_THROW("Dirac plane wave: momentum exceeds the finite energy range");
+        }
+    }
+
+    double
+    energy() const
+    {
+        return energy_;
+    }
+
+    double
+    energy_response(r3::vector<double> const& dq__) const
+    {
+        for (double dq : dq__) {
+            if (!std::isfinite(dq)) {
+                RTE_THROW("Dirac plane wave: nonfinite momentum direction");
+            }
+        }
+        return dot(q_, dq__) / (1 + energy_ / (speed_of_light * speed_of_light));
+    }
+
+    spinors_t
+    spinors() const
+    {
+        spinors_t result{};
+        result[0] = {normalization_, 0, normalization_ * ratio_ * q_[2],
+                     normalization_ * ratio_ * std::complex<double>(q_[0], q_[1])};
+        result[1] = {0, normalization_, normalization_ * ratio_ * std::complex<double>(q_[0], -q_[1]),
+                     -normalization_ * ratio_ * q_[2]};
+        return result;
+    }
+
+    spinors_t
+    response(r3::vector<double> const& dq__) const
+    {
+        double de     = energy_response(dq__);
+        double dratio = -ratio_ * de / (energy_ + 2 * speed_of_light * speed_of_light);
+        double dn = -std::pow(normalization_, 3) * (ratio_ * dratio * q_.length2() + ratio_ * ratio_ * dot(q_, dq__));
+        double scale = dn * ratio_ + normalization_ * dratio;
+        auto small   = q_ * scale + dq__ * (normalization_ * ratio_);
+        spinors_t result{};
+        result[0] = {dn, 0, small[2], std::complex<double>(small[0], small[1])};
+        result[1] = {0, dn, std::complex<double>(small[0], -small[1]), -small[2]};
+        return result;
+    }
+};
+
+/** The following matching conditions must be fulfilled:
+ *  \f[
+ *   \frac{\partial^j}{\partial r^j} \sum_{L \nu} A_{L \nu}^{\bf k}({\bf G})u_{\ell \nu}(r)
+ *   Y_{L}(\hat {\bf r}) \bigg|_{R^{MT}}  = \frac{\partial^j}{\partial r^j} \frac{4 \pi}{\sqrt \Omega}
+ *   e^{i{\bf (G+k)\tau}} \sum_{L}i^{\ell} j_{\ell}(|{\bf G+k}|r) Y_{L}^{*}(\widehat {\bf G+k}) Y_{L}(\hat {\bf r})
+ *   \bigg|_{R^{MT}}
+ *  \f]
+ *  where \f$ L = \{ \ell, m \} \f$. Dropping sum over L we arrive to the following system of linear equations:
+ *  \f[ \sum_{\nu} \frac{\partial^j u_{\ell \nu}(r)}{\partial r^j} \bigg|_{R^{MT}} A_{L \nu}^{\bf k}({\bf G})
+ *   = \frac{4 \pi}{\sqrt \Omega} e^{i{\bf (G+k)\tau}} i^{\ell} \frac{\partial^j j_{\ell}(|{\bf G+k}|r)}{\partial r^j}
+ *      \bigg|_{R^{MT}} Y_{L}^{*}(\widehat {\bf G+k})
+ *  \f]
+ *  The matching coefficients are then equal to:
+ *  \f[
+ *   A_{L \nu}^{\bf k}({\bf G}) = \sum_{j} \bigg[ \frac{\partial^j u_{\ell \nu}(r)}{\partial r^j} \bigg|_{R^{MT}}
+ *   \bigg]_{\nu j}^{-1} \frac{\partial^j j_{\ell}(|{\bf G+k}|r)}{\partial r^j} \bigg|_{R^{MT}}
+ *   \frac{4 \pi}{\sqrt \Omega} i^{\ell} e^{i{\bf (G+k)\tau}} Y_{L}^{*}(\widehat {\bf G+k})
+ *  \f]
+ */
 class Matching_coefficients // TODO: compute on GPU
 {
   private:
@@ -337,7 +425,171 @@ class Matching_coefficients // TODO: compute on GPU
         generate_impl<conjugate>(atom__, alm__, rb__, nullptr, &displacement__, &strain__);
     }
 
+    /// Full-j coefficients indexed by (G+k, AW, 4 physical components or 2 positive-energy PW spinors).
+    /** Match both Dirac components at the MT boundary; a third AW also matches the large-component derivative.
+        The lower spinor is -i S Omega_-kappa, consistent with the radial Dirac solver and angular convention. */
+    template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
+    void
+    generate(Atom const& atom__, mdarray<T, 3>& alm__, lapw_radial_basis_t const& rb__) const
+    {
+        generate_dirac_impl<conjugate>(atom__, alm__, rb__, nullptr);
+    }
+
+    template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
+    void
+    generate_potential_response(Atom const& atom__, radial_basis_response_t const& response__, mdarray<T, 3>& alm__,
+                                lapw_radial_basis_t const& rb__) const
+    {
+        auto const& sd = response__.surface_derivatives;
+        if (sd.size(0) != 6 ||
+            sd.size(1) != atom__.type().mt_radial_basis_size() - atom__.type().num_lo_descriptors()) {
+            RTE_THROW("wrong dimensions of Dirac AW boundary response");
+        }
+        generate_dirac_impl<conjugate>(atom__, alm__, rb__, &sd);
+    }
+
+    template <bool conjugate, typename T, typename = std::enable_if_t<!std::is_scalar<T>::value>>
+    void
+    generate_geometry_response(Atom const& atom__, r3::vector<double> const& displacement__,
+                               r3::matrix<double> const& strain__, mdarray<T, 3>& alm__,
+                               lapw_radial_basis_t const& rb__) const
+    {
+        generate_dirac_impl<conjugate>(atom__, alm__, rb__, nullptr, &displacement__, &strain__);
+    }
+
   private:
+    template <bool conjugate, typename T>
+    void
+    generate_dirac_impl(Atom const& atom__, mdarray<T, 3>& alm__, lapw_radial_basis_t const& rb__,
+                        mdarray<double, 2> const* response__, r3::vector<double> const* displacement__ = nullptr,
+                        r3::matrix<double> const* strain__ = nullptr) const
+    {
+        auto const& type = atom__.type();
+        if (!type.indexb().full_j() || alm__.size(0) != gkvec_.count() || alm__.size(1) != type.mt_aw_basis_size() ||
+            (alm__.size(2) != 4 && alm__.size(2) != 2)) {
+            RTE_THROW("full-j matching requires dimensions (G+k, AW, 4 components or 2 PW spinors)");
+        }
+        if (alm__.size(2) == 2) {
+            if constexpr (conjugate) {
+                generate_dirac_impl<false>(atom__, alm__, rb__, response__, displacement__, strain__);
+                for (auto& value : alm__) {
+                    value = std::conj(value);
+                }
+                return;
+            }
+            mdarray<T, 3> components({gkvec_.count(), type.mt_aw_basis_size(), 4}), baseline;
+            generate_dirac_impl<false>(atom__, components, rb__, response__, displacement__, strain__);
+            if (strain__) {
+                baseline = mdarray<T, 3>({gkvec_.count(), type.mt_aw_basis_size(), 4});
+                generate_dirac_impl<false>(atom__, baseline, rb__, nullptr);
+            }
+            alm__.zero();
+            for (int igk = 0; igk < gkvec_.count(); igk++) {
+                auto q = gkvec_.gkvec_cart(gvec_index_t::local(igk));
+                Dirac_plane_wave pw(q);
+                auto spinors = pw.spinors();
+                auto tangent =
+                        strain__ ? pw.response(dot(transpose(*strain__), q) * -1.0) : Dirac_plane_wave::spinors_t{};
+                for (int xi = 0; xi < type.mt_aw_basis_size(); xi++) {
+                    for (int s : {0, 1}) {
+                        std::complex<double> value{0};
+                        for (int c = 0; c < 4; c++) {
+                            value += static_cast<std::complex<double>>(components(igk, xi, c)) * spinors[s][c];
+                            if (strain__) {
+                                value += static_cast<std::complex<double>>(baseline(igk, xi, c)) * tangent[s][c];
+                            }
+                        }
+                        alm__(igk, xi, s) = value;
+                    }
+                }
+            }
+            return;
+        }
+        std::map<int, r3::matrix<double>> inverse_boundary;
+        constexpr std::array<int, 3> component{0, 1, 0}, derivative{0, 0, 1};
+        for (auto const& rf : type.indexr()) {
+            if (int(rf.idxlo) >= 0 || rf.order != 0) {
+                continue;
+            }
+            int n = static_cast<int>(rb__.aw_descriptor(rf.am).size());
+            if (n < 2 || n > 3) {
+                RTE_THROW("Dirac matching requires two or three augmented waves per kappa");
+            }
+            mdarray<double, 2> boundary({n, n}), inverse({n, n});
+            inverse.zero();
+            for (int row = 0; row < n; row++) {
+                inverse(row, row) = 1;
+                for (int order = 0; order < n; order++) {
+                    boundary(row, order) = rb__.aw_surface_deriv(rf.am, order, derivative[row], component[row]);
+                }
+            }
+            if (la::wrap(la::lib_t::lapack).gesv(n, n, boundary.at(memory_t::host), n, inverse.at(memory_t::host), n) !=
+                0) {
+                RTE_THROW("singular Dirac matching boundary matrix");
+            }
+            r3::matrix<double> A;
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < n; j++) {
+                    A(i, j) = inverse(i, j);
+                }
+            }
+            if (response__) {
+                r3::matrix<double> dA;
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < n; j++) {
+                        for (int row = 0; row < n; row++) {
+                            for (int order = 0; order < n; order++) {
+                                auto idxrf = type.indexr().index_of(rf.am, order);
+                                dA(i, j) -= A(i, row) * (*response__)(derivative[row] + 3 * component[row], idxrf) *
+                                            A(order, j);
+                            }
+                        }
+                    }
+                }
+                A = dA;
+            }
+            inverse_boundary.emplace(rf.am.kappa(), A);
+        }
+        plane_wave_response_t geometry;
+        if (strain__) {
+            geometry = plane_wave_geometry_response(atom__, *displacement__, *strain__, type.lmax_apw() + 1);
+        }
+        alm__.zero();
+        for (int xi = 0; xi < type.mt_aw_basis_size(); xi++) {
+            auto const& basis = type.indexb(xi);
+            auto const& A     = inverse_boundary.at(basis.am.kappa());
+            int n             = static_cast<int>(rb__.aw_descriptor(basis.am).size());
+            for (int c = 0; c < 4; c++) {
+                auto [lm, cg] = basis.spinor_component(c % 2, c >= 2);
+                if (lm < 0) {
+                    continue;
+                }
+                int l = c < 2 ? basis.am.l() : basis.am.two_j() - basis.am.l();
+                for (int igk = 0; igk < gkvec_.count(); igk++) {
+                    auto phase = std::exp(std::complex<double>(
+                            0, twopi * dot(gkvec_.gkvec(gvec_index_t::local(igk)), atom__.position())));
+                    std::complex<double> value{0};
+                    for (int row = 0; row < n; row++) {
+                        if (component[row] != c / 2) {
+                            continue;
+                        }
+                        auto b   = alm_b_(derivative[row], igk, l, type.id());
+                        auto rhs = b * std::conj(gkvec_ylm_(igk, lm));
+                        if (strain__) {
+                            rhs = (geometry.bessel(derivative[row], igk, l) +
+                                   std::complex<double>(0, geometry.phase[igk]) * b) *
+                                          std::conj(gkvec_ylm_(igk, lm)) +
+                                  b * std::conj(geometry.harmonics(igk, lm));
+                        }
+                        value += A(basis.order, row) * rhs;
+                    }
+                    value *= cg * phase * (c < 2 ? std::complex<double>(1, 0) : std::complex<double>(0, 1));
+                    alm__(igk, xi, c) = conjugate ? std::conj(value) : value;
+                }
+            }
+        }
+    }
+
     template <bool conjugate, typename T>
     void
     generate_impl(Atom const& atom__, mdarray<T, 2>& alm__, lapw_radial_basis_t const& rb__,

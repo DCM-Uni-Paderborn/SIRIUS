@@ -13,10 +13,13 @@ Potential::validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& d__) cons
     bool failed{false};
     try {
         bool spinor = ctx_.num_mag_dims() == 3;
+        bool dirac  = ctx_.valence_relativity() == relativity_t::dirac;
         int ns      = spinor ? 4 : ctx_.num_spins();
-        if (!ctx_.full_potential() || (spinor && !ctx_.cfg().control().use_second_variation()) ||
-            (ctx_.so_correction() && !spinor) || d__.rho.size() != ns || d__.tau.size() != ns ||
-            d__.local.size() != unit_cell_.num_atoms() || d__.core.size() != unit_cell_.num_atoms()) {
+        if (!ctx_.full_potential() ||
+            (dirac ? ctx_.cfg().control().use_second_variation() || ctx_.so_correction()
+                   : (spinor && !ctx_.cfg().control().use_second_variation()) || (ctx_.so_correction() && !spinor)) ||
+            d__.rho.size() != ns || d__.tau.size() != ns || d__.local.size() != unit_cell_.num_atoms() ||
+            d__.core.size() != unit_cell_.num_atoms()) {
             RTE_THROW("incompatible LAPW XC fields or unsupported relativistic/spin/device mode");
         }
         for (auto const* fields : {&d__.rho, &d__.tau}) {
@@ -30,6 +33,9 @@ Potential::validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& d__) cons
             }
         }
         for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            if (unit_cell_.atom(ia).type().indexb().full_j() != dirac) {
+                RTE_THROW("LAPW XC basis and valence relativity are inconsistent");
+            }
             auto const& grid = unit_cell_.atom(ia).type().radial_grid();
             for (int part = 0; part < 2; part++) {
                 if (d__.local[ia][part].size() != ns || d__.core[ia][part].size() != grid.num_points()) {

@@ -12,6 +12,7 @@
 #include "paw_xc_correction.hpp"
 #include "lapw_xc_atom.hpp"
 #include "lapw/matching_coefficients.hpp"
+#include "lapw/dirac_basis.hpp"
 #include <gsl/gsl_spline.h>
 
 namespace sirius {
@@ -356,7 +357,7 @@ Density::generate_mt_kinetic_density(bool add_core__)
     for (auto it : unit_cell_.spl_num_atoms()) {
         auto spin_tau = generate_mt_valence_kinetic_density(it.i);
         for (size_t i = 0; i < spin_tau[0].size(); i++) {
-            if (ctx_.num_mag_dims() == 3) {
+            if (ctx_.num_mag_dims() == 3 || ctx_.valence_relativity() == relativity_t::dirac) {
                 for (int j = 0; j <= ctx_.num_mag_dims(); j++) {
                     tau.component(j).mt()[it.i][i] = spin_tau[j][i];
                 }
@@ -387,7 +388,7 @@ Density::generate_mt_valence_kinetic_density(int ia__) const
         RTE_THROW("muffin-tin kinetic density requires LAPW");
     }
     auto const& atom = unit_cell_.atom(ia__);
-    if (ctx_.num_mag_dims() == 3) {
+    if (ctx_.num_mag_dims() == 3 || ctx_.valence_relativity() == relativity_t::dirac) {
         auto fields = LAPW_xc_atom(atom, lapw_basis().radial_basis(atom_index_t::global(ia__)), ctx_.lmax_rho())
                               .fields(density_matrix(ia__));
         return std::move(fields[1]);
@@ -440,6 +441,190 @@ Density::generate_paw_xc_correction(int ia__) const
     return PAW_xc_correction(unit_cell_.atom(ia__).type()).fields(density_matrix(ia__));
 }
 
+void
+Density::generate_dirac_valence(K_point_set const& ks__, std::vector<wf::Wave_functions<double>*> const* directions__,
+                                std::vector<mdarray<double, 2>> const* occupations__)
+{
+    if (&ks__.ctx() != &ctx_ || ctx_.valence_relativity() != relativity_t::dirac || !ctx_.full_potential() ||
+        ctx_.cfg().parameters().precision_wf() != "fp64") {
+        RTE_THROW("Dirac density requires fp64 full-j wave functions from the same context");
+    }
+    int nc = ctx_.num_mag_dims() + 1, nr = ctx_.spfft_coarse<double>().local_slice_size();
+    density_matrix_->zero();
+    for (int s = 0; s < nc; s++) {
+        rho_mag_coarse_[s]->zero();
+    }
+    std::vector<Smooth_periodic_function<double>> tau_coarse;
+    if (kinetic_density_) {
+        kinetic_density_->zero();
+        for (int s = 0; s < nc; s++) {
+            tau_coarse.emplace_back(ctx_.spfft_coarse<double>(), ctx_.gvec_coarse_fft_sptr());
+            tau_coarse.back().zero();
+        }
+    }
+    size_t ik{0};
+    for (auto it : ks__.spl_num_kpoints()) {
+        auto kp         = ks__.get<double>(it.i);
+        auto& psi       = kp->spinor_wave_functions();
+        auto* direction = directions__ ? (*directions__)[ik] : nullptr;
+        auto* df        = occupations__ ? &(*occupations__)[ik] : nullptr;
+        ik++;
+        int nb = kp->num_occupied_bands(0);
+        if (df) {
+            for (int b = nb; b < ctx_.num_bands(); b++) {
+                if ((*df)(b, 0) != 0) {
+                    nb = b + 1;
+                }
+            }
+        }
+        // MT coefficients contain the whole full-j spinor once, independently of the PW slots.
+        for (auto atom : psi.spl_num_atoms()) {
+            auto& dm = density_matrix(atom.i);
+            int nm   = unit_cell_.atom(atom.i).mt_basis_size();
+            for (int b = 0; b < nb; b++) {
+                double weight = kp->weight() * kp->band_occupancy(b, 0);
+                double dw     = df ? kp->weight() * (*df)(b, 0) : 0;
+                for (int j = 0; j < nm; j++) {
+                    auto cj = psi.mt_coeffs(j, atom.li, wf::spin_index(0), wf::band_index(b));
+                    for (int i = 0; i < nm; i++) {
+                        auto ci = psi.mt_coeffs(i, atom.li, wf::spin_index(0), wf::band_index(b));
+                        if (direction) {
+                            auto di = direction->mt_coeffs(i, atom.li, wf::spin_index(0), wf::band_index(b));
+                            auto dj = direction->mt_coeffs(j, atom.li, wf::spin_index(0), wf::band_index(b));
+                            dm(i, j, 0) += weight * (std::conj(di) * cj + std::conj(ci) * dj) + dw * std::conj(ci) * cj;
+                        } else {
+                            dm(i, j, 0) += weight * std::conj(ci) * cj;
+                        }
+                    }
+                }
+            }
+        }
+        if (!nb) {
+            continue;
+        }
+        std::array<wf::Wave_functions_fft<double>, 2> shuffled, delta;
+        for (int s : {0, 1}) {
+            shuffled[s] = wf::Wave_functions_fft<double>(kp->gkvec_fft_sptr(), psi, wf::spin_index(s),
+                                                         wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+            if (direction) {
+                delta[s] = wf::Wave_functions_fft<double>(kp->gkvec_fft_sptr(), *direction, wf::spin_index(s),
+                                                          wf::band_range(0, nb), wf::shuffle_to::fft_layout);
+            }
+        }
+        auto& fft      = kp->spfft_transform();
+        auto const& gk = *kp->gkvec_fft_sptr();
+        if (fft.local_slice_size() != nr) {
+            RTE_THROW("incompatible Dirac wave-function and density FFT slabs");
+        }
+        wf::Kinetic_density_operator<double> op(fft, gk);
+        std::array<std::vector<std::complex<double>>, 4> pw, real, dpw, dreal;
+        std::array<std::vector<double>, 4> tau;
+        for (int a = 0; a < 4; a++) {
+            pw[a].resize(gk.count());
+            real[a].resize(nr);
+            tau[a].resize(nr);
+            if (direction) {
+                dpw[a].resize(gk.count());
+                dreal[a].resize(nr);
+            }
+        }
+        for (int ib = 0; ib < shuffled[0].num_wf_local(); ib++) {
+            auto band     = shuffled[0].spl_num_wf().global_index(ib);
+            double weight = kp->weight() * kp->band_occupancy(band, 0) / unit_cell_.omega();
+            double dw     = df ? kp->weight() * (*df)(band, 0) / unit_cell_.omega() : 0;
+            for (int ig = 0; ig < gk.count(); ig++) {
+                auto u = Dirac_plane_wave(gk.gkvec_cart(ig)).spinors();
+                for (int a = 0; a < 4; a++) {
+                    pw[a][ig] = shuffled[0].pw_coeffs(ig, wf::band_index(ib)) * u[0][a] +
+                                shuffled[1].pw_coeffs(ig, wf::band_index(ib)) * u[1][a];
+                    if (direction) {
+                        dpw[a][ig] = delta[0].pw_coeffs(ig, wf::band_index(ib)) * u[0][a] +
+                                     delta[1].pw_coeffs(ig, wf::band_index(ib)) * u[1][a];
+                    }
+                }
+            }
+            for (int a = 0; a < 4; a++) {
+                fft.backward(reinterpret_cast<double const*>(pw[a].data()), SPFFT_PU_HOST);
+                auto ptr = reinterpret_cast<std::complex<double> const*>(fft.space_domain_data(SPFFT_PU_HOST));
+                if (nr) {
+                    std::copy_n(ptr, nr, real[a].data());
+                }
+                if (direction) {
+                    fft.backward(reinterpret_cast<double const*>(dpw[a].data()), SPFFT_PU_HOST);
+                    ptr = reinterpret_cast<std::complex<double> const*>(fft.space_domain_data(SPFFT_PU_HOST));
+                    if (nr) {
+                        std::copy_n(ptr, nr, dreal[a].data());
+                    }
+                }
+            }
+            for (int lower : {0, 1}) {
+                double sign = lower ? -1 : 1;
+                for (int ir = 0; ir < nr; ir++) {
+                    auto up = real[2 * lower][ir], down = real[2 * lower + 1][ir];
+                    auto cross = std::conj(up) * down;
+                    std::array<double, 4> value{std::norm(up) + std::norm(down),
+                                                sign * (std::norm(up) - std::norm(down)), sign * 2 * cross.real(),
+                                                sign * 2 * cross.imag()};
+                    for (int s = 0; s < nc; s++) {
+                        rho_mag_coarse_[s]->value(ir) += (direction ? dw : weight) * value[s];
+                    }
+                    if (direction) {
+                        auto du = dreal[2 * lower][ir], dd = dreal[2 * lower + 1][ir];
+                        double uu = 2 * std::real(std::conj(up) * du);
+                        double dn = 2 * std::real(std::conj(down) * dd);
+                        auto dc   = std::conj(du) * down + std::conj(up) * dd;
+                        std::array<double, 4> response{uu + dn, sign * (uu - dn), sign * 2 * dc.real(),
+                                                       sign * 2 * dc.imag()};
+                        for (int s = 0; s < nc; s++) {
+                            rho_mag_coarse_[s]->value(ir) += weight * response[s];
+                        }
+                    }
+                }
+                if (kinetic_density_) {
+                    for (auto& v : tau) {
+                        std::fill(v.begin(), v.end(), 0);
+                    }
+                    std::array<std::complex<double> const*, 2> p{pw[2 * lower].data(), pw[2 * lower + 1].data()};
+                    std::array<double*, 4> t{tau[0].data(), tau[1].data(), tau[2].data(), tau[3].data()};
+                    if (direction) {
+                        op.add_spinor_density_response(weight, p, {dpw[2 * lower].data(), dpw[2 * lower + 1].data()},
+                                                       t);
+                        if (dw) {
+                            op.add_spinor_density(dw, p, t);
+                        }
+                    } else {
+                        op.add_spinor_density(weight, p, t);
+                    }
+                    for (int s = 0; s < nc; s++) {
+                        for (int ir = 0; ir < nr; ir++) {
+                            tau_coarse[s].value(ir) += (s ? sign : 1) * tau[s][ir];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        auto& dm = density_matrix(ia);
+        ctx_.comm().allreduce(dm.at(memory_t::host), dm.size());
+    }
+    auto const& comm = ctx_.gvec_coarse_fft_sptr()->comm_ortho_fft();
+    auto finish      = [&](auto& coarse, auto& fine) {
+        comm.allreduce(nr ? &coarse.value(0) : nullptr, nr);
+        coarse.fft_transform(-1);
+        for (int ig = 0; ig < ctx_.gvec_coarse().count(); ig++) {
+            fine.f_pw_local(ctx_.gvec().gvec_base_mapping(ig)) = coarse.f_pw_local(ig);
+        }
+    };
+    for (int s = 0; s < nc; s++) {
+        finish(*rho_mag_coarse_[s], component(s).rg());
+        if (kinetic_density_) {
+            finish(tau_coarse[s], kinetic_density_->component(s).rg());
+        }
+    }
+    generate_valence_mt(lapw_basis());
+}
+
 template <typename T>
 std::vector<Smooth_periodic_function<double>>
 Density::generate_smooth_kinetic_density(K_point_set const& ks__) const
@@ -447,6 +632,9 @@ Density::generate_smooth_kinetic_density(K_point_set const& ks__) const
     PROFILE("sirius::Density::generate_smooth_kinetic_density");
     if (&ks__.ctx() != &ctx_) {
         RTE_THROW("kinetic density requires k-points from the same context");
+    }
+    if (ctx_.valence_relativity() == relativity_t::dirac) {
+        RTE_THROW("use native Dirac density generation to reconstruct all four physical components");
     }
 
     bool spinor    = ctx_.num_mag_dims() == 3;

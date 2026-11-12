@@ -347,7 +347,21 @@ Simulation_context::initialize()
 
     int nbnd = static_cast<int>(unit_cell().num_valence_electrons() / 2.0) +
                std::max(10, static_cast<int>(0.1 * unit_cell().num_valence_electrons()));
-    if (full_potential()) {
+    if (full_potential() && valence_relativity() == relativity_t::dirac) {
+        if (cfg().control().use_second_variation() || cfg().iterative_solver().type() != "exact" ||
+            cfg().parameters().precision_wf() != "fp64" || so_correction() || hubbard_correction() || gamma_point() ||
+            std::abs(cfg().parameters().fixed_mag()) > 1e-10) {
+            RTE_THROW("Dirac LAPW requires exact fp64 full variation, unreduced plane waves and no separate SOC or "
+                      "Hubbard term");
+        }
+        if (num_bands() < 0) {
+            num_bands(2 * nbnd);
+        }
+        if (num_bands() <
+            static_cast<int>(std::ceil(unit_cell().num_valence_electrons() - cfg().parameters().extra_charge()))) {
+            RTE_THROW("not enough single-occupancy Dirac bands");
+        }
+    } else if (full_potential()) {
         /* take 10% of empty non-magnetic states */
         if (num_fv_states() < 0) {
             num_fv_states(nbnd);

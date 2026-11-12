@@ -63,6 +63,20 @@ K_point<T>::initialize()
     /* build a list of basis functions */
     generate_gklo_basis();
 
+    if (ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac) {
+        std::vector<int> num_mt_coeffs(unit_cell_.num_atoms());
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            num_mt_coeffs[ia] = unit_cell_.atom(ia).mt_basis_size();
+        }
+        spinor_wave_functions_ = std::make_unique<wf::Wave_functions<T>>(gkvec_, num_mt_coeffs, wf::num_mag_dims(3),
+                                                                         wf::num_bands(nst), ctx_.host_memory_t());
+        for (int s : {0, 1}) {
+            spinor_wave_functions_->zero(memory_t::host, wf::spin_index(s), wf::band_range(0, nst));
+        }
+        update();
+        return;
+    }
+
     if (ctx_.full_potential()) {
         /* allocate first-variational eigen vectors in slab distribution;
          * in case of full variation, fv_eigen_vectors_slab will be uses as a temporary working space
@@ -534,7 +548,7 @@ template <typename T>
 void
 K_point<T>::save(std::string const& name__, int id__) const
 {
-    int num_slots = ctx_.num_spins();
+    int num_slots = ctx_.valence_relativity() == relativity_t::dirac ? 2 : ctx_.num_spins();
     std::unique_ptr<HDF5_tree> fout;
     /* rank 0 opens a file and writes common data */
     if (comm().rank() == 0) {
@@ -593,7 +607,7 @@ template <typename T>
 void
 K_point<T>::load(HDF5_tree h5in__)
 {
-    int num_slots = ctx_.num_spins();
+    int num_slots = ctx_.valence_relativity() == relativity_t::dirac ? 2 : ctx_.num_spins();
     h5in__.read("band_energies", band_energies_);
     h5in__.read("band_occupancies", band_occupancies_);
     int num_gkvec_in;
@@ -735,6 +749,10 @@ K_point<T>::generate_gklo_basis()
                                         ctx_.cyclic_block_size());
     num_gkvec_col_ = spl_ngk_col.local_size();
 
+    if (ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac) {
+        // Full-j LOs belong to the Dirac basis, not to scalar (l,m) FV descriptors.
+        return;
+    }
     if (ctx_.full_potential()) {
         splindex_block_cyclic<> spl_nlo_row(num_gkvec() + unit_cell_.mt_lo_basis_size(), n_blocks(num_ranks_row_),
                                             block_id(rank_row_), ctx_.cyclic_block_size());

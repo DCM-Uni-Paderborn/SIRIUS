@@ -16,11 +16,36 @@
 #include "lapw/interstitial_functions.hpp"
 #include "lapw/step_function.hpp"
 #include "density/lapw_xc_atom.hpp"
+#include "lapw/dirac_basis.hpp"
 #include "local_operator.hpp"
 #include "hamiltonian.hpp"
 
 namespace sirius {
 namespace {
+
+double
+dirac_field_component(int ns, int component, int spin)
+{
+    return ns == 4 ? double(component == spin)
+                   : (ns == 1 ? double(component == 0)
+                              : (component < 2 ? 0.5 * (component == 0 ? 1 : 1 - 2 * spin) : 0.0));
+}
+
+std::vector<double>
+lapw_radial_product_weights(Radial_grid<double> const& grid)
+{
+    Spline<double> prototype(grid);
+    mdarray<double, 2> integrals({grid.num_points(), 4});
+    integrals.zero();
+    for (int ir = 0; ir < grid.num_points() - 1; ir++) {
+        double r = grid[ir], h = grid[ir + 1] - r;
+        for (int j = 0; j < 4; j++) {
+            integrals(ir, j) = r * r * std::pow(h, j + 1) / (j + 1) + 2 * r * std::pow(h, j + 2) / (j + 2) +
+                               std::pow(h, j + 3) / (j + 3);
+        }
+    }
+    return prototype.interpolation_adjoint(integrals);
+}
 
 std::complex<double>
 lapw_so_angular(Atom_type const& type, int i, int j, int s)
@@ -336,6 +361,17 @@ Hamiltonian0<T>::Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radia
     if (ctx_.full_potential() && !lapw_basis_) {
         lapw_basis_ = potential__.create_lapw_basis();
     }
+    if (ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac) {
+        int invalid = !std::is_same_v<T, double> || ctx_.cfg().control().use_second_variation() ||
+                      ctx_.so_correction() || ctx_.hubbard_correction();
+        ctx_.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+        if (invalid) {
+            RTE_THROW("Dirac LAPW matrix assembly requires fp64 full variation without a separate SOC or Hubbard "
+                      "operator");
+        }
+        prepare_dirac_fields();
+        return;
+    }
 
     local_op_ =
             std::make_unique<Local_operator<T>>(ctx_, ctx_.spfft_coarse<T>(), ctx_.gvec_coarse_fft_sptr(), potential__);
@@ -540,6 +576,149 @@ Hamiltonian0<T>::~Hamiltonian0()
 
 template <typename T>
 void
+Hamiltonian0<T>::prepare_dirac_fields()
+{
+    int invalid{0};
+    for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
+        auto const& cls = lapw_basis().radial_basis_for_class(ic);
+        invalid |= cls.spherical_potential().size() != static_cast<size_t>(cls.atom_type().num_mt_points());
+        for (double value : cls.spherical_potential()) {
+            invalid |= !std::isfinite(value);
+        }
+    }
+    ctx_.comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("Dirac LAPW fields require an initialized finite spherical atomic potential");
+    }
+    int ng   = ctx_.gvec().num_gvec();
+    veff_pw_ = mdarray<std::complex<T>, 2>({ng, 4});
+    vtau_pw_ = mdarray<std::complex<T>, 2>({ng, 4});
+    veff_pw_.zero();
+    vtau_pw_.zero();
+    Smooth_periodic_function<double> masked(ctx_.spfft<double>(), ctx_.gvec_fft_sptr());
+    for (int s = 0; s <= ctx_.num_mag_dims(); s++) {
+        for (int ir = 0; ir < ctx_.spfft<double>().local_slice_size(); ir++) {
+            masked.value(ir) = ctx_.theta(ir) * potential_->component(s).rg().value(ir);
+        }
+        masked.fft_transform(-1);
+        auto values = masked.gather_f_pw();
+        for (int ig = 0; ig < ng; ig++) {
+            veff_pw_(ig, s) = static_cast<std::complex<T>>(values[ig]);
+        }
+    }
+    auto const* xc = potential_->lapw_xc_derivatives();
+    int ns         = ctx_.num_mag_dims() == 3 ? 4 : ctx_.num_spins();
+    if (xc) {
+        for (int s = 0; s < ns; s++) {
+            auto rho = xc->rho[s].gather_f_pw(), tau = xc->tau[s].gather_f_pw();
+            for (int component = 0; component < 4; component++) {
+                double factor = dirac_field_component(ns, component, s);
+                for (int ig = 0; ig < ng; ig++) {
+                    // These covectors already contain the quadrature and interstitial restriction.
+                    veff_pw_(ig, component) += static_cast<std::complex<T>>(factor * rho[ig]);
+                    vtau_pw_(ig, component) += static_cast<std::complex<T>>(factor * tau[ig]);
+                }
+            }
+        }
+    }
+    hmt_ = dirac_atom_matrices();
+}
+
+template <typename T>
+std::vector<mdarray<std::complex<T>, 3>>
+Hamiltonian0<T>::dirac_atom_matrices(std::vector<radial_basis_response_t> const* response__) const
+{
+    auto const* xc = potential_->lapw_xc_derivatives();
+    int ns         = ctx_.num_mag_dims() == 3 ? 4 : ctx_.num_spins();
+    int lmmax      = sf::lmmax(std::max(ctx_.lmax_pot(), ctx_.lmax_rho()));
+    std::vector<mdarray<std::complex<T>, 3>> matrices;
+    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+        auto const& atom = unit_cell_.atom(ia);
+        auto const& type = atom.type();
+        auto const& grid = type.radial_grid();
+        int nr = grid.num_points(), nb = type.mt_basis_size();
+        int owner = unit_cell_.spl_num_atoms().location(atom_index_t::global(ia)).ib;
+        mdarray<double, 3> values({ctx_.lmmax_pot(), nr, ctx_.num_mag_dims() + 1});
+        if (ctx_.comm().rank() == owner) {
+            for (int s = 0; s <= ctx_.num_mag_dims(); s++) {
+                std::copy_n(potential_->component(s).mt()[ia].at(memory_t::host), ctx_.lmmax_pot() * nr,
+                            &values(0, 0, s));
+            }
+        }
+        ctx_.comm().bcast(values.at(memory_t::host), values.size(), owner);
+        // Exact adjoint of integrating a sampled-product cubic spline with r^2 dr.
+        auto weights = lapw_radial_product_weights(grid);
+        LAPW_xc_atom op(atom, lapw_basis().radial_basis(atom_index_t::global(ia)), sf::lmax(lmmax));
+        matrices.emplace_back(std::array<index_range, 3>{nb, nb, 1});
+        matrices.back().zero();
+        for (int component = 0; component < 4; component++) {
+            Flm rho(lmmax, grid), tau(lmmax, grid);
+            rho.zero();
+            tau.zero();
+            if (component <= ctx_.num_mag_dims()) {
+                for (int ir = 0; ir < nr; ir++) {
+                    for (int lm = 0; lm < ctx_.lmmax_pot(); lm++) {
+                        double value = values(lm, ir, component);
+                        if (component == 0 && lm == 0) {
+                            value -=
+                                    lapw_basis().radial_basis(atom_index_t::global(ia)).spherical_potential()[ir] / y00;
+                        }
+                        rho(lm, ir) = weights[ir] * value;
+                    }
+                }
+            }
+            if (xc) {
+                for (int s = 0; s < ns; s++) {
+                    double factor = dirac_field_component(ns, component, s);
+                    for (int ir = 0; ir < nr; ir++) {
+                        for (int lm = 0; lm < ctx_.lmmax_rho(); lm++) {
+                            rho(lm, ir) += factor * xc->local[ia][0][s](lm, ir);
+                            tau(lm, ir) += factor * xc->local[ia][1][s](lm, ir);
+                        }
+                    }
+                }
+            }
+            auto matrix = op.matrix_elements(
+                    rho, tau, response__ ? &(*response__)[atom.symmetry_class().id()] : nullptr, component);
+            for (size_t i = 0; i < matrix.size(); i++) {
+                matrices.back()[i] += static_cast<std::complex<T>>(matrix[i]);
+            }
+        }
+    }
+    return matrices;
+}
+
+template <typename T>
+std::array<mdarray<std::complex<double>, 2>, 2>
+Hamiltonian0<T>::dirac_matrices(fft::Gvec const& gkvec__) const
+{
+    int invalid = !std::is_same_v<T, double> || !ctx_.full_potential() ||
+                  ctx_.valence_relativity() != relativity_t::dirac || local_op_ != nullptr ||
+                  hmt_.size() != static_cast<size_t>(unit_cell_.num_atoms());
+    gkvec__.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("Dirac matrices require the prepared native full-j Hamiltonian");
+    }
+    if constexpr (std::is_same_v<T, double>) {
+        Dirac_lapw_basis basis(unit_cell_, gkvec__, lapw_basis());
+        std::vector<mdarray<std::complex<double>, 2>> local;
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            int nb = unit_cell_.atom(ia).type().mt_basis_size();
+            local.emplace_back(std::array<index_range, 2>{nb, nb},
+                               const_cast<std::complex<double>*>(hmt_[ia].at(memory_t::host)));
+        }
+        auto h = basis.hamiltonian();
+        auto v = basis.field_operator(ctx_.gvec(), veff_pw_, vtau_pw_, local);
+        for (size_t i = 0; i < h.size(); i++) {
+            h[i] += v[i];
+        }
+        return {std::move(h), basis.overlap()};
+    }
+    RTE_THROW("Dirac matrices require fp64");
+}
+
+template <typename T>
+void
 Hamiltonian0<T>::apply_hmt_to_apw(device_t pu__, int ia__, int ispn__, int ngv__,
                                   mdarray<std::complex<T>, 2> const& alm__, mdarray<std::complex<T>, 2>& halm__,
                                   int stream_id__) const
@@ -676,6 +855,9 @@ Hamiltonian0<T>::generate_pw_coefs(Potential const& potential__)
 {
     PROFILE("sirius::Hamiltonian0::generate_pw_coefs");
 
+    if (ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac) {
+        RTE_THROW("Dirac LAPW fields are prepared by the four-component Hamiltonian constructor");
+    }
     if (!ctx_.full_potential()) {
         // These gathers involve all context ranks, including ranks with no k-point.
         auto gather = [&](auto const& scalar, auto const* magnetic, auto& dest) {
@@ -802,6 +984,9 @@ template <typename T>
 std::complex<T>
 Hamiltonian0<T>::hmt_component(int ia__, int i__, int j__, int s__, bool spin_orbit_only__) const
 {
+    if (ctx_.valence_relativity() == relativity_t::dirac) {
+        RTE_THROW("Dirac LAPW atom matrices do not use scalar spin blocks or second-variation SOC");
+    }
     auto const& h = hmt_[ia__];
     if (ctx_.num_mag_dims() != 3) {
         return spin_orbit_only__ ? std::complex<T>(0) : h(i__, j__, s__);

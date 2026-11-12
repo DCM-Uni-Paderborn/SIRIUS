@@ -1252,6 +1252,74 @@ lapw_radial_basis_t::generate_radial_integrals(relativity_t rel__)
     }
 }
 
+std::array<mdarray<double, 2>, 2>
+lapw_radial_basis_t::dirac_spherical_matrices(radial_basis_response_t const* response__,
+                                              std::vector<double> const& direction__) const
+{
+    int nr = atom_type_.num_mt_points(), nrf = atom_type_.mt_radial_basis_size();
+    if (!atom_type_.indexb().full_j() || spherical_potential_.size() != static_cast<size_t>(nr) ||
+        (!direction__.empty() && (!response__ || direction__.size() != static_cast<size_t>(nr)))) {
+        RTE_THROW("Dirac spherical matrices require a full-j basis and a compatible potential direction");
+    }
+    if (response__ && (response__->radial_functions.size(0) != static_cast<size_t>(nr) ||
+                       response__->radial_functions.size(1) != static_cast<size_t>(nrf) ||
+                       response__->radial_functions.size(2) != 4)) {
+        RTE_THROW("Dirac spherical matrices: incompatible radial response");
+    }
+    for (auto const* values : {&spherical_potential_, &direction__}) {
+        for (double value : *values) {
+            if (!std::isfinite(value)) {
+                RTE_THROW("Dirac spherical matrices: nonfinite potential or direction");
+            }
+        }
+    }
+    std::array<mdarray<double, 2>, 2> result{mdarray<double, 2>({nrf, nrf}), mdarray<double, 2>({nrf, nrf})};
+    for (auto& matrix : result) {
+        matrix.zero();
+    }
+    auto const& grid = atom_type_.radial_grid();
+    auto bilinear    = [&](auto const& left, auto const& right, int i, int j, int ir, int kappa) {
+        double r = grid[ir], R1 = left(ir, i, 0), S1 = left(ir, i, 2);
+        double R2 = right(ir, j, 0), S2 = right(ir, j, 2);
+        double overlap = R1 * R2 + S1 * S2;
+        // 1/2 (<i|c alpha.p|j> + <c alpha.p i|j>) for (R Omega_kappa, -i S Omega_-kappa).
+        double kinetic = 0.5 * speed_of_light / r *
+                         (S1 * (right(ir, j, 1) + (1 + kappa) * R2) - R1 * (right(ir, j, 3) + (1 - kappa) * S2) +
+                          (left(ir, i, 1) + (1 + kappa) * R1) * S2 - (left(ir, i, 3) + (1 - kappa) * S1) * R2);
+        return std::array<double, 2>{
+                kinetic + spherical_potential_[ir] * overlap - 2 * speed_of_light * speed_of_light * S1 * S2, overlap};
+    };
+    std::array<Spline<double>, 2> integrand{Spline<double>(grid), Spline<double>(grid)};
+    for (int j = 0; j < nrf; j++) {
+        for (int i = 0; i <= j; i++) {
+            auto am = atom_type_.indexr(i).am;
+            if (am != atom_type_.indexr(j).am) {
+                continue;
+            }
+            for (int ir = 0; ir < nr; ir++) {
+                auto value = bilinear(radial_functions_, radial_functions_, i, j, ir, am.kappa());
+                if (response__) {
+                    auto const& tangent   = response__->radial_functions;
+                    auto left             = bilinear(tangent, radial_functions_, i, j, ir, am.kappa());
+                    auto right            = bilinear(radial_functions_, tangent, i, j, ir, am.kappa());
+                    double potential_term = direction__.empty() ? 0 : direction__[ir] * value[1];
+                    value                 = {left[0] + right[0] + potential_term, left[1] + right[1]};
+                }
+                for (int part : {0, 1}) {
+                    if (!std::isfinite(value[part])) {
+                        RTE_THROW("Dirac spherical matrices: nonfinite radial bilinear");
+                    }
+                    integrand[part](ir) = value[part];
+                }
+            }
+            for (int part : {0, 1}) {
+                result[part](i, j) = result[part](j, i) = integrand[part].interpolate().integrate(2);
+            }
+        }
+    }
+    return result;
+}
+
 void
 lapw_radial_basis_t::save_spherical_potential() const
 {
