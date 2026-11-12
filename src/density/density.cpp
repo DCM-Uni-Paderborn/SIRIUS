@@ -232,9 +232,14 @@ Density::Density(Simulation_context& ctx__, bool kinetic_density__)
         validate_external_xc_context(ctx_);
     }
     if (external_xc_registered_ || kinetic_density__ || ctx_.meta_gga()) {
-        if (ctx_.num_mag_dims() == 3 || ctx_.so_correction() ||
-            (ctx_.full_potential() && ctx_.valence_relativity() != relativity_t::none && !external_xc_registered_)) {
-            RTE_THROW("kinetic-density storage requires scalar or collinear spin");
+        bool spinor = ctx_.num_mag_dims() == 3;
+        if ((spinor &&
+             (ctx_.meta_gga() || (!ctx_.full_potential() && unit_cell_.augment() && !external_xc_registered_))) ||
+            (ctx_.so_correction() && !spinor) ||
+            (ctx_.full_potential() && ctx_.valence_relativity() != relativity_t::none &&
+             ((spinor && ctx_.valence_relativity() != relativity_t::zora) || !external_xc_registered_))) {
+            RTE_THROW("kinetic-density storage requires scalar/collinear orbitals or reconstructed spinor fields; "
+                      "relativistic LAPW requires external XC and NR/ZORA radial functions for spinors");
         }
         kinetic_density_ = std::make_unique<Field4D>(ctx_, lmax_t(ctx_.lmax_rho()));
         kinetic_density_->zero();
@@ -438,6 +443,10 @@ Density::initial_density_pseudo()
                     auto ff = std::conj(ctx_.gvec_phase_factor(ig, ia)) * f;
                     auto v  = unit_cell_.atom(ia).vector_field();
                     mag(0).rg().f_pw_local(igloc) += v[2] * ff;
+                    if (ctx_.num_mag_dims() == 3) {
+                        mag(1).rg().f_pw_local(igloc) += v[0] * ff;
+                        mag(2).rg().f_pw_local(igloc) += v[1] * ff;
+                    }
                 }
             }
             for (int j = 0; j < ctx_.num_mag_dims(); j++) {

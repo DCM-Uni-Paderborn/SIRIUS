@@ -21,7 +21,14 @@ namespace sirius {
  *  Spheres must not overlap. Stored physical rho/tau already include any core
  *  contribution and SCF mixing. They are not rebuilt from density matrices,
  *  whose basis may have changed since the physical fields were generated.
- *  Collinear inputs are spin-resolved.
+ *  Collinear inputs are spin-resolved; spinor inputs are total/z/x/y, with
+ *  the unpolarized core confined to the total component.
+ *
+ *  Points belong once to the context communicator, independently of FFT layout.
+ *  All operations are collective, including empty point ranks. The geometry and
+ *  radial sampling grids must remain fixed through the forward/reverse pair.
+ *  Potential uses the adjoint for Hamiltonian assembly and discrete energy
+ *  contractions. Spherical core covectors drive the separate radial core solve.
  */
 class LAPW_xc_field_map
 {
@@ -62,12 +69,13 @@ class LAPW_xc_field_map
                                         4);
                 }
             }
-            int ns = density__.ctx().num_spins();
+            bool spinor = density__.ctx().num_mag_dims() == 3;
+            int ns      = spinor ? 4 : density__.ctx().num_spins();
             for (int s = 0; s < ns; s++) {
                 for (size_t i = 0; i < r.size(); i++) {
-                    r[i] = density__.component(0).mt()[ia__][i];
-                    t[i] = density__.kinetic_density().component(0).mt()[ia__][i];
-                    if (ns == 2) {
+                    r[i] = density__.component(spinor ? s : 0).mt()[ia__][i];
+                    t[i] = density__.kinetic_density().component(spinor ? s : 0).mt()[ia__][i];
+                    if (!spinor && ns == 2) {
                         r[i] = 0.5 * (r[i] + (1 - 2 * s) * density__.mag(0).mt()[ia__][i]);
                         t[i] = 0.5 * (t[i] + (1 - 2 * s) * density__.kinetic_density().vector(0).mt()[ia__][i]);
                     }
@@ -90,7 +98,7 @@ class LAPW_xc_field_map
     int
     num_components() const
     {
-        return ctx_.num_spins();
+        return ctx_.num_mag_dims() == 3 ? 4 : ctx_.num_spins();
     }
 
     void
@@ -130,9 +138,12 @@ class LAPW_xc_field_map
         std::string message;
         std::vector<r3::vector<double>> interstitial_points;
         try {
-            if (!ctx_.full_potential() || !density__.has_kinetic_density() || ctx_.num_mag_dims() == 3 ||
-                ctx_.so_correction() || points__.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-                RTE_THROW("LAPW XC field map requires scalar or collinear full-potential "
+            if (!ctx_.full_potential() || !density__.has_kinetic_density() ||
+                (ctx_.num_mag_dims() == 3 && ctx_.valence_relativity() != relativity_t::none &&
+                 ctx_.valence_relativity() != relativity_t::zora && ctx_.valence_relativity() != relativity_t::dirac) ||
+                (ctx_.so_correction() && ctx_.num_mag_dims() != 3) ||
+                points__.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                RTE_THROW("LAPW XC field map requires scalar-relativistic, NR/ZORA spinor or Dirac full-potential "
                           "rho/tau fields");
             }
             for (auto const& p : points__) {

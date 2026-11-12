@@ -7360,7 +7360,9 @@ sirius_set_xc_point_callback:
     double* dtau, int* status).
     Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr.
     Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1
-    total fields or ns=2 up/down fields.
+    total fields or ns=2 up/down fields. Explicit sirius_set_xc_spinor_mode
+    registration instead supplies ns=4 total/z/x/y fields for norm-conserving PW,
+    PAW, ultrasoft, and FP-LAPW. They are jointly reconstructed before the callback.
     The energy and descriptor weights do not scale those fields.
     Return raw covectors of the complete discrete energy, including model weights,
     without dividing by quadrature weights or applying host adjoints. Return the
@@ -7375,6 +7377,7 @@ sirius_set_xc_point_callback:
     CPU with scalar-relativistic radial functions.
     PW, PAW and ultrasoft forces and stress require the point geometry callbacks.
     FP-LAPW supports energy and orbital derivatives, but not forces or stress.
+    Noncollinear states use NR/ZORA second variation with SOC.
     Explicit cores support NR, ZORA and Dirac relativity.
   arguments:
     handler:
@@ -7442,6 +7445,7 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                     RTE_THROW("register external point XC before initializing the context");
                 }
                 if (!fptr__) {
+                    ctx.cb().external_xc_spinor_   = false;
                     ctx.cb().external_xc_geometry_ = nullptr;
                     ctx.cb().external_xc_pullback_ = nullptr;
                     ctx.cb().external_xc_          = nullptr;
@@ -7450,6 +7454,7 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                 }
                 auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
                                                 descriptor_weights__, block_sizes__, block_centres__);
+                ctx.cb().external_xc_spinor_   = false;
                 ctx.cb().external_xc_geometry_ = nullptr;
                 ctx.cb().external_xc_pullback_ = nullptr;
                 using callback_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
@@ -7473,6 +7478,56 @@ sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* use
                         RTE_THROW("external point XC callback returned status " + std::to_string(status));
                     }
                 };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_spinor_mode:
+  doc: >-
+    Opt into total/z/x/y fields for all registered point XC callbacks before
+    initializing the context. Their ns argument becomes four; array storage
+    remains (nr,ns) and (nr,3,ns). The energy and any geometry callback must use
+    the same convention. No local spin-axis rotation is applied.
+    FP-LAPW spinors use NR/ZORA second variation including SOC.
+    Scalar and collinear registrations retain their total and up/down fields
+    when this mode is disabled.
+    Registering a new energy callback resets the mode to disabled.
+    Called collectively on the context communicator with the same enabled value.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    enabled:
+      type: bool
+      attr: in, required
+      doc: Enable the four-component point callback convention.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_spinor_mode(void* const* handler__, bool const* enabled__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx   = get_sim_ctx(handler__);
+                int enabled = enabled__ && *enabled__;
+                int invalid = ctx.initialized() || !enabled__ ||
+                              (enabled &&
+                               (ctx.num_mag_dims() != 3 || !ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int minimum = enabled, maximum = enabled;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&minimum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&maximum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || minimum != maximum) {
+                    RTE_THROW("register a common spinor convention after point XC and before initialization");
+                }
+                ctx.cb().external_xc_spinor_ = enabled;
             },
             error_code__);
 }
