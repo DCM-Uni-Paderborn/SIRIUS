@@ -31,6 +31,7 @@ set(_SOURCES
   "hamiltonian/local_operator.cpp"
   "hamiltonian/non_local_operator.cpp"
   "density/density.cpp"
+  "density/kinetic_density.cpp"
   "density/augmentation_operator.cpp"
   "density/occupation_matrix.cpp"
   "dft/dft_ground_state.cpp"
@@ -47,12 +48,13 @@ set(_SOURCES
   "potential/paw_potential.cpp"
   "potential/poisson.cpp"
   "potential/xc.cpp"
+  "potential/meta_gga.cpp"
+  "potential/external_xc.cpp"
   "potential/xc_mt.cpp"
   "potential/potential.cpp"
   "potential/check_xc_potential.cpp"
   "unit_cell/unit_cell.cpp"
   "unit_cell/atom_type.cpp"
-  "unit_cell/atom_symmetry_class.cpp"
   "symmetry/crystal_symmetry.cpp"
   "geometry/force.cpp"
   "geometry/stress.cpp"
@@ -104,14 +106,16 @@ if(SIRIUS_USE_ROCM)
 endif()
 
 if(SIRIUS_USE_CUDA)
-   set_target_properties(sirius_cxx PROPERTIES CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+  set_target_properties(sirius_cxx PROPERTIES CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+  target_link_libraries(sirius_cxx PUBLIC CUDA::cudart CUDA::cublas
+                                          CUDA::cufft CUDA::cusolver)
 endif()
 
 target_link_libraries(sirius_cxx PUBLIC
   MPI::MPI_CXX
-  sirius::libxc
-  sirius::libspg
-  sirius::hdf5
+  Libxc::xc
+  Spglib::symspg
+  hdf5::hdf5
   costa::costa
   $<TARGET_NAME_IF_EXISTS:sirius::elpa>
   $<$<BOOL:${SIRIUS_USE_DLAF}>:DLAF::DLAF>
@@ -122,16 +126,14 @@ target_link_libraries(sirius_cxx PUBLIC
   SpFFT::spfft
   SPLA::spla
   GSL::gsl
-  $<$<BOOL:${SIRIUS_USE_DFTD3}>:sirius::dftd3>
-  $<$<BOOL:${SIRIUS_USE_DFTD4}>:sirius::dftd4 sirius::multicharge>
-  $<$<OR:$<BOOL:${SIRIUS_USE_DFTD3}>,$<BOOL:${SIRIUS_USE_DFTD4}>>:sirius::mctclib>
+  $<$<BOOL:${SIRIUS_USE_DFTD3}>:s-dftd3::s-dftd3>
+  $<$<BOOL:${SIRIUS_USE_DFTD4}>:dftd4::dftd4>
   "${SIRIUS_LINALG_LIB}"
   $<$<BOOL:${SIRIUS_USE_PUGIXML}>:pugixml::pugixml>
   $<$<BOOL:${SIRIUS_USE_VCSQNM}>:Eigen3::Eigen>
   $<$<BOOL:${SIRIUS_USE_MEMORY_POOL}>:umpire>
   $<TARGET_NAME_IF_EXISTS:CUDA::nvtx3>
   $<TARGET_NAME_IF_EXISTS:rocprofiler-sdk-roctx::rocprofiler-sdk-roctx>
-  $<TARGET_NAME_IF_EXISTS:sirius::cudalibs>
   $<$<BOOL:${SIRIUS_USE_ROCM}>:roc::rocsolver>
   $<$<BOOL:${SIRIUS_USE_ROCM}>:roc::rocblas>
   $<$<BOOL:${SIRIUS_USE_ROCM}>:hip::host>
@@ -192,7 +194,8 @@ install(TARGETS sirius_cxx
   EXPORT sirius_cxx_targets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-  INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius_cxx")
+  INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius/src"
+                       "${CMAKE_INSTALL_INCLUDEDIR}/sirius")
 install(EXPORT sirius_cxx_targets
   FILE sirius_cxxTargets.cmake
   NAMESPACE sirius::

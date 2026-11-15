@@ -842,11 +842,13 @@ class config_t
         }
         /// Level of verbosity.
         /**
-            The following convention in proposed:
-              - 0: silent mode (no output is printed)
-              - 1: basic output (low level of output)
-              - 2: extended output (medium level of output)
-              - 3: extensive output (high level of output)
+            Output levels:
+              - 0: silent mode
+              - 1: basic simulation information, compact SCF progress, final observables and a short timing table
+              - 2: original level 1 (basic output, including per-iteration density and energy reports)
+              - 3: original level 2 (extended output)
+              - 4: original level 3 (extensive output)
+            Verification and explicit diagnostic environment settings are unchanged.
         */
         inline auto verbosity() const
         {
@@ -1809,6 +1811,66 @@ class config_t
             }
             dict_["/dftd4/three_body"_json_pointer] = three_body__;
         }
+        /// Two-body dispersion cutoff (Bohr)
+        inline auto cutoff_disp2() const
+        {
+            return dict_.at("/dftd4/cutoff_disp2"_json_pointer).get<double>();
+        }
+        inline void cutoff_disp2(double cutoff_disp2__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd4/cutoff_disp2"_json_pointer] = cutoff_disp2__;
+        }
+        /// Three-body dispersion cutoff (Bohr)
+        inline auto cutoff_disp3() const
+        {
+            return dict_.at("/dftd4/cutoff_disp3"_json_pointer).get<double>();
+        }
+        inline void cutoff_disp3(double cutoff_disp3__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd4/cutoff_disp3"_json_pointer] = cutoff_disp3__;
+        }
+        /// Coordination-number cutoff (Bohr)
+        inline auto cutoff_cn() const
+        {
+            return dict_.at("/dftd4/cutoff_cn"_json_pointer).get<double>();
+        }
+        inline void cutoff_cn(double cutoff_cn__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd4/cutoff_cn"_json_pointer] = cutoff_cn__;
+        }
+        /// Two-body smooth switching width (Bohr); zero disables smoothing
+        inline auto cutoff_width2() const
+        {
+            return dict_.at("/dftd4/cutoff_width2"_json_pointer).get<double>();
+        }
+        inline void cutoff_width2(double cutoff_width2__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd4/cutoff_width2"_json_pointer] = cutoff_width2__;
+        }
+        /// Three-body smooth switching width (Bohr); zero disables smoothing
+        inline auto cutoff_width3() const
+        {
+            return dict_.at("/dftd4/cutoff_width3"_json_pointer).get<double>();
+        }
+        inline void cutoff_width3(double cutoff_width3__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd4/cutoff_width3"_json_pointer] = cutoff_width3__;
+        }
         /// parameters controlling the damping.
         /**
             Optional parameters that control the damping.
@@ -1973,6 +2035,66 @@ class config_t
                 throw std::runtime_error(locked_msg);
             }
             dict_["/dftd3/three_body"_json_pointer] = three_body__;
+        }
+        /// Two-body dispersion cutoff (Bohr)
+        inline auto cutoff_disp2() const
+        {
+            return dict_.at("/dftd3/cutoff_disp2"_json_pointer).get<double>();
+        }
+        inline void cutoff_disp2(double cutoff_disp2__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd3/cutoff_disp2"_json_pointer] = cutoff_disp2__;
+        }
+        /// Three-body dispersion cutoff (Bohr)
+        inline auto cutoff_disp3() const
+        {
+            return dict_.at("/dftd3/cutoff_disp3"_json_pointer).get<double>();
+        }
+        inline void cutoff_disp3(double cutoff_disp3__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd3/cutoff_disp3"_json_pointer] = cutoff_disp3__;
+        }
+        /// Coordination-number cutoff (Bohr)
+        inline auto cutoff_cn() const
+        {
+            return dict_.at("/dftd3/cutoff_cn"_json_pointer).get<double>();
+        }
+        inline void cutoff_cn(double cutoff_cn__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd3/cutoff_cn"_json_pointer] = cutoff_cn__;
+        }
+        /// Two-body smooth switching width (Bohr); zero disables smoothing
+        inline auto cutoff_width2() const
+        {
+            return dict_.at("/dftd3/cutoff_width2"_json_pointer).get<double>();
+        }
+        inline void cutoff_width2(double cutoff_width2__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd3/cutoff_width2"_json_pointer] = cutoff_width2__;
+        }
+        /// Three-body smooth switching width (Bohr); zero disables smoothing
+        inline auto cutoff_width3() const
+        {
+            return dict_.at("/dftd3/cutoff_width3"_json_pointer).get<double>();
+        }
+        inline void cutoff_width3(double cutoff_width3__)
+        {
+            if (dict_.contains("locked")) {
+                throw std::runtime_error(locked_msg);
+            }
+            dict_["/dftd3/cutoff_width3"_json_pointer] = cutoff_width3__;
         }
         /// name of the xc functional that determinates the default parameters. It should match the XC functional from libxc
         inline auto method() const

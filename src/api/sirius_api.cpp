@@ -344,6 +344,35 @@ phase_Rlm_QE(Atom_type const& type__, int xi__)
     return (type__.indexb(xi__).m < 0 && (-type__.indexb(xi__).m) % 2 == 0) ? -1 : 1;
 }
 
+static std::shared_ptr<sirius::xc_point_set_t>
+copy_xc_point_set(Simulation_context const& ctx, int const* num_points, int const* num_blocks,
+                  double const* coordinates, double const* energy_weights, double const* descriptor_weights,
+                  int const* block_sizes, double const* block_centres)
+{
+    int nr      = num_points ? *num_points : -1;
+    int nb      = num_blocks ? *num_blocks : -1;
+    int invalid = nr < 0 || nb < 0 || (nr > 0 && (!coordinates || !energy_weights || !descriptor_weights)) ||
+                  (nb > 0 && (!block_sizes || !block_centres));
+    ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("invalid external point XC array arguments on a context rank");
+    }
+    auto points = std::make_shared<sirius::xc_point_set_t>(ctx);
+    for (int p = 0; p < nr; p++) {
+        size_t offset = 3 * static_cast<size_t>(p);
+        points->coordinates.push_back({coordinates[offset], coordinates[offset + 1], coordinates[offset + 2]});
+        points->energy_weights.push_back(energy_weights[p]);
+        points->descriptor_weights.push_back(descriptor_weights[p]);
+    }
+    for (int b = 0; b < nb; b++) {
+        size_t offset = 3 * static_cast<size_t>(b);
+        points->block_sizes.push_back(block_sizes[b]);
+        points->block_centres.push_back({block_centres[offset], block_centres[offset + 1], block_centres[offset + 2]});
+    }
+    points->validate(ctx);
+    return points;
+}
+
 extern "C" {
 
 /*
@@ -2680,7 +2709,7 @@ sirius_initialize_subspace(void* const* gs_handler__, void* const* ks_handler__,
             [&]() {
                 auto& gs = get_gs(gs_handler__);
                 auto& ks = get_ks(ks_handler__);
-                Hamiltonian0<double> H0(gs.potential(), true);
+                Hamiltonian0<double> H0(gs.potential());
                 initialize_subspace(ks, H0);
             },
             error_code__);
@@ -2741,16 +2770,16 @@ sirius_find_eigen_states(void* const* gs_handler__, void* const* ks_handler__, b
                 //if (precompute_pw__ && *precompute_pw__) {
                 //    gs.potential().generate_pw_coefs();
                 //}
-                if ((precompute_rf__ && *precompute_rf__) || (precompute_ri__ && *precompute_ri__)) {
-                    gs.potential().update_atomic_potential();
-                }
-                if (precompute_rf__ && *precompute_rf__) {
-                    const_cast<Unit_cell&>(gs.ctx().unit_cell()).generate_radial_functions(gs.ctx().out());
-                }
-                if (precompute_ri__ && *precompute_ri__) {
-                    const_cast<Unit_cell&>(gs.ctx().unit_cell()).generate_radial_integrals();
-                }
-                Hamiltonian0<double> H0(gs.potential(), false);
+                //if ((precompute_rf__ && *precompute_rf__) || (precompute_ri__ && *precompute_ri__)) {
+                //    gs.potential().update_atomic_potential();
+                //}
+                //if (precompute_rf__ && *precompute_rf__) {
+                //    const_cast<Unit_cell&>(gs.ctx().unit_cell()).generate_radial_functions(gs.ctx().out());
+                //}
+                //if (precompute_ri__ && *precompute_ri__) {
+                //    const_cast<Unit_cell&>(gs.ctx().unit_cell()).generate_radial_integrals();
+                //}
+                Hamiltonian0<double> H0(gs.potential(), gs.potential().create_lapw_basis());
                 diagonalize<double, double>(H0, ks, tol, steps);
             },
             error_code__);
@@ -2858,7 +2887,8 @@ sirius_generate_density(void* const* gs_handler__, bool const* add_core__, bool 
                 if (paw_only) {
                     gs.density().generate_paw_density();
                 } else {
-                    gs.density().generate<double>(gs.k_point_set(), gs.ctx().use_symmetry(), add_core, transform_to_rg);
+                    gs.density().generate<double>(gs.k_point_set(), gs.potential().create_lapw_basis().get(),
+                                                  gs.ctx().use_symmetry(), add_core, transform_to_rg);
                 }
             },
             error_code__);
@@ -4178,33 +4208,33 @@ sirius_set_h_radial_integrals(void* const* handler__, int* ia__, int* lmmax__, d
 {
     call_sirius(
             [&]() {
-                auto& sim_ctx = get_sim_ctx(handler__);
-                int ia        = *ia__ - 1;
-                int idxrf1{-1};
-                int idxrf2{-1};
-                if ((l1__ != nullptr && o1__ != nullptr && ilo1__ != nullptr) ||
-                    (l2__ != nullptr && o2__ != nullptr && ilo2__ != nullptr)) {
-                    RTE_THROW("wrong combination of radial function indices");
-                }
-                if (l1__ != nullptr && o1__ != nullptr) {
-                    idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l1__, *o1__ - 1);
-                } else if (ilo1__ != nullptr) {
-                    idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
-                } else {
-                    RTE_THROW("1st radial function index is not valid");
-                }
+                //auto& sim_ctx = get_sim_ctx(handler__);
+                //int ia        = *ia__ - 1;
+                //int idxrf1{-1};
+                //int idxrf2{-1};
+                //if ((l1__ != nullptr && o1__ != nullptr && ilo1__ != nullptr) ||
+                //    (l2__ != nullptr && o2__ != nullptr && ilo2__ != nullptr)) {
+                //    RTE_THROW("wrong combination of radial function indices");
+                //}
+                //if (l1__ != nullptr && o1__ != nullptr) {
+                //    idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l1__, *o1__ - 1);
+                //} else if (ilo1__ != nullptr) {
+                //    idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
+                //} else {
+                //    RTE_THROW("1st radial function index is not valid");
+                //}
 
-                if (l2__ != nullptr && o2__ != nullptr) {
-                    idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l2__, *o2__ - 1);
-                } else if (ilo2__ != nullptr) {
-                    idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
-                } else {
-                    RTE_THROW("2nd radial function index is not valid");
-                }
+                //if (l2__ != nullptr && o2__ != nullptr) {
+                //    idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l2__, *o2__ - 1);
+                //} else if (ilo2__ != nullptr) {
+                //    idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
+                //} else {
+                //    RTE_THROW("2nd radial function index is not valid");
+                //}
 
-                for (int lm = 0; lm < *lmmax__; lm++) {
-                    sim_ctx.unit_cell().atom(ia).h_radial_integrals(idxrf1, idxrf2)[lm] = val__[lm];
-                }
+                //for (int lm = 0; lm < *lmmax__; lm++) {
+                //    sim_ctx.unit_cell().atom(ia).h_radial_integrals(idxrf1, idxrf2)[lm] = val__[lm];
+                //}
             },
             error_code__);
 }
@@ -4257,37 +4287,37 @@ sirius_set_o_radial_integral(void* const* handler__, int* ia__, double* val__, i
                              int* o2__, int* ilo2__, int* error_code__)
 {
 
-    call_sirius(
-            [&]() {
-                auto& sim_ctx = get_sim_ctx(handler__);
-                int ia        = *ia__ - 1;
-                if ((o1__ != nullptr && ilo1__ != nullptr) || (o2__ != nullptr && ilo2__ != nullptr)) {
-                    RTE_THROW("wrong combination of radial function indices");
-                }
+    //call_sirius(
+    //        [&]() {
+    //            auto& sim_ctx = get_sim_ctx(handler__);
+    //            int ia        = *ia__ - 1;
+    //            if ((o1__ != nullptr && ilo1__ != nullptr) || (o2__ != nullptr && ilo2__ != nullptr)) {
+    //                RTE_THROW("wrong combination of radial function indices");
+    //            }
 
-                if (o1__ != nullptr && ilo2__ != nullptr) {
-                    int idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
-                    int order2 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf2).order;
-                    sim_ctx.unit_cell().atom(ia).symmetry_class().set_o_radial_integral(*l__, *o1__ - 1, order2,
-                                                                                        *val__);
-                }
+    //            if (o1__ != nullptr && ilo2__ != nullptr) {
+    //                int idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
+    //                int order2 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf2).order;
+    //                sim_ctx.unit_cell().atom(ia).symmetry_class().set_o_radial_integral(*l__, *o1__ - 1, order2,
+    //                                                                                    *val__);
+    //            }
 
-                if (o2__ != nullptr && ilo1__ != nullptr) {
-                    int idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
-                    int order1 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf1).order;
-                    sim_ctx.unit_cell().atom(ia).symmetry_class().set_o_radial_integral(*l__, order1, *o2__ - 1,
-                                                                                        *val__);
-                }
+    //            if (o2__ != nullptr && ilo1__ != nullptr) {
+    //                int idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
+    //                int order1 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf1).order;
+    //                sim_ctx.unit_cell().atom(ia).symmetry_class().set_o_radial_integral(*l__, order1, *o2__ - 1,
+    //                                                                                    *val__);
+    //            }
 
-                if (ilo1__ != nullptr && ilo2__ != nullptr) {
-                    int idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
-                    int order1 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf1).order;
-                    int idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
-                    int order2 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf2).order;
-                    sim_ctx.unit_cell().atom(ia).symmetry_class().set_o_radial_integral(*l__, order1, order2, *val__);
-                }
-            },
-            error_code__);
+    //            if (ilo1__ != nullptr && ilo2__ != nullptr) {
+    //                int idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
+    //                int order1 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf1).order;
+    //                int idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
+    //                int order2 = sim_ctx.unit_cell().atom(ia).type().indexr(idxrf2).order;
+    //                sim_ctx.unit_cell().atom(ia).symmetry_class().set_o_radial_integral(*l__, order1, order2, *val__);
+    //            }
+    //        },
+    //        error_code__);
 }
 
 /*
@@ -4341,34 +4371,34 @@ void
 sirius_set_o1_radial_integral(void* const* handler__, int* ia__, double* val__, int* l1__, int* o1__, int* ilo1__,
                               int* l2__, int* o2__, int* ilo2__, int* error_code__)
 {
-    call_sirius(
-            [&]() {
-                auto& sim_ctx = get_sim_ctx(handler__);
-                int ia        = *ia__ - 1;
-                int idxrf1{-1};
-                int idxrf2{-1};
-                if ((l1__ != nullptr && o1__ != nullptr && ilo1__ != nullptr) ||
-                    (l2__ != nullptr && o2__ != nullptr && ilo2__ != nullptr)) {
-                    RTE_THROW("wrong combination of radial function indices");
-                }
-                if (l1__ != nullptr && o1__ != nullptr) {
-                    idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l1__, *o1__ - 1);
-                } else if (ilo1__ != nullptr) {
-                    idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
-                } else {
-                    RTE_THROW("1st radial function index is not valid");
-                }
+    //call_sirius(
+    //        [&]() {
+    //            auto& sim_ctx = get_sim_ctx(handler__);
+    //            int ia        = *ia__ - 1;
+    //            int idxrf1{-1};
+    //            int idxrf2{-1};
+    //            if ((l1__ != nullptr && o1__ != nullptr && ilo1__ != nullptr) ||
+    //                (l2__ != nullptr && o2__ != nullptr && ilo2__ != nullptr)) {
+    //                RTE_THROW("wrong combination of radial function indices");
+    //            }
+    //            if (l1__ != nullptr && o1__ != nullptr) {
+    //                idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l1__, *o1__ - 1);
+    //            } else if (ilo1__ != nullptr) {
+    //                idxrf1 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo1__ - 1);
+    //            } else {
+    //                RTE_THROW("1st radial function index is not valid");
+    //            }
 
-                if (l2__ != nullptr && o2__ != nullptr) {
-                    idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l2__, *o2__ - 1);
-                } else if (ilo2__ != nullptr) {
-                    idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
-                } else {
-                    RTE_THROW("2nd radial function index is not valid");
-                }
-                sim_ctx.unit_cell().atom(ia).symmetry_class().set_o1_radial_integral(idxrf1, idxrf2, *val__);
-            },
-            error_code__);
+    //            if (l2__ != nullptr && o2__ != nullptr) {
+    //                idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_l_order(*l2__, *o2__ - 1);
+    //            } else if (ilo2__ != nullptr) {
+    //                idxrf2 = sim_ctx.unit_cell().atom(ia).type().indexr_by_idxlo(*ilo2__ - 1);
+    //            } else {
+    //                RTE_THROW("2nd radial function index is not valid");
+    //            }
+    //            sim_ctx.unit_cell().atom(ia).symmetry_class().set_o1_radial_integral(idxrf1, idxrf2, *val__);
+    //        },
+    //        error_code__);
 }
 
 /*
@@ -4414,45 +4444,45 @@ void
 sirius_set_radial_function(void* const* handler__, int const* ia__, int const* deriv_order__, double const* f__,
                            int const* l__, int const* o__, int const* ilo__, int* error_code__)
 {
-    call_sirius(
-            [&]() {
-                auto& sim_ctx = get_sim_ctx(handler__);
+    //call_sirius(
+    //        [&]() {
+    //            auto& sim_ctx = get_sim_ctx(handler__);
 
-                int ia = *ia__ - 1;
+    //            int ia = *ia__ - 1;
 
-                auto& atom = sim_ctx.unit_cell().atom(ia);
-                int n      = atom.num_mt_points();
+    //            auto& atom = sim_ctx.unit_cell().atom(ia);
+    //            int n      = atom.num_mt_points();
 
-                if (l__ != nullptr && o__ != nullptr && ilo__ != nullptr) {
-                    RTE_THROW("wrong combination of radial function indices");
-                }
-                if (!(*deriv_order__ == 0 || *deriv_order__ == 1)) {
-                    RTE_THROW("wrond radial derivative order");
-                }
+    //            if (l__ != nullptr && o__ != nullptr && ilo__ != nullptr) {
+    //                RTE_THROW("wrong combination of radial function indices");
+    //            }
+    //            if (!(*deriv_order__ == 0 || *deriv_order__ == 1)) {
+    //                RTE_THROW("wrond radial derivative order");
+    //            }
 
-                int idxrf{-1};
-                if (l__ != nullptr && o__ != nullptr) {
-                    idxrf = atom.type().indexr_by_l_order(*l__, *o__ - 1);
-                } else if (ilo__ != nullptr) {
-                    idxrf = atom.type().indexr_by_idxlo(*ilo__ - 1);
-                } else {
-                    RTE_THROW("radial function index is not valid");
-                }
+    //            int idxrf{-1};
+    //            if (l__ != nullptr && o__ != nullptr) {
+    //                idxrf = atom.type().indexr_by_l_order(*l__, *o__ - 1);
+    //            } else if (ilo__ != nullptr) {
+    //                idxrf = atom.type().indexr_by_idxlo(*ilo__ - 1);
+    //            } else {
+    //                RTE_THROW("radial function index is not valid");
+    //            }
 
-                if (*deriv_order__ == 0) {
-                    atom.symmetry_class().radial_function(idxrf, std::vector<double>(f__, f__ + n));
-                } else {
-                    std::vector<double> f(n);
-                    for (int ir = 0; ir < n; ir++) {
-                        f[ir] = f__[ir] * atom.type().radial_grid()[ir];
-                    }
-                    atom.symmetry_class().radial_function_derivative(idxrf, f);
-                }
-                if (l__ != nullptr && o__ != nullptr) {
-                    atom.symmetry_class().aw_surface_deriv(*l__, *o__ - 1, *deriv_order__, f__[n - 1]);
-                }
-            },
-            error_code__);
+    //            if (*deriv_order__ == 0) {
+    //                atom.symmetry_class().radial_function(idxrf, std::vector<double>(f__, f__ + n));
+    //            } else {
+    //                std::vector<double> f(n);
+    //                for (int ir = 0; ir < n; ir++) {
+    //                    f[ir] = f__[ir] * atom.type().radial_grid()[ir];
+    //                }
+    //                atom.symmetry_class().radial_function_derivative(idxrf, f);
+    //            }
+    //            if (l__ != nullptr && o__ != nullptr) {
+    //                atom.symmetry_class().aw_surface_deriv(*l__, *o__ - 1, *deriv_order__, f__[n - 1]);
+    //            }
+    //        },
+    //        error_code__);
 }
 
 /*
@@ -4503,12 +4533,12 @@ sirius_update_atomic_potential:
 void
 sirius_update_atomic_potential(void* const* gs_handler__, int* error_code__)
 {
-    call_sirius(
-            [&]() {
-                auto& gs = get_gs(gs_handler__);
-                gs.potential().update_atomic_potential();
-            },
-            error_code__);
+    //call_sirius(
+    //        [&]() {
+    //            auto& gs = get_gs(gs_handler__);
+    //            gs.potential().update_atomic_potential();
+    //        },
+    //        error_code__);
 }
 
 /*
@@ -6982,8 +7012,8 @@ sirius_create_hamiltonian(void* const* gs_handler__, void** H0_handler__, int* e
                 // We assume that the GS density is up to date
                 bool transform_to_rg{true};
                 gs.potential().generate(gs.density(), gs.ctx().use_symmetry(), transform_to_rg);
-                bool precompute_lapw{false};
-                *H0_handler__ = new any_ptr(new Hamiltonian0<double>(gs.potential(), precompute_lapw));
+                *H0_handler__ =
+                        new any_ptr(new Hamiltonian0<double>(gs.potential(), gs.potential().create_lapw_basis()));
             },
             error_code__);
 }
@@ -7178,6 +7208,483 @@ sirius_set_dftd4_correction(void* const* handler__, char const* method__, char c
                 if (damping_term__ != nullptr) {
                     sim_ctx.cfg().dftd4().damping_values(damping_term__);
                 }
+            },
+            error_code__);
+}
+/*
+@api begin
+sirius_set_xc_callback:
+  doc: >-
+    Register an external XC evaluator before initializing the context.
+    SIRIUS supplies fields generated from its orbitals. The caller evaluates XC
+    in the same process and returns the energy and primitive-field derivatives.
+    The callback is collective on the context communicator and has the C signature
+    void callback(void* user_data, int nr, int ns, const int* grid_dims,
+    int z_offset, int fcomm_context, int fcomm_fft,
+    const double* lattice, double weight, const double* rho,
+    const double* gradient, const double* tau, double* energy,
+    double* vrho, double* vgradient, double* vtau, int* status).
+    All fields use atomic units. Scalar arrays have Fortran shape (nr,ns),
+    gradients (nr,3,ns), and lattice (3,3) with lattice vectors in columns.
+    grid_dims contains the three global FFT dimensions. Local points are a
+    contiguous z slab starting at zero-based z_offset, with x varying fastest.
+    ns=1 denotes total density and tau, ns=2 denotes up and down channels.
+    weight is the volume per FFT point. Return the same total XC energy on
+    every context rank, including ranks with an empty slab. FFT replicas
+    must not be counted twice. fcomm_fft partitions one complete grid.
+    Return derivatives of the full discrete energy divided by weight.
+    SIRIUS applies the gradient adjoint and tau operator itself.
+    Output arrays and status are initially zero. On failure set status nonzero
+    after completing all callback collectives. Do not unwind across the C ABI.
+    The caller owns user_data and keeps it alive until the context is destroyed.
+    A null function pointer disables the callback before context initialization.
+    Currently supported for CPU norm-conserving PW calculations without core
+    charge, SOC, or noncollinear magnetism. Forces and stress are not supported.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: Pointer to a C-interoperable XC callback.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Opaque callback state, which may be null.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx   = get_sim_ctx(handler__);
+                int enabled = fptr__ != nullptr, minimum = enabled, maximum = enabled;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&minimum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&maximum, 1);
+                if (minimum != maximum) {
+                    RTE_THROW("external XC registration must agree on all context ranks");
+                }
+                if (ctx.initialized()) {
+                    RTE_THROW("register external XC before initializing the context");
+                }
+                if (!fptr__) {
+                    ctx.cb().external_xc_ = nullptr;
+                    ctx.cb().external_xc_points_.reset();
+                    ctx.cb().external_xc_geometry_ = nullptr;
+                    ctx.cb().external_xc_pullback_ = nullptr;
+                    return;
+                }
+                using callback_t =
+                        void (*)(void*, int, int, int const*, int, int, int, double const*, double, double const*,
+                                 double const*, double const*, double*, double*, double*, double*, int*);
+                auto callback = reinterpret_cast<callback_t>(fptr__);
+                ctx.cb().external_xc_points_.reset();
+                ctx.cb().external_xc_geometry_ = nullptr;
+                ctx.cb().external_xc_pullback_ = nullptr;
+                ctx.cb().external_xc_          = [callback, user_data__](auto const& c, auto const& in, auto& out) {
+                    if (in.points) {
+                        RTE_THROW("the FFT XC callback cannot evaluate an arbitrary point set");
+                    }
+                    auto const& fft = c.template spfft<double>();
+                    int dims[]      = {fft.dim_x(), fft.dim_y(), fft.dim_z()};
+                    double lattice[9];
+                    for (int j = 0; j < 3; j++) {
+                        for (int i = 0; i < 3; i++) {
+                            lattice[i + 3 * j] = c.unit_cell().lattice_vectors()(i, j);
+                        }
+                    }
+                    int status{0};
+                    callback(user_data__, in.num_points, in.num_spins, dims, fft.local_z_offset(),
+                             MPI_Comm_c2f(c.comm().native()), MPI_Comm_c2f(fft.communicator()), lattice,
+                             in.point_weight, in.rho, in.gradient, in.tau, &out.energy, out.vrho, out.vgradient,
+                             out.vtau, &status);
+                    if (status) {
+                        RTE_THROW("external XC callback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_point_callback:
+  doc: >-
+    Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature
+    before initializing the context, after defining all atoms and lattice vectors.
+    These are real-space integration points, not k points. SIRIUS reconstructs
+    the fields from its orbitals. The caller evaluates XC in the same process
+    and returns the energy and primitive-field derivatives. SIRIUS maps these
+    derivatives back to the PW Hamiltonian.
+    Each complete atom block is owned once across the context communicator.
+    Empty local arrays are permitted. The callback has the C signature
+    void callback(void* user_data, int nr, int ns, int nb, int fcomm,
+    const double* coordinates, const double* energy_weights,
+    const double* descriptor_weights, const int* block_sizes,
+    const double* block_centres, const double* rho, const double* gradient,
+    const double* tau, double* energy, double* drho, double* dgradient,
+    double* dtau, int* status).
+    Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr.
+    Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units.
+    ns=1 denotes total fields and ns=2 up/down fields. Weights do not scale
+    the physical fields. Return the same globally summed energy on every rank
+    and raw derivatives of the complete discrete energy, including nonlocal
+    descriptor contributions and weights. Do not divide by quadrature weights
+    or apply the sampling/gradient adjoint in the callback.
+    Output arrays and status are initially zero. On failure set status nonzero
+    after completing callback collectives. Never unwind across the C ABI.
+    The caller retains user_data until the context is destroyed.
+    Currently supported for CPU scalar/collinear fp64 norm-conserving PW
+    calculations without core charge, SOC or symmetry reduction. Forces and stress
+    require the additional point geometry callbacks.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable point callback. Null disables external XC.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Opaque callback state, which may be null.
+    num_points:
+      type: int
+      attr: in, required
+      doc: Number of local point rows.
+    num_blocks:
+      type: int
+      attr: in, required
+      doc: Number of complete local atom blocks.
+    coordinates:
+      type: double
+      attr: in, required, dimension(3,num_points)
+      doc: Cartesian target coordinates.
+    energy_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Energy quadrature and partition weights.
+    descriptor_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Independent descriptor quadrature weights.
+    block_sizes:
+      type: int
+      attr: in, required, dimension(num_blocks)
+      doc: Positive consecutive row counts summing to num_points.
+    block_centres:
+      type: double
+      attr: in, required, dimension(3,num_blocks)
+      doc: Cartesian centres of the atom blocks.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_point_callback(void* const* handler__, void (*fptr__)(), void* user_data__, int const* num_points__,
+                             int const* num_blocks__, double const* coordinates__, double const* energy_weights__,
+                             double const* descriptor_weights__, int const* block_sizes__,
+                             double const* block_centres__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx   = get_sim_ctx(handler__);
+                int enabled = fptr__ != nullptr, minimum = enabled, maximum = enabled;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&minimum, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&maximum, 1);
+                if (minimum != maximum) {
+                    RTE_THROW("external XC registration must agree on all context ranks");
+                }
+                if (ctx.initialized()) {
+                    RTE_THROW("register external point XC before initializing the context");
+                }
+                if (!fptr__) {
+                    ctx.cb().external_xc_ = nullptr;
+                    ctx.cb().external_xc_points_.reset();
+                    ctx.cb().external_xc_geometry_ = nullptr;
+                    ctx.cb().external_xc_pullback_ = nullptr;
+                    return;
+                }
+                auto points      = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
+                                                     descriptor_weights__, block_sizes__, block_centres__);
+                using callback_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
+                                            int const*, double const*, double const*, double const*, double const*,
+                                            double*, double*, double*, double*, int*);
+                auto callback    = reinterpret_cast<callback_t>(fptr__);
+                ctx.cb().external_xc_points_   = points;
+                ctx.cb().external_xc_geometry_ = nullptr;
+                ctx.cb().external_xc_pullback_ = nullptr;
+                ctx.cb().external_xc_          = [callback, user_data__](auto const& c, auto const& in, auto& out) {
+                    if (!in.points) {
+                        RTE_THROW("the point XC callback requires an explicit point quadrature");
+                    }
+                    auto const& p = *in.points;
+                    int status{0};
+                    callback(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
+                             MPI_Comm_c2f(c.comm().native()),
+                             p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
+                             p.descriptor_weights.data(), p.block_sizes.data(),
+                             p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
+                             in.tau, &out.energy, out.vrho, out.vgradient, out.vtau, &status);
+                    if (status) {
+                        RTE_THROW("external point XC callback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+/*
+@api begin
+sirius_update_xc_point_set:
+  doc: >-
+    Replace the copied quadrature of an initialized external point XC context
+    without changing its field or geometry callbacks or their user data.
+    Call collectively between SCF calculations, after setting the new lattice
+    and atom positions and before updating the ground state. This call does not
+    update the density, potential or orbitals. Local point and block counts may
+    change, including redistribution to previously empty ranks. The array
+    conventions are those of sirius_set_xc_point_callback. An invalid replacement
+    leaves the previous quadrature and callbacks unchanged.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Initialized simulation context handler.
+    num_points:
+      type: int
+      attr: in, required
+      doc: Number of local point rows.
+    num_blocks:
+      type: int
+      attr: in, required
+      doc: Number of complete local atom blocks.
+    coordinates:
+      type: double
+      attr: in, required, dimension(3,num_points)
+      doc: Cartesian target coordinates.
+    energy_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Energy quadrature and partition weights.
+    descriptor_weights:
+      type: double
+      attr: in, required, dimension(num_points)
+      doc: Independent descriptor quadrature weights.
+    block_sizes:
+      type: int
+      attr: in, required, dimension(num_blocks)
+      doc: Positive consecutive row counts summing to num_points.
+    block_centres:
+      type: double
+      attr: in, required, dimension(3,num_blocks)
+      doc: Cartesian centres of the atom blocks.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_update_xc_point_set(void* const* handler__, int const* num_points__, int const* num_blocks__,
+                           double const* coordinates__, double const* energy_weights__,
+                           double const* descriptor_weights__, int const* block_sizes__, double const* block_centres__,
+                           int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx   = get_sim_ctx(handler__);
+                int invalid = !ctx.initialized() || !ctx.cb().external_xc_ || !ctx.cb().external_xc_points_;
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid) {
+                    RTE_THROW("updating XC points requires an initialized external point XC context");
+                }
+                auto points = copy_xc_point_set(ctx, num_points__, num_blocks__, coordinates__, energy_weights__,
+                                                descriptor_weights__, block_sizes__, block_centres__);
+                ctx.cb().external_xc_points_ = std::move(points);
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_set_xc_point_geometry_callbacks:
+  doc: >-
+    Register optional geometry callbacks after the point XC evaluator and before
+    context initialization. The field callback has the same C arguments as the
+    point XC callback, with four additional double pointers before status.
+    These return raw coordinate (3,nr), energy-weight (nr), descriptor-weight
+    (nr) and block-centre (3,nb) derivatives at fixed physical fields.
+    Evaluate the same discrete energy and field derivatives as the point callback.
+    All explicit atom/cell dependence must enter through these quadrature inputs.
+    The pullback callback has C signature
+    void pullback(void* user_data, int nr, int nb, int natom, int fcomm,
+    const int* block_sizes, const double* dcoordinates, const double* denergy_weights,
+    const double* ddescriptor_weights, const double* dblock_centres,
+    double* datoms, double* dlattice, int* status).
+    SIRIUS adds field-sampling derivatives to dcoordinates before the pullback.
+    The host returns globally summed Cartesian atom (3,natom) and cell (3,3)
+    derivatives, identical on every rank. Lattice vectors are columns and the
+    cell derivative holds Cartesian atoms fixed. Apply no force sign or volume
+    normalization. SIRIUS adds the Fourier cell response and the PW normalization
+    and kinetic-density metric terms when evaluating total stress.
+    Callbacks are collective, including empty ranks. Outputs start at zero.
+    Set status nonzero on failure without unwinding across the C ABI.
+    Both null pointers disable geometry evaluation. The initial scope matches
+    the CPU scalar/collinear norm-conserving point XC evaluator.
+  arguments:
+    handler:
+      type: ctx_handler
+      attr: in, required
+      doc: Simulation context handler.
+    field_fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable field and geometry evaluator.
+    pullback_fptr:
+      type: func
+      attr: in, required, value
+      doc: C-interoperable quadrature pullback.
+    user_data:
+      type: void*
+      attr: in, required, value
+      doc: Caller-owned state retained until context destruction.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_set_xc_point_geometry_callbacks(void* const* handler__, void (*field_fptr__)(), void (*pullback_fptr__)(),
+                                       void* user_data__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& ctx       = get_sim_ctx(handler__);
+                int invalid     = ctx.initialized() || bool(field_fptr__) != bool(pullback_fptr__) ||
+                                  (field_fptr__ && (!ctx.cb().external_xc_ || !ctx.cb().external_xc_points_));
+                int enabled_min = bool(field_fptr__), enabled_max = enabled_min;
+                ctx.comm().allreduce<int, mpi::op_t::min>(&enabled_min, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&enabled_max, 1);
+                ctx.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid || enabled_min != enabled_max) {
+                    RTE_THROW("register both XC geometry callbacks collectively after point XC and before "
+                              "initialization");
+                }
+                if (!field_fptr__) {
+                    ctx.cb().external_xc_geometry_ = nullptr;
+                    ctx.cb().external_xc_pullback_ = nullptr;
+                    return;
+                }
+                using field_t = void (*)(void*, int, int, int, int, double const*, double const*, double const*,
+                                         int const*, double const*, double const*, double const*, double const*,
+                                         double*, double*, double*, double*, double*, double*, double*, double*, int*);
+                using pullback_t = void (*)(void*, int, int, int, int, int const*, double const*, double const*,
+                                            double const*, double const*, double*, double*, int*);
+                auto field       = reinterpret_cast<field_t>(field_fptr__);
+                auto pullback    = reinterpret_cast<pullback_t>(pullback_fptr__);
+                ctx.cb().external_xc_geometry_ = [field, user_data__](auto const& c, auto const& in, auto& out) {
+                    if (!in.points || !out.geometry) {
+                        RTE_THROW("the XC geometry callback requires explicit point inputs and geometry outputs");
+                    }
+                    auto const& p = *in.points;
+                    auto& d       = *out.geometry;
+                    int status{0};
+                    field(user_data__, in.num_points, in.num_spins, static_cast<int>(p.block_sizes.size()),
+                          MPI_Comm_c2f(c.comm().native()),
+                          p.coordinates.empty() ? nullptr : p.coordinates.front().data(), p.energy_weights.data(),
+                          p.descriptor_weights.data(), p.block_sizes.data(),
+                          p.block_centres.empty() ? nullptr : p.block_centres.front().data(), in.rho, in.gradient,
+                          in.tau, &out.energy, out.vrho, out.vgradient, out.vtau,
+                          d.coordinates.empty() ? nullptr : d.coordinates.front().data(), d.energy_weights.data(),
+                          d.descriptor_weights.data(),
+                          d.block_centres.empty() ? nullptr : d.block_centres.front().data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC geometry callback returned status " + std::to_string(status));
+                    }
+                };
+                ctx.cb().external_xc_pullback_ = [pullback, user_data__](auto const& c, auto const& p, auto const& d,
+                                                                         auto& out) {
+                    int status{0};
+                    pullback(user_data__, static_cast<int>(p.coordinates.size()),
+                             static_cast<int>(p.block_sizes.size()), c.unit_cell().num_atoms(),
+                             MPI_Comm_c2f(c.comm().native()), p.block_sizes.data(),
+                             d.coordinates.empty() ? nullptr : d.coordinates.front().data(), d.energy_weights.data(),
+                             d.descriptor_weights.data(),
+                             d.block_centres.empty() ? nullptr : d.block_centres.front().data(),
+                             out.atoms.empty() ? nullptr : out.atoms.front().data(), out.lattice.data(), &status);
+                    if (status) {
+                        RTE_THROW("external XC quadrature pullback returned status " + std::to_string(status));
+                    }
+                };
+            },
+            error_code__);
+}
+
+/*
+@api begin
+sirius_get_xc_geometry_derivatives:
+  doc: >-
+    Evaluate explicit XC atom and cell energy derivatives for the current fields.
+    Requires point geometry callbacks. Smooth Fourier coefficients are fixed.
+    Complete PW stress also includes orbital normalization and kinetic-density
+    metric terms, which are added by the total-stress calculation.
+    Outputs are globally summed on every rank. No force sign or volume factor is
+    applied. Cell columns vary at fixed Cartesian atoms.
+  arguments:
+    gs_handler:
+      type: gs_handler
+      attr: in, required
+      doc: Ground-state handler.
+    num_atoms:
+      type: int
+      attr: in, required
+      doc: Number of atoms in the context.
+    atoms:
+      type: double
+      attr: out, required, dimension(3,num_atoms)
+      doc: Cartesian atom energy derivatives.
+    lattice:
+      type: double
+      attr: out, required, dimension(3,3)
+      doc: Cell energy derivatives with lattice vectors in columns.
+    error_code:
+      type: int
+      attr: out, optional
+      doc: Error code.
+@api end
+*/
+void
+sirius_get_xc_geometry_derivatives(void* const* gs_handler__, int const* num_atoms__, double* atoms__,
+                                   double* lattice__, int* error_code__)
+{
+    call_sirius(
+            [&]() {
+                auto& gs    = get_gs(gs_handler__);
+                int invalid = !num_atoms__ || !atoms__ || !lattice__;
+                if (num_atoms__) {
+                    invalid |= *num_atoms__ != gs.ctx().unit_cell().num_atoms();
+                }
+                gs.ctx().comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+                if (invalid) {
+                    RTE_THROW("invalid XC geometry output buffers on a context rank");
+                }
+                auto result = gs.potential().external_xc_geometry(gs.density());
+                for (int ia = 0; ia < *num_atoms__; ia++) {
+                    std::copy(result.atoms[ia].begin(), result.atoms[ia].end(), atoms__ + 3 * ia);
+                }
+                std::copy(result.lattice.begin(), result.lattice.end(), lattice__);
             },
             error_code__);
 }

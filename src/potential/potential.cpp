@@ -15,6 +15,7 @@
 #include "xc_functional.hpp"
 #include "lapw/generate_gvec_ylm.hpp"
 #include "lapw/generate_sbessel_mt.hpp"
+#include "lapw/lapw_radial_basis.hpp"
 #include "symmetry/symmetrize_field4d.hpp"
 #include "dft/energy.hpp"
 #include "core/power.hpp"
@@ -93,6 +94,56 @@ Potential::Potential(Simulation_context& ctx__)
     using pf  = Periodic_function<double>;
     using spf = Smooth_periodic_function<double>;
 
+    if (ctx_.meta_gga()) {
+        int invalid{0};
+        std::string error;
+        try {
+            if (ctx_.processing_unit() != device_t::CPU || ctx_.spfft<double>().processing_unit() != SPFFT_PU_HOST ||
+                ctx_.spfft_coarse<double>().processing_unit() != SPFFT_PU_HOST || ctx_.num_mag_dims() == 3 ||
+                ctx_.so_correction() || ctx_.cfg().parameters().precision_wf() != "fp64" || ctx_.veff_callback() ||
+                ctx_.cfg().parameters().veff_pw_cutoff() > 0) {
+                RTE_THROW("Libxc meta-GGA SCF currently requires CPU scalar/collinear fp64 orbitals");
+            }
+            if (ctx_.full_potential() || unit_cell_.num_paw_atoms()) {
+                RTE_THROW("Libxc meta-GGA currently supports norm-conserving PW calculations only");
+            }
+            for (int iat = 0; iat < unit_cell_.num_atom_types(); iat++) {
+                auto const& type = unit_cell_.atom_type(iat);
+                if (type.augment() || type.spin_orbit_coupling()) {
+                    RTE_THROW("Libxc meta-GGA requires scalar norm-conserving pseudopotentials");
+                }
+                auto const& core = type.ps_core_charge_density();
+                if (std::any_of(core.begin(), core.end(), [](double v) { return v != 0; })) {
+                    RTE_THROW("meta-GGA nonlinear core correction requires matching core kinetic-density data");
+                }
+            }
+            for (auto& functional : xc_func_) {
+                if (functional.is_meta_gga()) {
+                    // Validate capabilities without evaluating any grid points.
+                    functional.get_meta(0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+                } else if (!functional.is_lda() && !functional.is_gga()) {
+                    RTE_THROW(
+                            "Libxc meta-GGA combinations currently support LDA, GGA and tau-dependent meta-GGA terms");
+                }
+            }
+        } catch (std::exception const& e) {
+            invalid = 1;
+            error   = e.what();
+        }
+        comm_.allreduce<int, mpi::op_t::max>(&invalid, 1);
+        if (invalid) {
+            RTE_THROW("invalid Libxc meta-GGA configuration on a context rank: " + error);
+        }
+    }
+    external_xc_registered_ = bool(ctx_.cb().external_xc_);
+    if (external_xc_registered_) {
+        validate_external_xc_context(ctx_);
+    }
+    if (ctx_.meta_gga() || external_xc_registered_) {
+        kinetic_potential_ = std::make_unique<Field4D>(ctx_, lmax_t(ctx_.lmax_pot()));
+        kinetic_potential_->zero();
+    }
+
     if (ctx_.full_potential()) {
         hartree_potential_ = std::make_unique<pf>(
                 ctx_, [&](int ia) { return lmax_t(ctx_.lmax_pot()); }, &ctx_.unit_cell().spl_num_atoms());
@@ -154,11 +205,11 @@ Potential::Potential(Simulation_context& ctx__)
     }
 
     if (ctx_.cfg().parameters().dftd3_correction()) {
-        dftd3_ = std::make_unique<dftd3>(new dftd3(ctx_, unit_cell_));
+        dftd3_ = std::make_unique<dftd3>(ctx_, unit_cell_);
     }
 
     if (ctx_.cfg().parameters().dftd4_correction()) {
-        dftd4_ = std::make_unique<dftd4>(new dftd4(ctx_, unit_cell_));
+        dftd4_ = std::make_unique<dftd4>(ctx_, unit_cell_);
     }
 
     update();
@@ -257,7 +308,7 @@ Potential::is_gradient_correction() const
 {
     bool is_gga{false};
     for (auto& ixc : xc_func_) {
-        if (ixc.is_gga() || ixc.is_vdw()) {
+        if (ixc.is_gga() || ixc.is_meta_gga() || ixc.is_vdw()) {
             is_gga = true;
         }
     }
@@ -335,6 +386,10 @@ Potential::generate(Density const& density__, bool use_symmetry__, bool transfor
     if (use_symmetry__) {
         /* symmetrize potential and effective magnetic field */
         symmetrize_field4d(*this);
+        if (kinetic_potential_) {
+            symmetrize_field4d(*kinetic_potential_);
+            kinetic_potential_->fft_transform(1);
+        }
         if (transform_to_rg__) {
             /* transform potential to real space after symmetrization */
             this->fft_transform(1);
@@ -356,7 +411,7 @@ Potential::generate(Density const& density__, bool use_symmetry__, bool transfor
     if (!ctx_.full_potential()) {
         generate_d_mtrx();
         generate_PAW_effective_potential(density__);
-        if (ctx_.verbosity() >= 3) {
+        if (ctx_.verbosity() >= 4) {
             rte::ostream out(ctx_.out(), "potential");
             out << "density matrix" << std::endl;
             for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
@@ -393,7 +448,7 @@ Potential::generate(Density const& density__, bool use_symmetry__, bool transfor
     }
 
     if (ctx_.full_potential()) {
-        if (ctx_.verbosity() >= 3) {
+        if (ctx_.verbosity() >= 4) {
             auto vs = this->get_spherical_potential();
             rte::ostream out(ctx_.out(), "potential");
             for (int ic = 0; ic < ctx_.unit_cell().num_atom_symmetry_classes(); ic++) {
@@ -434,34 +489,6 @@ Potential::get_spherical_potential() const
     return vs;
 }
 
-void
-Potential::update_atomic_potential()
-{
-    for (int ic = 0; ic < unit_cell_.num_atom_symmetry_classes(); ic++) {
-        int ia   = unit_cell_.atom_symmetry_class(ic).atom_id(0);
-        int nmtp = unit_cell_.atom(ia).num_mt_points();
-
-        std::vector<double> veff(nmtp);
-
-        for (int ir = 0; ir < nmtp; ir++) {
-            veff[ir] = y00 * effective_potential().mt()[ia](0, ir);
-        }
-
-        unit_cell_.atom_symmetry_class(ic).set_spherical_potential(veff);
-    }
-
-    for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
-        double* veff = &effective_potential().mt()[ia](0, 0);
-
-        double* beff[] = {nullptr, nullptr, nullptr};
-        for (int i = 0; i < ctx_.num_mag_dims(); i++) {
-            beff[i] = &effective_magnetic_field(i).mt()[ia](0, 0);
-        }
-
-        unit_cell_.atom(ia).set_nonspherical_potential(veff, beff);
-    }
-}
-
 mdarray<std::complex<double>, 2>
 Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__) const
 {
@@ -480,6 +507,16 @@ Potential::poisson_vmt(Spheric_function_set<double, atom_index_t> const& rhomt__
 
     ctx_.comm().allreduce(&qmt(0, 0), (int)qmt.size());
     return qmt;
+}
+
+std::shared_ptr<LAPW_radial_basis>
+Potential::create_lapw_basis() const
+{
+    if (!ctx_.full_potential()) {
+        return nullptr;
+    }
+
+    return std::make_shared<LAPW_radial_basis>(unit_cell_, ctx_.valence_relativity(), this->get_spherical_potential());
 }
 
 } // namespace sirius

@@ -423,7 +423,8 @@
                         "dlaf",
                         "magma",
                         "magma_gpu",
-                        "cusolver"
+                        "cusolver",
+                        "rocsolver"
                     ],
                     "title": "Standard eigen-value solver to use."
                 },
@@ -439,7 +440,8 @@
                         "dlaf",
                         "magma",
                         "magma_gpu",
-                        "cusolver"
+                        "cusolver",
+                        "rocsolver"
                     ],
                     "title": "Generalized eigen-value solver to use."
                 },
@@ -477,7 +479,7 @@
                     "type": "integer",
                     "default": 0,
                     "title": "Level of verbosity.",
-                    "description": "The following convention in proposed:\n  - 0: silent mode (no output is printed)\n  - 1: basic output (low level of output)\n  - 2: extended output (medium level of output)\n  - 3: extensive output (high level of output)"
+                    "description": "The following convention in proposed:\n  - 0: silent mode (no output is printed)\n  - 1: compact output (low level of output)\n  - 2: basic output\n  - 3: extended output\n  - 4: extensive output(high level of output)"
                 },
                 "verification": {
                     "type": "integer",
@@ -1088,6 +1090,31 @@
                     "default": true,
                     "title": "Include the three-body dispersion in the calculations"
                 },
+                "cutoff_disp2": {
+                    "type": "number",
+                    "default": 60.0,
+                    "title": "Two-body dispersion cutoff (Bohr)"
+                },
+                "cutoff_disp3": {
+                    "type": "number",
+                    "default": 40.0,
+                    "title": "Three-body dispersion cutoff (Bohr)"
+                },
+                "cutoff_cn": {
+                    "type": "number",
+                    "default": 30.0,
+                    "title": "Coordination-number cutoff (Bohr)"
+                },
+                "cutoff_width2": {
+                    "type": "number",
+                    "default": 0.05,
+                    "title": "Two-body smooth switching width (Bohr); zero disables smoothing"
+                },
+                "cutoff_width3": {
+                    "type": "number",
+                    "default": 0.0,
+                    "title": "Three-body smooth switching width (Bohr); zero disables smoothing"
+                },
                 "parameters": {
                     "type": "object",
                     "title": "parameters controlling the damping.",
@@ -1156,6 +1183,31 @@
                     "type": "boolean",
                     "default": true,
                     "title": "Include the three-body dispersion in the calculations"
+                },
+                "cutoff_disp2": {
+                    "type": "number",
+                    "default": 60.0,
+                    "title": "Two-body dispersion cutoff (Bohr)"
+                },
+                "cutoff_disp3": {
+                    "type": "number",
+                    "default": 40.0,
+                    "title": "Three-body dispersion cutoff (Bohr)"
+                },
+                "cutoff_cn": {
+                    "type": "number",
+                    "default": 40.0,
+                    "title": "Coordination-number cutoff (Bohr)"
+                },
+                "cutoff_width2": {
+                    "type": "number",
+                    "default": 0.05,
+                    "title": "Two-body smooth switching width (Bohr); zero disables smoothing"
+                },
+                "cutoff_width3": {
+                    "type": "number",
+                    "default": 0.0,
+                    "title": "Three-body smooth switching width (Bohr); zero disables smoothing"
                 },
                 "method": {
                     "type": "string",

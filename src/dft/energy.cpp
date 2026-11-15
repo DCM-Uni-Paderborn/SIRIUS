@@ -107,7 +107,11 @@ energy_enuc(Simulation_context const& ctx, Potential const& potential)
 double
 energy_vloc(Density const& density, Potential const& potential)
 {
-    return sirius::inner(potential.local_potential(), density.rho().rg());
+    double result = sirius::inner(potential.local_potential(), density.rho().rg());
+    if (density.ctx().cb().external_xc_) {
+        result -= density.ctx().cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
+    }
+    return result;
 }
 
 double
@@ -119,13 +123,20 @@ eval_sum(Density const& density, K_point_set const& kset)
 double
 energy_veff(Density const& density, Potential const& potential)
 {
-    return sirius::inner(density.rho(), potential.effective_potential());
+    double result = sirius::inner(density.rho(), potential.effective_potential()) -
+                    potential.external_xc_background_contraction();
+    if (density.ctx().cb().external_xc_) {
+        // The Hartree potential has zero cell average; the remaining background is the local PP term.
+        result -= density.ctx().cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
+    }
+    return result;
 }
 
 double
 energy_kin(Simulation_context const& ctx, K_point_set const& kset, Density const& density, Potential const& potential)
 {
-    return eval_sum(density, kset) - energy_veff(density, potential) - energy_bxc(density, potential);
+    return eval_sum(density, kset) - energy_veff(density, potential) - energy_bxc(density, potential) -
+           potential.energy_vtau(density);
 }
 
 double
@@ -144,6 +155,9 @@ ks_energy(Simulation_context const& ctx, std::map<std::string, double> const& en
                      energies.at("PAW_one_elec");
             tot_en += -0.5 * energies.at("vha") + energies.at("exc") + energies.at("PAW_total_energy") +
                       energies.at("ewald");
+            if (energies.count("vtau")) {
+                tot_en -= energies.at("vtau");
+            }
             if (ctx.hubbard_correction()) {
                 tot_en += energies.at("hubbard_energy") - energies.at("hubbard_one_el_contribution");
             }
@@ -217,6 +231,9 @@ total_energy_components(Simulation_context const& ctx, K_point_set const& kset, 
     }
 
     table["entropy"] = kset.entropy_sum();
+    if (potential.has_kinetic_potential()) {
+        table["vtau"] = potential.energy_vtau(density);
+    }
 
     return table;
 }
@@ -235,7 +252,8 @@ double
 one_electron_energy(Density const& density, Potential const& potential)
 {
     return energy_vha(potential) + energy_vxc(density, potential) + energy_bxc(density, potential) +
-           potential.PAW_one_elec_energy(density) + one_electron_energy_hubbard(density, potential);
+           potential.PAW_one_elec_energy(density) + one_electron_energy_hubbard(density, potential) +
+           potential.energy_vtau(density);
 }
 
 double
@@ -252,7 +270,8 @@ double
 energy_potential(Density const& density, Potential const& potential)
 {
     const double e = energy_veff(density, potential) + energy_bxc(density, potential) +
-                     potential.PAW_one_elec_energy(density) + ::sirius::hubbard_energy(density);
+                     potential.PAW_one_elec_energy(density) + ::sirius::hubbard_energy(density) +
+                     potential.energy_vtau(density);
     return e;
 }
 

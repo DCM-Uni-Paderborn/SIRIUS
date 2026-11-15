@@ -31,15 +31,15 @@ double
 xc_mt(Radial_grid<double> const& rgrid__, SHT const& sht__, std::vector<XC_functional> const& xc_func__,
       int num_mag_dims__, std::vector<Flm const*> rho__, std::vector<Flm*> vxc__, Flm* exc__, bool use_lalp__);
 
+/* Forward declartaion */
+class LAPW_radial_basis;
+
 /// Generate effective potential from charge density and magnetization.
-/** \note At some point we need to update the atomic potential with the new MT potential. This is simple if the
-          effective potential is a global function. Otherwise we need to pass the effective potential between MPI ranks.
-          This is also simple, but requires some time. It is also easier to mix the global functions.  */
 class Potential : public Field4D
 {
   private:
     /// Alias to unit cell.
-    Unit_cell& unit_cell_;
+    Unit_cell const& unit_cell_;
 
     /// Communicator of the simulation.
     mpi::Communicator const& comm_;
@@ -52,6 +52,17 @@ class Potential : public Field4D
 
     /// XC energy per unit particle.
     std::unique_ptr<Periodic_function<double>> xc_energy_density_;
+
+    /// Derivatives conjugate to total tau and its collinear spin difference.
+    std::unique_ptr<Field4D> kinetic_potential_;
+
+    void
+    xc_rg_meta(Density const& density__);
+
+    bool external_xc_registered_{false};
+    double external_xc_energy_{0};
+    void
+    xc_external(Density const& density__);
 
     /// Local part of pseudopotential.
     std::unique_ptr<Smooth_periodic_function<double>> local_potential_;
@@ -172,7 +183,7 @@ class Potential : public Field4D
     calc_PAW_local_Dij(typename atom_index_t::global ia__, mdarray<double, 3>& d_mtrx_paw__);
 
     double
-    calc_PAW_hartree_potential(Atom& atom, Flm const& full_density, Flm& full_potential);
+    calc_PAW_hartree_potential(Atom const& atom, Flm const& full_density, Flm& full_potential);
 
     double
     calc_PAW_one_elec_energy(Atom const& atom__, mdarray<double, 2> const& density_matrix__,
@@ -290,6 +301,13 @@ class Potential : public Field4D
     xc_rg_magnetic(Density const& density__, bool use_lapl, const bool calculate_vdw_stress__);
 
   public:
+    /// Explicit external-XC dE/dR and dE/dA at fixed smooth Fourier fields.
+    /** Includes motion of the integration points, weights and atom-block centres.
+     *  Normalization of PW orbitals and the tau metric term belong to Stress.
+     */
+    xc_geometry_derivatives_t
+    external_xc_geometry(Density const& density__) const;
+
     /// Constructor
     Potential(Simulation_context& ctx__);
 
@@ -618,9 +636,6 @@ class Potential : public Field4D
     void
     generate(Density const& density__, bool use_sym__, bool transform_to_rg__);
 
-    void
-    update_atomic_potential();
-
     template <device_t pu>
     void
     add_mt_contribution_to_pw();
@@ -762,6 +777,42 @@ class Potential : public Field4D
         return *xc_energy_density_;
     }
 
+    bool
+    has_kinetic_potential() const
+    {
+        return bool(kinetic_potential_);
+    }
+
+    auto&
+    kinetic_potential()
+    {
+        if (!kinetic_potential_) {
+            RTE_THROW("kinetic potential is not enabled");
+        }
+        return *kinetic_potential_;
+    }
+
+    auto const&
+    kinetic_potential() const
+    {
+        if (!kinetic_potential_) {
+            RTE_THROW("kinetic potential is not enabled");
+        }
+        return *kinetic_potential_;
+    }
+
+    double
+    energy_vtau(Density const& density__) const
+    {
+        double result{0};
+        if (kinetic_potential_) {
+            for (int j = 0; j < ctx_.num_mag_dims() + 1; j++) {
+                result += inner(density__.kinetic_density().component(j), kinetic_potential_->component(j));
+            }
+        }
+        return result;
+    }
+
     inline auto
     vh_el(int ia) const
     {
@@ -774,11 +825,23 @@ class Potential : public Field4D
         return energy_vha_;
     }
 
-    /// Integral of \f$ \rho({\bf r}) V^{XC}({\bf r}) \f$.
+    /// XC contraction of the non-electronic uniform neutralizing charge.
+    /** \f$ (q/\Omega)\int V^{XC}(\mathbf r)\,d\mathbf r\f$ uses the current
+     *  real-space potential, whose Fourier buffer need not have been transformed.
+     */
+    double
+    external_xc_background_contraction() const
+    {
+        return external_xc_registered_
+                       ? ctx_.cfg().parameters().extra_charge() * xc_potential().integrate().total / unit_cell_.omega()
+                       : 0;
+    }
+
+    /// Integral of the electronic density times the XC potential.
     auto
     energy_vxc(Density const& density__) const
     {
-        return inner(density__.rho(), xc_potential());
+        return inner(density__.rho(), xc_potential()) - external_xc_background_contraction();
     }
 
     /// Integral of \f$ \rho_{c}({\bf r}) V^{XC}({\bf r}) \f$.
@@ -792,6 +855,9 @@ class Potential : public Field4D
     auto
     energy_exc(Density const& density__) const
     {
+        if (external_xc_registered_) {
+            return external_xc_energy_;
+        }
         double exc = (1 + add_delta_rho_xc_) * inner(density__.rho(), xc_energy_density());
         if (!ctx_.full_potential()) {
             exc += (1 + add_delta_rho_xc_) * inner(density__.rho_pseudo_core(), xc_energy_density().rg());
@@ -883,25 +949,40 @@ class Potential : public Field4D
     {
         return vdw_stress_kernel_;
     }
+
     inline auto&
     vdw_stress_gradient()
     {
         return vdw_stress_gradient_;
     }
+
     inline auto&
     vdw_stress_potential()
     {
         return vdw_stress_potential_;
     }
+
+    std::shared_ptr<LAPW_radial_basis>
+    create_lapw_basis() const;
+
+    friend void
+    copy(Potential const&, Potential&);
 };
 
 inline void
 copy(Potential const& src__, Potential& dest__)
 {
+    if (src__.external_xc_registered_ != dest__.external_xc_registered_) {
+        RTE_THROW("cannot copy potentials with different external XC registration");
+    }
+    dest__.external_xc_energy_ = src__.external_xc_energy_;
     for (int j = 0; j < src__.ctx().num_mag_dims() + 1; j++) {
         copy(src__.component(j).rg(), dest__.component(j).rg());
         if (src__.ctx().full_potential()) {
             copy(src__.component(j).mt(), dest__.component(j).mt());
+        }
+        if (src__.has_kinetic_potential()) {
+            copy(src__.kinetic_potential().component(j).rg(), dest__.kinetic_potential().component(j).rg());
         }
     }
 }

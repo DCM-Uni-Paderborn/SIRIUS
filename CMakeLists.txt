@@ -47,7 +47,7 @@ set_property(CACHE SIRIUS_USE_FP32 PROPERTY STRINGS "AUTO" "ON" "OFF")
 
 # set language and standard
 
-if(SIRIUS_CREATE_FORTRAN_BINDINGS)
+if(SIRIUS_CREATE_FORTRAN_BINDINGS OR SIRIUS_USE_DFTD3 OR SIRIUS_USE_DFTD4)
   enable_language(Fortran)
 endif()
 
@@ -88,17 +88,7 @@ if (NOT CMAKE_BUILD_TYPE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "debug" "release" "relwithdebinfo")
 endif()
 
-if(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU" OR ${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
-  set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -ggdb -DDEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -ggdb -O2")
-elseif(${CMAKE_CXX_COMPILER_ID} STREQUAL "Intel")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-  set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2")
-endif()
+add_compile_options($<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang,IntelLLVM>:-Wall>)
 
 # preserve rpaths when installing and make the install folder relocatable
 # use `CMAKE_SKIP_INSTALL_RPATH` to skip this
@@ -133,23 +123,26 @@ endif()
 find_package(MPI REQUIRED)
 #set(GSL_CBLAS_LIBRARY ${BLAS_LIBRARIES} CACHE STRING "" FORCE)
 find_package(GSL REQUIRED)
-find_package(LibXC 4.0.0 REQUIRED)
-find_package(LibSPG REQUIRED)
-find_package(HDF5 REQUIRED C)
-include(cmake/hdf5_target.cmake)
+find_package(Libxc REQUIRED CONFIG)
+find_package(Spglib REQUIRED CONFIG)
+find_package(HDF5 REQUIRED COMPONENTS C)
 find_package(SpFFT 1.0.2 CONFIG REQUIRED)
 find_package(SPLA 1.4.0 CONFIG REQUIRED)
+
+if (Libxc_VERSION VERSION_LESS "7.0.0")
+   message(FATAL_ERROR "Libxc >= 7.0.0 is required; found version ${Libxc_VERSION}")
+endif ()
 
 if (SIRIUS_USE_PUGIXML)
    find_package(pugixml REQUIRED)
 endif()
 
 if (SIRIUS_USE_DFTD3)
-   find_package(DFTD3 REQUIRED)
+   find_package(s-dftd3 REQUIRED CONFIG)
 endif ()
 
 if (SIRIUS_USE_DFTD4)
-  find_package(DFTD4 REQUIRED)
+  find_package(dftd4 REQUIRED CONFIG)
 endif ()
 
 if (SIRIUS_USE_VCSQNM)
@@ -179,11 +172,6 @@ if(SIRIUS_USE_MKL)
   set_property(CACHE MKL_LINK PROPERTY STRINGS static dynamic sdl)
 
   if(SIRIUS_USE_SCALAPACK)
-    # Request the complete cluster target from MKLConfig.cmake.  It owns the
-    # ScaLAPACK -> BLACS -> MKL link order and the --start/--end-group pair
-    # needed for static oneMKL on ELF platforms.
-    set(ENABLE_SCALAPACK ON)
-
     # Do not silently map every non-Open-MPI implementation to Intel MPI.
     # MKLConfig.cmake accepts intelmpi, openmpi, mpich, and mpich2.
     if(NOT DEFINED MKL_MPI)
@@ -206,8 +194,8 @@ if(SIRIUS_USE_MKL)
   if(SIRIUS_USE_SCALAPACK)
     if(NOT TARGET MKL::MKL_SCALAPACK)
       message(FATAL_ERROR
-        "oneMKL did not provide MKL::MKL_SCALAPACK.  Ensure ENABLE_SCALAPACK=ON, "
-        "MKL_LINK is not 'sdl', and MKL_MPI names a supported MPI family.")
+        "Intel oneMKL did not provide MKL::MKL_SCALAPACK. Ensure MKL_LINK "
+        "is not \"sdl\" and MKL_MPI names a supported MPI family.")
     endif()
     set(SIRIUS_LINALG_LIB MKL::MKL_SCALAPACK)
   else()
@@ -246,9 +234,7 @@ find_package(costa CONFIG REQUIRED)
 
 if(SIRIUS_USE_CUDA)
   enable_language(CUDA)
-  # note find cudatoolkit is called inside the include file. the
-  # sirius::cuda_libs target is also defined there
-  include(cmake/cudalibs_target.cmake)
+  find_package(CUDAToolkit REQUIRED)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES}")
 endif(SIRIUS_USE_CUDA)
 
@@ -337,8 +323,6 @@ configure_file("${PROJECT_SOURCE_DIR}/cmake/sirius_cxxConfig.cmake.in"
                @ONLY)
 install(FILES "${PROJECT_BINARY_DIR}/sirius_cxxConfig.cmake"
               "${PROJECT_BINARY_DIR}/sirius_cxxConfigVersion.cmake"
-              "${PROJECT_SOURCE_DIR}/cmake/cudalibs_target.cmake"
-              "${PROJECT_SOURCE_DIR}/cmake/hdf5_target.cmake"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius_cxx")
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/cmake/modules"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius_cxx"

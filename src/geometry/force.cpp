@@ -196,6 +196,13 @@ Force::calc_forces_total()
 mdarray<double, 2> const&
 Force::calc_forces_total(bool add_scf_corr)
 {
+    xc_geometry_derivatives_t geometry(ctx_.unit_cell().num_atoms());
+    if (ctx_.cb().external_xc_) {
+        geometry = potential_.external_xc_geometry(density_);
+    }
+    if (ctx_.meta_gga() && !ctx_.cb().external_xc_) {
+        RTE_THROW("meta-GGA geometry derivatives are not connected to forces yet");
+    }
     forces_total_ = mdarray<double, 2>({3, ctx_.unit_cell().num_atoms()});
 
     calc_forces_dftd3();
@@ -233,6 +240,11 @@ Force::calc_forces_total(bool add_scf_corr)
             }
         }
     }
+    for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
+        for (int x = 0; x < 3; x++) {
+            forces_total_(x, ia) -= geometry.atoms[ia][x];
+        }
+    }
     return forces_total_;
 }
 
@@ -256,7 +268,9 @@ Force::calc_forces_ibs()
         }
     }
 
-    Hamiltonian0<double> H0(potential_, false);
+    auto lapw_basis = potential_.create_lapw_basis();
+
+    Hamiltonian0<double> H0(potential_, lapw_basis);
     for (auto it : kset_.spl_num_kpoints()) {
         auto hk = H0(*kset_.get<double>(it.i));
         add_ibs_force(kset_.get<double>(it.i), hk, ffac, forces_ibs_);
@@ -483,9 +497,9 @@ Force::calc_forces_us()
                          * but in formula we have   i * G * exp[-iGRn] Veff*(G)
                          * the differences because we unfold complex array in the real one
                          * and need negative imagine part due to a multiplication law of complex numbers */
-                        auto z = std::complex<double>(0, -gvc[ivec]) *
-                                 ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) *
-                                 potential_.component(ispin).rg().f_pw_local(igloc);
+                        auto z                   = std::complex<double>(0, -gvc[ivec]) *
+                                                   ctx_.gvec_phase_factor(ig, atom_type.atom_id(ia)) *
+                                                   potential_.component(ispin).rg().f_pw_local(igloc);
                         v_tmp(ia, 2 * igloc)     = z.real();
                         v_tmp(ia, 2 * igloc + 1) = z.imag();
                     }
@@ -806,9 +820,11 @@ Force::add_ibs_force(K_point<double>* kp__, Hamiltonian_k<double>& Hk__, mdarray
         auto& atom = uc.atom(ia);
         auto& type = atom.type();
 
+        auto const& rb = Hk__.H0().lapw_basis().radial_basis(atom_index_t::global(ia));
+
         /* generate matching coefficients for current atom */
-        kp__->alm_coeffs_row().generate<true>(atom, alm_row);
-        kp__->alm_coeffs_col().generate<false>(atom, alm_col);
+        kp__->alm_coeffs_row().generate<true>(atom, alm_row, rb);
+        kp__->alm_coeffs_col().generate<false>(atom, alm_col, rb);
 
         /* setup apw-lo and lo-apw blocks */
         Hk__.set_fv_h_o_apw_lo(atom, ia, 0, alm_row, alm_col, h, o);
@@ -948,7 +964,7 @@ Force::print_info(std::ostream& out__, int verbosity__)
         print_forces("total Forces in Ha/bohr", forces_total());
     }
 
-    if (verbosity__ >= 2) {
+    if (verbosity__ >= 3) {
         if (ctx_.full_potential()) {
             print_forces("contribution from density", forces_rho());
 

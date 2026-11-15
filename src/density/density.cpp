@@ -189,11 +189,12 @@ update_density_rg_2_gpu(int size__, std::complex<double> const* psi_rg_up__, std
 }
 #endif
 
-Density::Density(Simulation_context& ctx__)
+Density::Density(Simulation_context& ctx__, bool kinetic_density__)
     : Field4D(ctx__, lmax_t(ctx__.lmax_rho()),
               {ctx__.periodic_function_ptr("rho"), ctx__.periodic_function_ptr("magz"),
                ctx__.periodic_function_ptr("magx"), ctx__.periodic_function_ptr("magy")})
     , unit_cell_(ctx_.unit_cell())
+    , external_xc_registered_(bool(ctx__.cb().external_xc_))
 {
     PROFILE("sirius::Density");
 
@@ -202,6 +203,19 @@ Density::Density(Simulation_context& ctx__)
     }
 
     using spf = Smooth_periodic_function<double>;
+
+    if (external_xc_registered_) {
+        validate_external_xc_context(ctx_);
+    }
+    if (kinetic_density__ || ctx_.meta_gga() || external_xc_registered_) {
+        if (ctx_.processing_unit() != device_t::CPU || ctx_.spfft<double>().processing_unit() != SPFFT_PU_HOST ||
+            ctx_.spfft_coarse<double>().processing_unit() != SPFFT_PU_HOST || ctx_.num_mag_dims() == 3 ||
+            ctx_.so_correction() || ctx_.full_potential() || unit_cell_.num_paw_atoms()) {
+            RTE_THROW("kinetic density currently requires CPU norm-conserving PW orbitals without spin-orbit coupling");
+        }
+        kinetic_density_ = std::make_unique<Field4D>(ctx_, lmax_t(ctx_.lmax_rho()));
+        kinetic_density_->zero();
+    }
 
     /*  allocate charge density and magnetization on a coarse grid */
     for (int i = 0; i < ctx_.num_mag_dims() + 1; i++) {
@@ -298,6 +312,13 @@ Density::initial_density()
     }
     if (ctx_.use_symmetry()) {
         symmetrize_field4d(*this);
+    }
+    if (kinetic_density_) {
+        initial_kinetic_density();
+        if (ctx_.use_symmetry()) {
+            symmetrize_field4d(*kinetic_density_);
+            kinetic_density_->fft_transform(1);
+        }
     }
 }
 
@@ -1185,12 +1206,32 @@ Density::check_num_electrons() const
 
 template <typename T>
 void
-Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__)
+Density::generate(K_point_set const& ks__, LAPW_radial_basis const* lapw_basis__, bool symmetrize__, bool add_core__,
+                  bool transform_to_rg__)
 {
     PROFILE("sirius::Density::generate");
+    if (bool(ctx_.cb().external_xc_) != external_xc_registered_) {
+        RTE_THROW("external XC registration cannot change during SCF");
+    }
     power::Profile p1("generate_dens");
 
-    generate_valence<T>(ks__);
+    generate_valence<T>(ks__, lapw_basis__);
+
+    if (kinetic_density_) {
+        auto tau = generate_smooth_kinetic_density<T>(ks__);
+        for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
+            auto up = tau[0].f_pw_local(ig);
+            auto dn = ctx_.num_spins() == 2 ? tau[1].f_pw_local(ig) : std::complex<double>(0);
+            kinetic_density_->scalar().rg().f_pw_local(ig) = up + dn;
+            if (ctx_.num_spins() == 2) {
+                kinetic_density_->vector(0).rg().f_pw_local(ig) = up - dn;
+            }
+        }
+        if (symmetrize__) {
+            symmetrize_field4d(*kinetic_density_);
+        }
+        kinetic_density_->fft_transform(1);
+    }
 
     if (ctx_.full_potential()) {
         if (add_core__) {
@@ -1243,7 +1284,7 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
                     }
                 }
                 std::string status = (diff > 1e-8) ? "Fail" : "OK";
-                if (ctx_.verbosity() >= 1) {
+                if (ctx_.verbosity() >= 2) {
                     RTE_OUT(ctx_.out()) << "error of density matrix symmetrization: " << diff << " " << status
                                         << std::endl;
                 }
@@ -1260,7 +1301,7 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
                     }
                 }
                 std::string status = (diff1 > 1e-8) ? "Fail" : "OK";
-                if (ctx_.verbosity() >= 1) {
+                if (ctx_.verbosity() >= 2) {
                     RTE_OUT(ctx_.out()) << "error of LDA+U local occupation matrix symmetrization: " << diff1 << " "
                                         << status << std::endl;
                 }
@@ -1274,7 +1315,7 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
                     }
                 }
                 status = (diff2 > 1e-8) ? "Fail" : "OK";
-                if (ctx_.verbosity() >= 1) {
+                if (ctx_.verbosity() >= 2) {
                     RTE_OUT(ctx_.out()) << "error of LDA+U nonlocal occupation matrix symmetrization: " << diff2 << " "
                                         << status << std::endl;
                 }
@@ -1287,7 +1328,7 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
     }
 
     if (occupation_matrix_) {
-        occupation_matrix_->print_occupancies(2);
+        occupation_matrix_->print_occupancies(3);
         /* calculate the lagrange multiplier and resulting error */
         if (ctx_.hubbard_constrained_calculation()) {
             occupation_matrix_->calculate_constraints_and_error();
@@ -1312,7 +1353,8 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
         }
         sirius::symmetrize_density_matrix(unit_cell_, ctx_.rotm_ylm(), *density_matrix_, ctx_.num_mag_comp());
         for (int ia = 0; ia < ctx_.unit_cell().num_atoms(); ia++) {
-            auto& type = ctx_.unit_cell().atom(ia).type();
+            auto& type     = ctx_.unit_cell().atom(ia).type();
+            auto const& rb = lapw_basis__->radial_basis(atom_index_t::global(ia));
             out << "atom : " << ia << std::endl;
             for (int l = 0; l < 4; l++) {
                 int nrf = type.indexr().max_order(l);
@@ -1329,8 +1371,7 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
                                     dm_ylm(l + m1, l + m2) +=
                                             (*density_matrix_)[ia](type.indexb_by_l_m_order(l, m1, order1),
                                                                    type.indexb_by_l_m_order(l, m2, order2), is) *
-                                            ctx_.unit_cell().atom(ia).symmetry_class().o_radial_integral(l, order1,
-                                                                                                         order2);
+                                            rb.o_radial_integral(l, order1, order2);
                                 }
                             }
                         }
@@ -1390,10 +1431,12 @@ Density::generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, b
 }
 
 template void
-Density::generate<double>(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__);
+Density::generate<double>(K_point_set const& ks__, LAPW_radial_basis const* lapw_basis__, bool symmetrize__,
+                          bool add_core__, bool transform_to_rg__);
 #if defined(SIRIUS_USE_FP32)
 template void
-Density::generate<float>(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__);
+Density::generate<float>(K_point_set const& ks__, LAPW_radial_basis const* lapw_basis__, bool symmetrize__,
+                         bool add_core__, bool transform_to_rg__);
 #endif
 
 void
@@ -1418,9 +1461,13 @@ Density::augment()
 
 template <typename T>
 void
-Density::generate_valence(K_point_set const& ks__)
+Density::generate_valence(K_point_set const& ks__, LAPW_radial_basis const* lapw_basis__)
 {
     PROFILE("sirius::Density::generate_valence");
+
+    if (ctx_.full_potential() && !lapw_basis__) {
+        RTE_THROW("LAPW density generation requires a radial basis");
+    }
 
     /* check weights */
     double wt{0};
@@ -1558,7 +1605,7 @@ Density::generate_valence(K_point_set const& ks__)
 
     /* for muffin-tin part */
     if (ctx_.full_potential()) {
-        generate_valence_mt();
+        generate_valence_mt(*lapw_basis__);
     }
 }
 
@@ -1768,7 +1815,7 @@ Density::reduce_density_matrix(Atom_type const& atom_type__, mdarray<std::comple
 }
 
 void
-Density::generate_valence_mt()
+Density::generate_valence_mt(LAPW_radial_basis const& lapw_basis__)
 {
     PROFILE("sirius::Density::generate_valence_mt");
 
@@ -1841,6 +1888,8 @@ Density::generate_valence_mt()
     for (auto it : unit_cell_.spl_num_atoms()) {
         auto& atom_type = unit_cell_.atom(it.i).type();
 
+        auto const& rb = lapw_basis__.radial_basis(it.i);
+
         int nmtp         = atom_type.num_mt_points();
         int num_rf_pairs = atom_type.mt_radial_basis_size() * (atom_type.mt_radial_basis_size() + 1) / 2;
 
@@ -1869,9 +1918,7 @@ Density::generate_valence_mt()
                 /* off-diagonal pairs are taken two times: d_{12}*f_1*f_2 + d_{21}*f_2*f_1 = d_{12}*2*f_1*f_2 */
                 int n = (idxrf1 == idxrf2) ? 1 : 2;
                 for (int ir = 0; ir < unit_cell_.atom(it.i).num_mt_points(); ir++) {
-                    rf_pairs(ir, offs + idxrf1) = n *
-                                                  unit_cell_.atom(it.i).symmetry_class().radial_function(ir, idxrf1) *
-                                                  unit_cell_.atom(it.i).symmetry_class().radial_function(ir, idxrf2);
+                    rf_pairs(ir, offs + idxrf1) = n * rb.radial_function(ir, idxrf1) * rb.radial_function(ir, idxrf2);
                 }
             }
         }
@@ -2014,8 +2061,15 @@ Density::mixer_init(config_t::mixer_t const& mixer_cfg__)
     /* create mixer */
     this->mixer_ =
             mixer::Mixer_factory<Periodic_function<double>, Periodic_function<double>, Periodic_function<double>,
-                                 Periodic_function<double>, density_matrix_t, PAW_density<double>, Hubbard_matrix>(
-                    mixer_cfg__);
+                                 Periodic_function<double>, density_matrix_t, PAW_density<double>, Hubbard_matrix,
+                                 Periodic_function<double>, Periodic_function<double>>(mixer_cfg__);
+
+    if (kinetic_density_) {
+        this->mixer_->initialize_function<7>(func_prop, kinetic_density_->scalar(), ctx_);
+        if (ctx_.num_spins() == 2) {
+            this->mixer_->initialize_function<8>(func_prop, kinetic_density_->vector(0), ctx_);
+        }
+    }
 
     if (ctx_.full_potential()) {
         this->mixer_->initialize_function<0>(func_prop, component(0), ctx_,
@@ -2062,6 +2116,12 @@ Density::mixer_input()
     PROFILE("sirius::Density::mixer_input");
 
     mixer_->set_input<0>(component(0));
+    if (kinetic_density_) {
+        mixer_->set_input<7>(kinetic_density_->scalar());
+        if (ctx_.num_spins() == 2) {
+            mixer_->set_input<8>(kinetic_density_->vector(0));
+        }
+    }
     if (ctx_.num_mag_dims() > 0) {
         mixer_->set_input<1>(component(1));
     }
@@ -2087,6 +2147,13 @@ Density::mixer_output()
     PROFILE("sirius::Density::mixer_output");
 
     mixer_->get_output<0>(component(0));
+    if (kinetic_density_) {
+        mixer_->get_output<7>(kinetic_density_->scalar());
+        if (ctx_.num_spins() == 2) {
+            mixer_->get_output<8>(kinetic_density_->vector(0));
+        }
+        kinetic_density_->fft_transform(-1);
+    }
     if (ctx_.num_mag_dims() > 0) {
         mixer_->get_output<1>(component(1));
     }
@@ -2215,6 +2282,18 @@ void
 Density::save(std::string name__) const
 {
     rho().hdf5_write(name__, "density");
+    if (kinetic_density_) {
+        if (ctx_.comm().rank() == 0) {
+            HDF5_tree fout(name__, hdf5_access_t::read_write);
+            for (int j = 0; j < ctx_.num_spins(); j++) {
+                fout.create_node("kinetic_density_" + std::to_string(j));
+            }
+        }
+        ctx_.comm().barrier();
+        for (int j = 0; j < ctx_.num_spins(); j++) {
+            kinetic_density_->component(j).hdf5_write(name__, "kinetic_density_" + std::to_string(j));
+        }
+    }
     for (int j = 0; j < ctx_.num_mag_dims(); j++) {
         mag(j).hdf5_write(name__, "magnetization/" + std::to_string(j));
     }
@@ -2255,6 +2334,12 @@ Density::load(std::string name__)
 
     rho().hdf5_read(name__, "density", gv);
     rho().rg().fft_transform(1);
+    if (kinetic_density_) {
+        for (int j = 0; j < ctx_.num_spins(); j++) {
+            kinetic_density_->component(j).hdf5_read(name__, "kinetic_density_" + std::to_string(j), gv);
+        }
+        kinetic_density_->fft_transform(1);
+    }
     for (int j = 0; j < ctx_.num_mag_dims(); j++) {
         mag(j).hdf5_read(name__, "magnetization/" + std::to_string(j), gv);
         mag(j).rg().fft_transform(1);
@@ -2312,7 +2397,7 @@ Density::generate_core_charge_density(std::vector<std::vector<double>> const& vs
         RTE_OUT(ctx_.out()) << "Warning: generation of core charge density failed" << std::endl
                             << e.what() << std::endl;
     }
-    RTE_OUT(ctx_.out(2)) << pout.flush(0);
+    RTE_OUT(ctx_.out(3)) << pout.flush(0);
 }
 
 void

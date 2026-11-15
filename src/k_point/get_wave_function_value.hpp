@@ -14,13 +14,11 @@
 #ifndef __GET_WAVE_FUNCTION_VALUE_HPP__
 #define __GET_WAVE_FUNCTION_VALUE_HPP__
 
-// #include ...
-
 namespace sirius {
 
 inline auto
 get_wave_function_value(K_point<double> const& kp__, wf::Wave_functions<double> const& wf__, r3::vector<double> r__,
-                        wf::band_index band_idx__, wf::spin_index spin_idx__)
+                        wf::band_index band_idx__, wf::spin_index spin_idx__, LAPW_radial_basis const& lapw_basis__)
 {
     int ja{-1}, jr{-1};
     double dr{0}, tp[2];
@@ -43,13 +41,15 @@ get_wave_function_value(K_point<double> const& kp__, wf::Wave_functions<double> 
 
             auto& atom = uc.atom(ja);
 
+            auto const& rb = lapw_basis__.radial_basis(atom_index_t::global(ja));
+
             // generate Ylm spherical harmonics for the given (theta, phi)
             std::vector<std::complex<double>> ylm(atom.type().lmmax_apw());
             sf::spherical_harmonics(atom.type().lmax_apw(), tp[0], tp[1], &ylm[0]);
 
             // iterate over all atomic basis functions (apw and lo)
             double re{0}, im{0};
-            #pragma omp parallel for reduction(+:re, im)
+            #pragma omp parallel for reduction(+ : re, im)
             for (int xi = 0; xi < atom.mt_basis_size(); xi++) {
                 // expansion coefficient
                 auto c = wf__.mt_coeffs(xi, loc.index_local, spin_idx__, band_idx__);
@@ -58,11 +58,10 @@ get_wave_function_value(K_point<double> const& kp__, wf::Wave_functions<double> 
                 // index of radial function
                 auto idxrf = atom.type().indexb(xi).idxrf;
                 // get derivative of radial function; this is needed for simple linear interpolation
-                auto f1 = (atom.symmetry_class().radial_function(jr + 1, idxrf) -
-                           atom.symmetry_class().radial_function(jr, idxrf)) /
+                auto f1 = (rb.radial_function(jr + 1, idxrf) - rb.radial_function(jr, idxrf)) /
                           atom.type().radial_grid().dx(jr);
 
-                auto v = c * ylm[lm] * (atom.symmetry_class().radial_function(jr, idxrf) + f1 * dr);
+                auto v = c * ylm[lm] * (rb.radial_function(jr, idxrf) + f1 * dr);
                 re += v.real();
                 im += v.imag();
             }
@@ -75,7 +74,7 @@ get_wave_function_value(K_point<double> const& kp__, wf::Wave_functions<double> 
         // sum over local set of G+k-vectors
         double re{0}, im{0};
         int ngkloc = kp__.gkvec().count();
-        #pragma omp parallel for reduction(+:re, im)
+        #pragma omp parallel for reduction(+ : re, im)
         for (int igloc = 0; igloc < ngkloc; igloc++) {
             // G+k vector in Cartesian coordinates
             auto vgc = kp__.gkvec().gvec_cart(gvec_index_t::local(igloc));

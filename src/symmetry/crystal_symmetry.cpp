@@ -207,7 +207,7 @@ Crystal_symmetry::Crystal_symmetry(r3::matrix<double> const& lattice_vectors__, 
     PROFILE_START("sirius::Crystal_symmetry|spg");
     if (use_sym__) {
         /* make a call to spglib */
-        spg_dataset_ = spg_get_dataset(lattice, (double(*)[3]) & positions_(0, 0), &types_[0], num_atoms_, tolerance_);
+        spg_dataset_ = spg_get_dataset(lattice, (double (*)[3]) & positions_(0, 0), &types_[0], num_atoms_, tolerance_);
         if (spg_dataset_ == NULL) {
             RTE_THROW("spg_get_dataset() returned NULL");
         }
@@ -346,7 +346,7 @@ Crystal_symmetry::print_info(std::ostream& out__, int verbosity__) const
           << "metric tensor error: " << std::scientific << this->metric_tensor_error() << std::endl
           << "rotation matrix error: " << std::scientific << this->sym_op_R_error() << std::endl;
 
-    if (verbosity__ >= 2) {
+    if (verbosity__ >= 3) {
         out__ << std::endl << "symmetry operations " << std::endl << std::endl;
         for (int isym = 0; isym < this->size(); isym++) {
             auto R  = this->operator[](isym).spg_op.R;

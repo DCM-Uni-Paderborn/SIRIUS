@@ -161,7 +161,7 @@ xc_mt_paw(std::vector<XC_functional> const& xc_func__, int lmax__, int num_mag_d
 }
 
 double
-Potential::calc_PAW_hartree_potential(Atom& atom__, Flm const& rho__, Flm& v_tot__)
+Potential::calc_PAW_hartree_potential(Atom const& atom__, Flm const& rho__, Flm& v_tot__)
 {
     auto lmmax = rho__.angular_domain_size();
 
@@ -330,7 +330,7 @@ Potential::PAW_xc_total_energy(Density const& density__) const
     /* compute contribution from the core */
     double ecore{0};
     int n_paw_atoms_loc = unit_cell_.spl_num_paw_atoms().local_size();
-    #pragma omp parallel for reduction(+:ecore)
+    #pragma omp parallel for reduction(+ : ecore)
     for (int ialoc = 0; ialoc < n_paw_atoms_loc; ialoc++) {
         auto i  = unit_cell_.spl_num_paw_atoms().global_index(paw_atom_index_t::local(ialoc));
         auto ia = unit_cell_.paw_atom_index(i);
@@ -361,7 +361,7 @@ Potential::PAW_one_elec_energy(Density const& density__) const
 {
     double e{0};
     int n_paw_atoms_loc = unit_cell_.spl_num_paw_atoms().local_size();
-    #pragma omp parallel for reduction(+:e)
+    #pragma omp parallel for reduction(+ : e)
     for (int ialoc = 0; ialoc < n_paw_atoms_loc; ialoc++) {
         auto i  = unit_cell_.spl_num_paw_atoms().global_index(paw_atom_index_t::local(ialoc));
         auto ia = unit_cell_.paw_atom_index(i);

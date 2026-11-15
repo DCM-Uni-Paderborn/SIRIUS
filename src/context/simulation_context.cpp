@@ -369,9 +369,14 @@ Simulation_context::initialize()
 
     std::string evsn[] = {std_evp_solver_name(), gen_evp_solver_name()};
 #if defined(SIRIUS_CUDA)
-    bool is_cuda{true};
+    bool has_gpu_solver{true};
+    std::string const gpu_solver_name{"cusolver"};
+#elif defined(SIRIUS_ROCM)
+    bool has_gpu_solver{true};
+    std::string const gpu_solver_name{"rocsolver"};
 #else
-    bool is_cuda{false};
+    bool has_gpu_solver{false};
+    std::string const gpu_solver_name;
 #endif
 #if defined(SIRIUS_MAGMA)
     bool is_magma{true};
@@ -395,8 +400,8 @@ Simulation_context::initialize()
 #endif
 
     if (processing_unit() == device_t::CPU || acc::num_devices() == 0) {
-        is_cuda  = false;
-        is_magma = false;
+        has_gpu_solver = false;
+        is_magma       = false;
     }
 
     int const npr = mpi_grid_dims()[0];
@@ -410,14 +415,14 @@ Simulation_context::initialize()
                 if (full_potential()) {
                     if (is_magma) {
                         evsn[i] = "magma";
-                    } else if (is_cuda) {
-                        evsn[i] = "cusolver";
+                    } else if (has_gpu_solver) {
+                        evsn[i] = gpu_solver_name;
                     } else {
                         evsn[i] = "lapack";
                     }
                 } else {
-                    if (is_cuda) {
-                        evsn[i] = "cusolver";
+                    if (has_gpu_solver) {
+                        evsn[i] = gpu_solver_name;
                     } else if (is_magma && num_bands() > 200) {
                         evsn[i] = "magma";
                     } else {
@@ -512,7 +517,7 @@ Simulation_context::initialize()
 
     auto print_mpi_layout = env::print_mpi_layout();
 
-    if (verbosity() >= 3 || print_mpi_layout) {
+    if (verbosity() >= 4 || print_mpi_layout) {
         mpi::pstdout pout(comm());
 #if defined(SIRIUS_CPU_INFO)
         unsigned int cpu_id, numa_id;
@@ -550,6 +555,78 @@ Simulation_context::initialize()
 void
 Simulation_context::print_info(std::ostream& out__) const
 {
+    std::map<la::ev_solver_t, std::string> const evsm = {
+            {la::ev_solver_t::lapack, "LAPACK"},     {la::ev_solver_t::scalapack, "ScaLAPACK"},
+            {la::ev_solver_t::elpa, "ELPA"},         {la::ev_solver_t::dlaf, "DLA-Future"},
+            {la::ev_solver_t::magma, "MAGMA"},       {la::ev_solver_t::magma_gpu, "MAGMA with GPU pointers"},
+            {la::ev_solver_t::cusolver, "cuSOLVER"}, {la::ev_solver_t::rocsolver, "rocSOLVER"}};
+
+    if (verbosity() == 1) {
+        rte::ostream os(out__, "info");
+        os << "SIRIUS " << major_version() << "." << minor_version() << "." << revision()
+           << "; git hash: " << git_hash() << std::endl
+           << "method: " << cfg().parameters().electronic_structure_method()
+           << "; processing unit: " << (processing_unit() == device_t::GPU ? "GPU" : "CPU") << std::endl
+           << "MPI ranks: " << comm().size() << "; OpenMP threads: " << omp_get_max_threads() << std::endl
+           << "atoms: " << unit_cell().num_atoms() << "; atom types: " << unit_cell().num_atom_types()
+           << "; electrons: " << unit_cell().num_electrons() << "; bands: " << num_bands() << std::endl
+           << "spins: " << num_spins() << "; magnetic dimensions: " << num_mag_dims()
+           << "; spin-orbit coupling: " << boolstr(so_correction()) << std::endl
+           << "lattice vectors (Bohr):" << std::endl;
+        for (int i = 0; i < 3; i++) {
+            auto a = unit_cell().lattice_vector(i);
+            os << "  a" << i + 1 << ": " << ffmt(14, 8) << a[0] << ffmt(14, 8) << a[1] << ffmt(14, 8) << a[2]
+               << std::endl;
+        }
+        if (mpi_grid_) {
+            os << "MPI grid: " << mpi_grid_->communicator(1).size() << " " << mpi_grid_->communicator(2).size()
+               << std::endl;
+        }
+        os << "cell volume (Bohr^3): " << unit_cell().omega() << std::endl;
+        for (int i = 0; i < unit_cell().num_atom_types(); i++) {
+            auto const& type = unit_cell().atom_type(i);
+            os << "atom type: " << type.label() << "; atoms: " << type.num_atoms() << "; file: " << type.file_name()
+               << std::endl;
+        }
+        os << "XC functionals:";
+        if (!xc_functionals_weight().empty() && xc_functionals_weight().size() != xc_functionals().size()) {
+            RTE_THROW("The table containing the weight of each functional should have the same number of elements "
+                      "than the xc_functionals parameter\n");
+        }
+        for (size_t i = 0; i < xc_functionals().size(); i++) {
+            os << " " << xc_functionals()[i];
+            if (!xc_functionals_weight().empty()) {
+                os << " (weight " << xc_functionals_weight().at(i) << ")";
+            }
+        }
+        os << std::endl
+           << "|G+k| cutoff: " << gk_cutoff() << "; density cutoff: " << pw_cutoff() << " (Bohr^-1)" << std::endl
+           << "FFT grids (fine / coarse): " << fft_grid_[0] << " " << fft_grid_[1] << " " << fft_grid_[2] << " / "
+           << fft_coarse_grid_[0] << " " << fft_coarse_grid_[1] << " " << fft_coarse_grid_[2] << std::endl
+           << "G-vectors (fine / coarse): " << gvec().num_gvec() << " / " << gvec_coarse().num_gvec() << std::endl
+           << "k-point grid (input): " << cfg().parameters().ngridk()[0] << " " << cfg().parameters().ngridk()[1] << " "
+           << cfg().parameters().ngridk()[2] << "; shift: " << cfg().parameters().shiftk()[0] << " "
+           << cfg().parameters().shiftk()[1] << " " << cfg().parameters().shiftk()[2] << std::endl
+           << "symmetry: " << boolstr(use_symmetry()) << "; symmetry operations: " << unit_cell().symmetry().size()
+           << std::endl
+           << "diagonalization: " << cfg().iterative_solver().type()
+           << "; standard/generalized eigensolvers: " << evsm.at(std_evp_solver().type()) << "/"
+           << evsm.at(gen_evp_solver().type()) << std::endl
+           << "smearing: " << cfg().parameters().smearing() << "; width: " << smearing_width() << " Ha" << std::endl
+           << "mixer: " << cfg().mixer().type() << "; beta: " << cfg().mixer().beta()
+           << "; history: " << cfg().mixer().max_history() << std::endl;
+        if (!full_potential()) {
+            os << "precision (wave-functions / subspace matrices): " << cfg().parameters().precision_wf() << " / "
+               << cfg().parameters().precision_hs() << std::endl;
+        }
+        if (full_potential()) {
+            os << "LAPW cutoff: " << cfg().parameters().aw_cutoff()
+               << "; lmax (APW/rho/potential): " << unit_cell().lmax_apw() << "/" << lmax_rho() << "/" << lmax_pot()
+               << std::endl;
+        }
+        return;
+    }
+
     {
         rte::ostream os(out__, "info");
         tm const* ptm = localtime(&start_time_.tv_sec);
@@ -662,11 +739,7 @@ Simulation_context::print_info(std::ostream& out__) const
 
         std::string evsn[]     = {"standard eigen-value solver        : ", "generalized eigen-value solver     : "};
         la::ev_solver_t evst[] = {std_evp_solver().type(), gen_evp_solver().type()};
-        std::map<la::ev_solver_t, std::string> const evsm = {
-                {la::ev_solver_t::lapack, "LAPACK"},    {la::ev_solver_t::scalapack, "ScaLAPACK"},
-                {la::ev_solver_t::elpa, "ELPA"},        {la::ev_solver_t::dlaf, "DLA-Future"},
-                {la::ev_solver_t::magma, "MAGMA"},      {la::ev_solver_t::magma_gpu, "MAGMA with GPU pointers"},
-                {la::ev_solver_t::cusolver, "cuSOLVER"}};
+
         for (int i = 0; i < 2; i++) {
             os << evsn[i] << evsm.at(evst[i]) << std::endl;
         }
