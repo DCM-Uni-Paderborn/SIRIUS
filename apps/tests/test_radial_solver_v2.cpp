@@ -52,12 +52,12 @@ enu_from_potential(cmd_args const& args__)
         }
     }
 
-    lapw_radial_basis_t rb{atype, relativity_t::none, veff};
+    lapw_radial_basis_t rb{0, atype, relativity_t::none, veff};
     rb.write_enu(std::cout);
 
     int ierr{0};
     if (!args__.exist("skip_enu")) {
-        ierr += rb.find_enu();
+        ierr += rb.find_enu(relativity_t::none);
         if (ierr) {
             std::cout << "Enu search failed" << std::endl;
         }
