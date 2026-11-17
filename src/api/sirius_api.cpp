@@ -7370,8 +7370,9 @@ sirius_set_xc_point_callback:
     status are initially zero. Set status nonzero on failure after completing
     callback collectives. Never unwind across the C ABI. The caller retains
     user_data until the context is destroyed. Geometry changes invalidate the
-    supplied quadrature. Disable crystal symmetry for point XC.
-    Ultrasoft setups additionally supply independent r^2 T_ij^L tables.
+    supplied quadrature. Crystal symmetry requires a symmetry-closed atom quadrature,
+    preserving both weight arrays. The complete point set is retained while k-points
+    may be reduced. Ultrasoft setups additionally supply independent r^2 T_ij^L tables.
     PW, PAW and ultrasoft are supported on CPU/GPU. PAW and nonlinear core corrections
     require explicitly supplied positive core tau. FP-LAPW fields are supported on
     CPU/GPU with scalar-relativistic or native Dirac radial functions.

@@ -6,6 +6,7 @@
 #include "potential.hpp"
 #include "density/lapw_xc_field_map.hpp"
 #include "density/paw_xc_field_map.hpp"
+#include "symmetry/xc_point_symmetry.hpp"
 
 namespace sirius {
 
@@ -20,6 +21,42 @@ xc_point_set_t::xc_point_set_t(Simulation_context const& ctx__)
         auto r = ctx__.unit_cell().atom(ia).position();
         atoms_.push_back({r[0], r[1], r[2]});
     }
+}
+
+xc_point_set_t::xc_point_set_t(xc_point_set_t const& other)
+    : coordinates(other.coordinates)
+    , energy_weights(other.energy_weights)
+    , descriptor_weights(other.descriptor_weights)
+    , block_sizes(other.block_sizes)
+    , block_centres(other.block_centres)
+    , lattice_(other.lattice_)
+    , atoms_(other.atoms_)
+{
+}
+
+xc_point_set_t&
+xc_point_set_t::operator=(xc_point_set_t const& other)
+{
+    if (this != &other) {
+        coordinates        = other.coordinates;
+        energy_weights     = other.energy_weights;
+        descriptor_weights = other.descriptor_weights;
+        block_sizes        = other.block_sizes;
+        block_centres      = other.block_centres;
+        lattice_           = other.lattice_;
+        atoms_             = other.atoms_;
+        symmetry_.reset();
+    }
+    return *this;
+}
+
+XC_point_symmetry const&
+xc_point_set_t::symmetry(Simulation_context const& ctx__) const
+{
+    if (!symmetry_) {
+        symmetry_ = std::make_shared<XC_point_symmetry>(ctx__, *this);
+    }
+    return *symmetry_;
 }
 
 void
@@ -210,7 +247,7 @@ validate_external_xc_context(Simulation_context const& ctx__)
     if (points) {
         points->validate(ctx__);
         if (ctx__.cfg().parameters().use_symmetry()) {
-            RTE_THROW("external XC point quadrature requires disabled crystal symmetry");
+            points->symmetry(ctx__);
         }
     }
     if (ctx__.full_potential()) {
@@ -371,6 +408,9 @@ Potential::xc_external_points(Density const& density__)
     xc_point_fields_t derivatives(nr, ns);
     auto evaluate = [&](auto const& map) {
         auto fields = map.sample(rho, tau);
+        if (ctx_.use_symmetry()) {
+            fields = quadrature.symmetry(ctx_).apply(fields);
+        }
         derivatives.rho.zero();
         derivatives.gradient.zero();
         derivatives.tau.zero();
@@ -384,6 +424,9 @@ Potential::xc_external_points(Density const& density__)
         xc_callback_output_t output{0, derivatives.rho.at(memory_t::host), derivatives.gradient.at(memory_t::host),
                                     derivatives.tau.at(memory_t::host)};
         evaluate_external_xc(ctx_, input, output);
+        if (ctx_.use_symmetry()) {
+            derivatives = quadrature.symmetry(ctx_).apply(derivatives, true);
+        }
         return output.energy;
     };
     xc_potential_->zero();
@@ -445,8 +488,10 @@ Potential::external_xc_geometry(Density const& density__) const
     }
     auto smooth = external_xc_smooth_fields(ctx_, density__);
     xc_point_derivatives_t geometry(quadrature);
+    r3::matrix<double> symmetry_lattice;
     auto evaluate = [&](auto const& map) {
-        auto fields = map.sample(smooth[0], smooth[1]);
+        auto raw_fields = map.sample(smooth[0], smooth[1]);
+        auto fields     = ctx_.use_symmetry() ? quadrature.symmetry(ctx_).apply(raw_fields) : std::move(raw_fields);
         xc_point_fields_t derivatives(points.size(), ctx_.num_mag_dims() + 1);
         derivatives.rho.zero();
         derivatives.gradient.zero();
@@ -461,6 +506,10 @@ Potential::external_xc_geometry(Density const& density__) const
         xc_callback_output_t output{0, derivatives.rho.at(memory_t::host), derivatives.gradient.at(memory_t::host),
                                     derivatives.tau.at(memory_t::host), &geometry};
         evaluate_external_xc(ctx_, input, output);
+        if (ctx_.use_symmetry()) {
+            symmetry_lattice = quadrature.symmetry(ctx_).geometry_adjoint(raw_fields, derivatives);
+            derivatives      = quadrature.symmetry(ctx_).apply(derivatives, true);
+        }
         return map.geometry_adjoint(smooth[0], smooth[1], derivatives);
     };
     auto mapped = evaluate(PAW_xc_field_map(density__, points));
@@ -501,7 +550,7 @@ Potential::external_xc_geometry(Density const& density__) const
             failed |= !std::isfinite(result.atoms[ia][x]);
         }
         for (int y = 0; y < 3; y++) {
-            result.lattice[x + 3 * y] += mapped.lattice(x, y);
+            result.lattice[x + 3 * y] += mapped.lattice(x, y) + symmetry_lattice(x, y);
             failed |= !std::isfinite(result.lattice[x + 3 * y]);
         }
     }
