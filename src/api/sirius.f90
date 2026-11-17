@@ -7123,7 +7123,7 @@ call sirius_set_xc_callback_aux(handler_ptr,fptr,user_data,error_code_ptr)
 end subroutine sirius_set_xc_callback
 
 !
-!> @brief Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature before initializing the context, after defining all atoms and lattice vectors. These are real-space integration points, not k points. SIRIUS reconstructs the fields from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. SIRIUS maps these derivatives back to the PW, PAW or LAPW Hamiltonian. Each complete atom block is owned once across the context communicator. Empty local arrays are permitted. The callback has the C signature void callback(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, double* energy, double* drho, double* dgradient, double* dtau, int* status). Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr. Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1 total fields or ns=2 up/down fields. The energy and descriptor weights do not scale those fields. Return raw covectors of the complete discrete energy, including model weights, without dividing by quadrature weights or applying host adjoints. Return the same globally summed energy on every rank, including empty ranks. Arrays and status are initially zero. Set status nonzero on failure after completing callback collectives. Never unwind across the C ABI. The caller retains user_data until the context is destroyed. Geometry changes invalidate the supplied quadrature. Disable crystal symmetry for point XC. Ultrasoft setups additionally supply independent r^2 T_ij^L tables. PW, PAW and ultrasoft are supported on CPU. PAW and nonlinear core corrections require explicitly supplied positive core tau. FP-LAPW fields are supported on CPU with scalar-relativistic radial functions. PW, PAW and ultrasoft forces and stress require the point geometry callbacks. FP-LAPW supports energy and orbital derivatives, but not forces or stress. Explicit cores support NR, ZORA and Dirac relativity.
+!> @brief Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature before initializing the context, after defining all atoms and lattice vectors. These are real-space integration points, not k points. SIRIUS reconstructs the fields from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. SIRIUS maps these derivatives back to the PW, PAW or LAPW Hamiltonian. Each complete atom block is owned once across the context communicator. Empty local arrays are permitted. The callback has the C signature void callback(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, double* energy, double* drho, double* dgradient, double* dtau, int* status). Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr. Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1 total fields or ns=2 up/down fields. Explicit sirius_set_xc_spinor_mode registration instead supplies ns=4 total/z/x/y fields for norm-conserving PW, PAW, ultrasoft, and FP-LAPW. They are jointly reconstructed before the callback. The energy and descriptor weights do not scale those fields. Return raw covectors of the complete discrete energy, including model weights, without dividing by quadrature weights or applying host adjoints. Return the same globally summed energy on every rank, including empty ranks. Arrays and status are initially zero. Set status nonzero on failure after completing callback collectives. Never unwind across the C ABI. The caller retains user_data until the context is destroyed. Geometry changes invalidate the supplied quadrature. Disable crystal symmetry for point XC. Ultrasoft setups additionally supply independent r^2 T_ij^L tables. PW, PAW and ultrasoft are supported on CPU. PAW and nonlinear core corrections require explicitly supplied positive core tau. FP-LAPW fields are supported on CPU with scalar-relativistic radial functions. PW, PAW and ultrasoft forces and stress require the point geometry callbacks. FP-LAPW supports energy and orbital derivatives, but not forces or stress. Noncollinear states use NR/ZORA second variation with SOC. Explicit cores support NR, ZORA and Dirac relativity.
 !> @param [in] handler Simulation context handler.
 !> @param [in] fptr C-interoperable point callback. Null disables external XC.
 !> @param [in] user_data Opaque callback state, which may be null.
@@ -7204,6 +7204,45 @@ call sirius_set_xc_point_callback_aux(handler_ptr,fptr,user_data,num_points_ptr,
 &num_blocks_ptr,coordinates_ptr,energy_weights_ptr,descriptor_weights_ptr,block_sizes_ptr,&
 &block_centres_ptr,error_code_ptr)
 end subroutine sirius_set_xc_point_callback
+
+!
+!> @brief Opt into total/z/x/y fields for all registered point XC callbacks before initializing the context. Their ns argument becomes four; array storage remains (nr,ns) and (nr,3,ns). The energy and any geometry callback must use the same convention. No local spin-axis rotation is applied. FP-LAPW spinors use NR/ZORA second variation including SOC. Scalar and collinear registrations retain their total and up/down fields when this mode is disabled. Registering a new energy callback resets the mode to disabled. Called collectively on the context communicator with the same enabled value.
+!> @param [in] handler Simulation context handler.
+!> @param [in] enabled Enable the four-component point callback convention.
+!> @param [out] error_code Error code.
+subroutine sirius_set_xc_spinor_mode(handler,enabled,error_code)
+implicit none
+!
+type(sirius_context_handler), target, intent(in) :: handler
+logical, target, intent(in) :: enabled
+integer, optional, target, intent(out) :: error_code
+!
+type(C_PTR) :: handler_ptr
+type(C_PTR) :: enabled_ptr
+logical(C_BOOL), target :: enabled_c_type
+type(C_PTR) :: error_code_ptr
+!
+interface
+subroutine sirius_set_xc_spinor_mode_aux(handler,enabled,error_code)&
+&bind(C, name="sirius_set_xc_spinor_mode")
+use, intrinsic :: ISO_C_BINDING
+type(C_PTR), value :: handler
+type(C_PTR), value :: enabled
+type(C_PTR), value :: error_code
+end subroutine
+end interface
+!
+handler_ptr = C_NULL_PTR
+handler_ptr = C_LOC(handler%handler_ptr_)
+enabled_ptr = C_NULL_PTR
+enabled_c_type = enabled
+enabled_ptr = C_LOC(enabled_c_type)
+error_code_ptr = C_NULL_PTR
+if (present(error_code)) then
+error_code_ptr = C_LOC(error_code)
+endif
+call sirius_set_xc_spinor_mode_aux(handler_ptr,enabled_ptr,error_code_ptr)
+end subroutine sirius_set_xc_spinor_mode
 
 !
 !> @brief Replace the copied quadrature of an initialized external point XC context without changing its field or geometry callbacks or their user data. Call collectively between SCF calculations, after setting the new lattice and atom positions and before updating the ground state. This call does not update the density, potential or orbitals. Local point and block counts may change, including redistribution to previously empty ranks. The array conventions are those of sirius_set_xc_point_callback. An invalid replacement leaves the previous quadrature and callbacks unchanged.

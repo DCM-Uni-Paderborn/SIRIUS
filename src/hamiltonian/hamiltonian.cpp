@@ -22,6 +22,24 @@
 namespace sirius {
 namespace {
 
+std::complex<double>
+lapw_so_angular(Atom_type const& type, int i, int j, int s)
+{
+    auto const& a = type.indexb(i);
+    auto const& b = type.indexb(j);
+    int l         = a.am.l();
+    if (s == 0 || l != b.am.l() || l > type.lmax_apw()) {
+        return 0;
+    }
+    if (s == 1) {
+        return a.m == b.m ? a.m : 0;
+    }
+    double up_down = a.m == b.m + 1 ? std::sqrt(l * (l + 1.0) - a.m * (a.m - 1.0)) : 0;
+    double down_up = b.m == a.m + 1 ? std::sqrt(l * (l + 1.0) - b.m * (b.m - 1.0)) : 0;
+    return s == 2 ? std::complex<double>{0.5 * (up_down + down_up), 0}
+                  : std::complex<double>{0, 0.5 * (up_down - down_up)};
+}
+
 } // namespace
 
 // TODO: radial integrals for the potential should be computed here; the problem is that they also can be set
@@ -475,11 +493,20 @@ Hamiltonian0<T>::Hamiltonian0(Potential& potential__, std::shared_ptr<LAPW_radia
             for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
                 LAPW_xc_atom op(unit_cell_.atom(ia), lapw_basis().radial_basis(atom_index_t::global(ia)),
                                 ctx_.lmax_rho());
-                for (int s = 0; s < ctx_.num_spins(); s++) {
+                bool spinor = ctx_.num_mag_dims() == 3;
+                for (int s = 0; s < (spinor ? 4 : ctx_.num_spins()); s++) {
                     auto matrix = op.matrix_elements(d->local[ia][0][s], d->local[ia][1][s]);
                     for (int j = 0; j < unit_cell_.atom(ia).type().mt_basis_size(); j++) {
                         for (int i = 0; i < unit_cell_.atom(ia).type().mt_basis_size(); i++) {
-                            if (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) {
+                            if (spinor) {
+                                if (s < 2) {
+                                    hmt_[ia](i, j, s) += static_cast<std::complex<T>>(matrix(i, j));
+                                } else {
+                                    auto value = static_cast<std::complex<T>>(matrix(i, j));
+                                    hmt_[ia](i, j, 2) += s == 2 ? value : std::complex<T>(0, -1) * value;
+                                    hmt_[ia](i, j, 3) += s == 2 ? value : std::complex<T>(0, 1) * value;
+                                }
+                            } else if (ctx_.num_spins() == 2 && ctx_.cfg().control().use_second_variation()) {
                                 hmt_[ia](i, j, 0) += static_cast<std::complex<T>>(0.5 * matrix(i, j));
                                 hmt_[ia](i, j, 1) += static_cast<std::complex<T>>(0.5 * (1 - 2 * s) * matrix(i, j));
                             } else {
@@ -752,20 +779,52 @@ Hamiltonian0<T>::generate_pw_coefs(Potential const& potential__)
     }
     if (auto const* d = potential__.lapw_xc_derivatives()) {
         bool second = ctx_.cfg().control().use_second_variation();
-        vtau_pw_    = mdarray<std::complex<T>, 2>({ctx_.gvec().num_gvec(), second ? 1 : ctx_.num_spins()});
+        bool spinor = ctx_.num_mag_dims() == 3;
+        vtau_pw_ = mdarray<std::complex<T>, 2>({ctx_.gvec().num_gvec(), spinor ? 4 : (second ? 1 : ctx_.num_spins())});
         vtau_pw_.zero();
-        for (int s = 0; s < ctx_.num_spins(); s++) {
+        for (int s = 0; s < (spinor ? 4 : ctx_.num_spins()); s++) {
             auto v       = d->rho[s].gather_f_pw();
             auto t       = d->tau[s].gather_f_pw();
-            int column   = second ? 0 : s;
-            double scale = second ? 1.0 / ctx_.num_spins() : 1.0;
+            int column   = spinor ? s : (second ? 0 : s);
+            double scale = second && !spinor ? 1.0 / ctx_.num_spins() : 1.0;
             for (int ig = 0; ig < ctx_.gvec().num_gvec(); ig++) {
                 // These Fourier covectors already exclude the MT quadrature points.
-                veff_pw_(ig, column) += static_cast<std::complex<T>>(scale * v[ig]);
+                if (!spinor || s == 0) {
+                    veff_pw_(ig, spinor ? 0 : column) += static_cast<std::complex<T>>(scale * v[ig]);
+                }
                 vtau_pw_(ig, column) += static_cast<std::complex<T>>(scale * t[ig]);
             }
         }
     }
+}
+
+template <typename T>
+std::complex<T>
+Hamiltonian0<T>::hmt_component(int ia__, int i__, int j__, int s__, bool spin_orbit_only__) const
+{
+    auto const& h = hmt_[ia__];
+    if (ctx_.num_mag_dims() != 3) {
+        return spin_orbit_only__ ? std::complex<T>(0) : h(i__, j__, s__);
+    }
+    std::complex<T> result{0};
+    if (!spin_orbit_only__ && s__ < 2) {
+        result = ctx_.cfg().control().use_second_variation()
+                         ? h(i__, j__, s__)
+                         : T(0.5) * (h(i__, j__, 0) + T(1 - 2 * s__) * h(i__, j__, 1));
+    } else if (!spin_orbit_only__) {
+        result = s__ == 2 ? T(0.5) * (h(i__, j__, 2) + h(i__, j__, 3))
+                          : std::complex<T>(0, -0.5) * (h(i__, j__, 3) - h(i__, j__, 2));
+    }
+    if (ctx_.so_correction() && s__ != 0) {
+        auto const& atom = unit_cell_.atom(ia__);
+        auto const& a    = atom.type().indexb(i__);
+        auto const& b    = atom.type().indexb(j__);
+        result += static_cast<std::complex<T>>(lapw_so_angular(atom.type(), i__, j__, s__)) *
+                  static_cast<T>(lapw_basis()
+                                         .radial_basis(atom_index_t::global(ia__))
+                                         .so_radial_integral(a.am.l(), a.order, b.order));
+    }
+    return result;
 }
 
 template class Hamiltonian0<double>;

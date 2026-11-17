@@ -44,7 +44,8 @@ struct xc_point_set_t
 /** Scalar arrays have Fortran shape (num_points, num_spins), gradients
  *  (num_points, 3, num_spins). One spin component denotes total density/tau,
  *  two components denote up/down. The neutralizing PP background is excluded.
- *  No density clipping or renormalization is applied.
+ *  No density clipping or renormalization is applied. Explicit spinor mode supplies
+ *  four total/z/x/y components for each field; num_spins then denotes this component count, not occupations.
  *  The context supplies the cell, atoms, FFT layout and communicators.
  */
 struct xc_callback_input_t

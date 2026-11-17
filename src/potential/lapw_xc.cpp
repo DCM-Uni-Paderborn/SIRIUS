@@ -12,8 +12,10 @@ Potential::validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& d__) cons
 {
     bool failed{false};
     try {
-        int ns = ctx_.num_spins();
-        if (!ctx_.full_potential() || ctx_.so_correction() || d__.rho.size() != ns || d__.tau.size() != ns ||
+        bool spinor = ctx_.num_mag_dims() == 3;
+        int ns      = spinor ? 4 : ctx_.num_spins();
+        if (!ctx_.full_potential() || (spinor && !ctx_.cfg().control().use_second_variation()) ||
+            (ctx_.so_correction() && !spinor) || d__.rho.size() != ns || d__.tau.size() != ns ||
             d__.local.size() != unit_cell_.num_atoms() || d__.core.size() != unit_cell_.num_atoms()) {
             RTE_THROW("incompatible LAPW XC fields or unsupported relativistic/spin/device mode");
         }
@@ -47,8 +49,8 @@ Potential::validate_lapw_xc_derivatives(lapw_xc_field_adjoint_t const& d__) cons
                 }
                 for (int ir = 0; ir < grid.num_points(); ir++) {
                     double spherical{0};
-                    for (int s = 0; s < ns; s++) {
-                        spherical += d__.local[ia][part][s](0, ir) / (ns * y00);
+                    for (int s = 0; s < (spinor ? 1 : ns); s++) {
+                        spherical += d__.local[ia][part][s](0, ir) / ((spinor ? 1 : ns) * y00);
                     }
                     double core = d__.core[ia][part][ir];
                     failed |= std::abs(core - spherical) > 1e-12 * std::max({1.0, std::abs(core), std::abs(spherical)});
@@ -140,17 +142,18 @@ Potential::lapw_xc_contractions(Density const& density__, lapw_xc_field_adjoint_
     if (invalid) {
         RTE_THROW("LAPW XC contractions require physical rho/tau from the same context");
     }
-    int ns = ctx_.num_spins();
+    bool spinor = ctx_.num_mag_dims() == 3;
+    int ns      = spinor ? 4 : ctx_.num_spins();
     std::array<double, 4> result{};
     for (int s = 0; s < ns; s++) {
         double sign = 1 - 2 * s;
         for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
             double multiplicity = ctx_.gvec().reduced() && ig >= ctx_.gvec().skip_g0() ? 2 : 1;
-            double weight       = ctx_.gvec().omega() * multiplicity / ns;
-            auto r              = density__.component(0).rg().f_pw_local(ig);
-            auto t              = density__.kinetic_density().component(0).rg().f_pw_local(ig);
-            result[0] += weight * std::real(std::conj(d.rho[s].f_pw_local(ig)) * r);
-            if (ns == 2) {
+            double weight       = ctx_.gvec().omega() * multiplicity / (spinor ? 1 : ns);
+            auto r              = density__.component(spinor ? s : 0).rg().f_pw_local(ig);
+            auto t              = density__.kinetic_density().component(spinor ? s : 0).rg().f_pw_local(ig);
+            result[spinor && s > 0 ? 1 : 0] += weight * std::real(std::conj(d.rho[s].f_pw_local(ig)) * r);
+            if (!spinor && ns == 2) {
                 result[1] += weight * sign *
                              std::real(std::conj(d.rho[s].f_pw_local(ig)) * density__.mag(0).rg().f_pw_local(ig));
                 t += sign * density__.kinetic_density().vector(0).rg().f_pw_local(ig);
@@ -158,7 +161,7 @@ Potential::lapw_xc_contractions(Density const& density__, lapw_xc_field_adjoint_
             result[2] += weight * std::real(std::conj(d.tau[s].f_pw_local(ig)) * t);
             result[3] +=
                     weight * std::real(std::conj(d.rho[s].f_pw_local(ig)) * r + std::conj(d.tau[s].f_pw_local(ig)) * t);
-            if (ns == 2) {
+            if (!spinor && ns == 2) {
                 result[3] += weight * sign *
                              std::real(std::conj(d.rho[s].f_pw_local(ig)) * density__.mag(0).rg().f_pw_local(ig));
             }
@@ -166,14 +169,14 @@ Potential::lapw_xc_contractions(Density const& density__, lapw_xc_field_adjoint_
         // MT covectors are replicated, but each physical sphere contributes once.
         // Stored fields already contain the core, so no separate core term is added.
         for (auto it : unit_cell_.spl_num_atoms()) {
-            auto const& r = density__.component(0).mt()[it.i];
-            auto const& t = density__.kinetic_density().component(0).mt()[it.i];
+            auto const& r = density__.component(spinor ? s : 0).mt()[it.i];
+            auto const& t = density__.kinetic_density().component(spinor ? s : 0).mt()[it.i];
             for (size_t i = 0; i < d.local[it.i][0][s].size(); i++) {
-                double v = d.local[it.i][0][s][i] / ns;
-                double w = d.local[it.i][1][s][i] / ns;
-                result[0] += v * r[i];
+                double v = d.local[it.i][0][s][i] / (spinor ? 1 : ns);
+                double w = d.local[it.i][1][s][i] / (spinor ? 1 : ns);
+                result[spinor && s > 0 ? 1 : 0] += v * r[i];
                 result[2] += w * t[i];
-                if (ns == 2) {
+                if (!spinor && ns == 2) {
                     result[1] += sign * v * density__.mag(0).mt()[it.i][i];
                     result[2] += sign * w * density__.kinetic_density().vector(0).mt()[it.i][i];
                 }

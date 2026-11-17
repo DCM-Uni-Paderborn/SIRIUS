@@ -164,6 +164,11 @@ class Hamiltonian0
         return hmt_[ia__];
     }
 
+    /// Atom-local Hamiltonian in scalar/collinear or total/z/x/y component order.
+    /// Includes the second-variation SOC operator in the spinor components.
+    std::complex<T>
+    hmt_component(int ia__, int i__, int j__, int s__, bool spin_orbit_only__ = false) const;
+
     auto const&
     veff_pw(int ig__, int ispn__ = 0) const
     {

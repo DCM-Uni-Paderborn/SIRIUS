@@ -161,6 +161,96 @@ Density::initial_kinetic_density()
     auto guess = [&](double n) {
         return 0.3 * std::pow(3 * pi * pi * ctx_.num_spins(), 2.0 / 3.0) * std::pow(std::max(0.0, n), 5.0 / 3.0);
     };
+    if (ctx_.num_mag_dims() == 3) {
+        auto spinor_guess = [&](double n, std::array<double, 3> const& m,
+                                std::array<std::array<double, 4>, 3> const& grad) {
+            double length = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+            double up = guess(0.5 * (n + length)), dn = guess(0.5 * (n - length));
+            std::array<double, 4> result{up + dn, 0, 0, 0};
+            std::array<double, 3> axis{};
+            for (int j = 0; j < 3; j++) {
+                axis[j]       = length ? m[j] / length : 0;
+                result[j + 1] = (up - dn) * axis[j];
+            }
+            if (add_von_weizsaecker) {
+                // For R=(n I+m.sigma)/2, use sum_x (d_x sqrt(R))^2/2.
+                // This positive matrix recovers both spin-channel guesses and includes spin-texture gradients.
+                double su = std::sqrt(std::max(0.0, 0.5 * (n + length)));
+                double sd = std::sqrt(std::max(0.0, 0.5 * (n - length)));
+                double b  = n >= length ? (su + sd > 0 ? 0.5 / (su + sd) : 0) : (length ? 0.5 * (su - sd) / length : 0);
+                for (int x = 0; x < 3; x++) {
+                    double dm = std::inner_product(axis.begin(), axis.end(), grad[x].begin() + 1, 0.0);
+                    double du = su > 0 ? 0.25 * (grad[x][0] + dm) / su : 0;
+                    double dd = sd > 0 ? 0.25 * (grad[x][0] - dm) / sd : 0;
+                    double a  = 0.5 * (du + dd);
+                    result[0] += a * a;
+                    for (int j = 0; j < 3; j++) {
+                        double v = 0.5 * (du - dd) * axis[j] + b * (grad[x][j + 1] - axis[j] * dm);
+                        result[0] += v * v;
+                        result[j + 1] += 2 * a * v;
+                    }
+                }
+            }
+            return result;
+        };
+        std::vector<Smooth_periodic_vector_function<double>> grad;
+        if (add_von_weizsaecker) {
+            for (int j = 0; j < 4; j++) {
+                grad.push_back(to_rg(gradient(component(j).rg())));
+            }
+        }
+        for (int ir = 0; ir < ctx_.spfft<double>().local_slice_size(); ir++) {
+            std::array<std::array<double, 4>, 3> g{};
+            for (size_t j = 0; j < grad.size(); j++) {
+                for (int x = 0; x < 3; x++) {
+                    g[x][j] = grad[j][x].value(ir);
+                }
+            }
+            auto value = spinor_guess(rho().rg().value(ir),
+                                      {mag(0).rg().value(ir), mag(1).rg().value(ir), mag(2).rg().value(ir)}, g);
+            for (int j = 0; j < 4; j++) {
+                tau.component(j).rg().value(ir) = value[j];
+            }
+        }
+        if (ctx_.full_potential()) {
+            SHT sht(device_t::CPU, ctx_.lmax_rho());
+            for (auto it : unit_cell_.spl_num_atoms()) {
+                std::vector<Ftp> fields;
+                std::vector<std::vector<Ftp>> grad(4);
+                for (int j = 0; j < 4; j++) {
+                    fields.push_back(transform(sht, component(j).mt()[it.i]));
+                    if (add_von_weizsaecker) {
+                        auto g = gradient(component(j).mt()[it.i]);
+                        for (int x = 0; x < 3; x++) {
+                            grad[j].push_back(transform(sht, g[x]));
+                        }
+                    }
+                }
+                for (size_t i = 0; i < fields[0].size(); i++) {
+                    std::array<std::array<double, 4>, 3> g{};
+                    if (add_von_weizsaecker) {
+                        for (int j = 0; j < 4; j++) {
+                            for (int x = 0; x < 3; x++) {
+                                g[x][j] = grad[j][x][i];
+                            }
+                        }
+                    }
+                    auto value = spinor_guess(fields[0][i], {fields[1][i], fields[2][i], fields[3][i]}, g);
+                    for (int j = 0; j < 4; j++) {
+                        fields[j][i] = value[j];
+                    }
+                }
+                for (int j = 0; j < 4; j++) {
+                    transform(sht, fields[j], tau.component(j).mt()[it.i]);
+                }
+            }
+            for (int j = 0; j < 4; j++) {
+                tau.component(j).mt().sync(unit_cell_.spl_num_atoms());
+            }
+        }
+        tau.fft_transform(-1);
+        return;
+    }
     for (int ir = 0; ir < ctx_.spfft<double>().local_slice_size(); ir++) {
         for (int s = 0; s < ctx_.num_spins(); s++) {
             double n = rho().rg().value(ir);
@@ -266,6 +356,12 @@ Density::generate_mt_kinetic_density(bool add_core__)
     for (auto it : unit_cell_.spl_num_atoms()) {
         auto spin_tau = generate_mt_valence_kinetic_density(it.i);
         for (size_t i = 0; i < spin_tau[0].size(); i++) {
+            if (ctx_.num_mag_dims() == 3) {
+                for (int j = 0; j <= ctx_.num_mag_dims(); j++) {
+                    tau.component(j).mt()[it.i][i] = spin_tau[j][i];
+                }
+                continue;
+            }
             double up = spin_tau[0][i], dn = ctx_.num_spins() == 2 ? spin_tau[1][i] : 0;
             tau.scalar().mt()[it.i][i] = up + dn;
             if (ctx_.num_spins() == 2) {
@@ -291,6 +387,11 @@ Density::generate_mt_valence_kinetic_density(int ia__) const
         RTE_THROW("muffin-tin kinetic density requires LAPW");
     }
     auto const& atom = unit_cell_.atom(ia__);
+    if (ctx_.num_mag_dims() == 3) {
+        auto fields = LAPW_xc_atom(atom, lapw_basis().radial_basis(atom_index_t::global(ia__)), ctx_.lmax_rho())
+                              .fields(density_matrix(ia__));
+        return std::move(fields[1]);
+    }
     auto const& type = atom.type();
     mdarray<double, 2> radial({type.num_mt_points(), type.indexr().size()});
     mdarray<double, 2> derivative({type.num_mt_points(), type.indexr().size()});
@@ -312,6 +413,11 @@ Density::generate_paw_valence_kinetic_density(int ia__) const
     auto const& type = unit_cell_.atom(ia__).type();
     if (ctx_.full_potential() || !type.is_paw() || (type.spin_orbit_coupling() && ctx_.num_mag_dims() != 3)) {
         RTE_THROW("PAW kinetic density requires a pseudopotential context and spinors for SOC partial waves");
+    }
+    if (ctx_.num_mag_dims() == 3) {
+        auto ae = PAW_local_fields(type, true).fields(density_matrix(ia__), false);
+        auto ps = PAW_local_fields(type, false, false).fields(density_matrix(ia__), false);
+        return {std::move(ae[1]), std::move(ps[1])};
     }
     int lmax = 2 * type.indexr().lmax();
     std::vector<int> ae_sizes, ps_sizes;
@@ -343,7 +449,8 @@ Density::generate_smooth_kinetic_density(K_point_set const& ks__) const
         RTE_THROW("kinetic density requires k-points from the same context");
     }
 
-    int components = ctx_.num_spins();
+    bool spinor    = ctx_.num_mag_dims() == 3;
+    int components = spinor ? 4 : ctx_.num_spins();
     std::vector<Smooth_periodic_function<double>> coarse, result;
     for (int j = 0; j < components; j++) {
         coarse.emplace_back(ctx_.spfft_coarse<double>(), ctx_.gvec_coarse_fft_sptr());
@@ -369,10 +476,22 @@ Density::generate_smooth_kinetic_density(K_point_set const& ks__) const
             psi[ispn] =
                     wf::Wave_functions_fft<T>(kp->gkvec_fft_sptr(), kp->spinor_wave_functions(), wf::spin_index(ispn),
                                               wf::band_range(0, nbnd), wf::shuffle_to::fft_layout);
-            for (int ib = 0; ib < psi[ispn].num_wf_local(); ib++) {
-                auto band = psi[ispn].spl_num_wf().global_index(ib);
-                T weight  = kp->weight() * kp->band_occupancy(band, ispn) / unit_cell_.omega();
-                op.add_density(weight, psi[ispn].at(memory_t::host, 0, wf::band_index(ib)), tau[ispn].data());
+            if (!spinor) {
+                for (int ib = 0; ib < psi[ispn].num_wf_local(); ib++) {
+                    auto band = psi[ispn].spl_num_wf().global_index(ib);
+                    T weight  = kp->weight() * kp->band_occupancy(band, ispn) / unit_cell_.omega();
+                    op.add_density(weight, psi[ispn].at(memory_t::host, 0, wf::band_index(ib)), tau[ispn].data());
+                }
+            }
+        }
+        if (spinor && kp->num_occupied_bands()) {
+            for (int ib = 0; ib < psi[0].num_wf_local(); ib++) {
+                auto band = psi[0].spl_num_wf().global_index(ib);
+                T weight  = kp->weight() * kp->band_occupancy(band, 0) / unit_cell_.omega();
+                op.add_spinor_density(weight,
+                                      {psi[0].at(memory_t::host, 0, wf::band_index(ib)),
+                                       psi[1].at(memory_t::host, 0, wf::band_index(ib))},
+                                      {tau[0].data(), tau[1].data(), tau[2].data(), tau[3].data()});
             }
         }
         for (int j = 0; j < components; j++) {
