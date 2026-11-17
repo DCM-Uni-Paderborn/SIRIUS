@@ -236,6 +236,7 @@ class Density : public Field4D
     std::unique_ptr<Smooth_periodic_function<double>> rho_pseudo_core_{nullptr};
 
     /// Fixed pseudo-core tau, excluded from valence mixing and electron counts.
+    std::unique_ptr<Smooth_periodic_function<double>> tau_pseudo_core_;
 
     /// Scalar and spin-vector tau (plus core inside LAPW spheres), mixed with rho/magnetization.
     std::unique_ptr<Field4D> kinetic_density_;
@@ -334,6 +335,10 @@ class Density : public Field4D
     /// Generate pseudo core charge density needed for non-linear core correction.
     void
     generate_pseudo_core_charge_density();
+
+    /// Positive real-space pseudo-core charge and kinetic fields for meta-GGA XC.
+    void
+    generate_pseudo_core_fields();
 
   public:
     /// External XC enables tau automatically; it can also be requested for orbital-field diagnostics.
@@ -605,6 +610,15 @@ class Density : public Field4D
     rho_pseudo_core() const
     {
         return *rho_pseudo_core_;
+    }
+
+    Smooth_periodic_function<double> const&
+    tau_pseudo_core() const
+    {
+        if (!tau_pseudo_core_) {
+            RTE_THROW("pseudo-core kinetic density requires an ordinary pseudopotential meta-GGA context");
+        }
+        return *tau_pseudo_core_;
     }
 
     inline auto const&

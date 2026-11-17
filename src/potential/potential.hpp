@@ -75,6 +75,7 @@ class Potential : public Field4D
     friend void
     copy(Potential const&, Potential&);
     /// Grid XC energy using the PAW orbital density without compensation charge.
+    std::optional<double> paw_meta_grid_energy_;
 
     void
     xc_external(Density const& density__);
@@ -83,7 +84,10 @@ class Potential : public Field4D
     xc_external_points(Density const& density__);
 
     void
-    xc_rg_meta(Density const& density__);
+    xc_rg_meta(Density const& density__, lapw_xc_field_adjoint_t* lapw__ = nullptr);
+
+    void
+    xc_lapw_meta(Density const& density__);
 
     std::vector<std::array<std::vector<double>, 2>>
     project_core_xc_derivatives(lapw_xc_field_adjoint_t const& derivatives__) const;
@@ -974,6 +978,9 @@ class Potential : public Field4D
         }
         if (external_xc_registered_) {
             return external_xc_energy_;
+        }
+        if (paw_meta_grid_energy_) {
+            return *paw_meta_grid_energy_;
         }
         double exc = (1 + add_delta_rho_xc_) * inner(density__.rho(), xc_energy_density());
         if (!ctx_.full_potential()) {

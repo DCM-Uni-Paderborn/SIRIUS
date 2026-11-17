@@ -586,7 +586,11 @@ Potential::xc(Density const& density__)
     }
     if (kinetic_potential_) {
         kinetic_potential_->zero();
-        xc_rg_meta(density__);
+        if (ctx_.full_potential()) {
+            xc_lapw_meta(density__);
+        } else {
+            xc_rg_meta(density__);
+        }
         return;
     }
     /* quick return */

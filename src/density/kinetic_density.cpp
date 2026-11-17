@@ -16,6 +16,113 @@
 
 namespace sirius {
 
+void
+Density::generate_pseudo_core_fields()
+{
+    int invalid{0};
+    try {
+        for (int iat = 0; iat < unit_cell_.num_atom_types(); iat++) {
+            auto const& type = unit_cell_.atom_type(iat);
+            type.check_ps_core_kinetic_density();
+            invalid |= type.has_ps_core_kinetic_density() &&
+                       type.num_mt_points() < static_cast<int>(gsl_interp_type_min_size(gsl_interp_steffen));
+        }
+    } catch (std::exception const&) {
+        invalid = 1;
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("meta-GGA nonlinear core correction requires setup-supplied positive pseudo-core tau");
+    }
+
+    rho_pseudo_core_->zero();
+    tau_pseudo_core_->zero();
+    auto const& fft = ctx_.spfft<double>();
+    std::array<int, 3> dims{fft.dim_x(), fft.dim_y(), fft.dim_z()};
+    auto wrap = [](int i, int n) { return (i % n + n) % n; };
+    try {
+        for (int iat = 0; iat < unit_cell_.num_atom_types(); iat++) {
+            auto const& type = unit_cell_.atom_type(iat);
+            if (!type.has_ps_core_kinetic_density()) {
+                continue;
+            }
+            std::vector<double> grid(type.num_mt_points());
+            for (int ir = 0; ir < type.num_mt_points(); ir++) {
+                grid[ir] = type.radial_grid(ir);
+            }
+            auto core_rho = type.ps_core_charge_density();
+            core_rho.resize(grid.size(), 0);
+            std::unique_ptr<gsl_spline, decltype(&gsl_spline_free)> rho(
+                    gsl_spline_alloc(gsl_interp_steffen, grid.size()), gsl_spline_free);
+            std::unique_ptr<gsl_spline, decltype(&gsl_spline_free)> tau(
+                    gsl_spline_alloc(gsl_interp_steffen, grid.size()), gsl_spline_free);
+            std::unique_ptr<gsl_interp_accel, decltype(&gsl_interp_accel_free)> accel(gsl_interp_accel_alloc(),
+                                                                                      gsl_interp_accel_free);
+            if (!rho || !tau || !accel) {
+                RTE_THROW("failed to allocate pseudo-core interpolation");
+            }
+            gsl_spline_init(rho.get(), grid.data(), core_rho.data(), grid.size());
+            gsl_spline_init(tau.get(), grid.data(), type.ps_core_kinetic_density().data(), grid.size());
+            // Sample the fixed radial fields directly. Fourier truncation of a positive
+            // core can produce negative tails; monotone interpolation avoids this without clipping.
+            for (int i = 0; i < type.num_atoms(); i++) {
+                auto position = unit_cell_.atom(type.atom_id(i)).position();
+                std::array<int, 3> first, last;
+                for (int j = 0; j < 3; j++) {
+                    position[j] -= std::floor(position[j]);
+                    double length2{0};
+                    for (int k = 0; k < 3; k++) {
+                        length2 += std::pow(unit_cell_.inverse_lattice_vectors()(j, k), 2);
+                    }
+                    double extent = grid.back() * std::sqrt(length2);
+                    first[j]      = static_cast<int>(std::floor(dims[j] * (position[j] - extent)));
+                    last[j]       = static_cast<int>(std::ceil(dims[j] * (position[j] + extent)));
+                }
+                // Unwrapped grid indices enumerate every periodic image, including overlapping cores.
+                for (int z = first[2]; z <= last[2]; z++) {
+                    int iz = wrap(z, dims[2]) - fft.local_z_offset();
+                    if (iz < 0 || iz >= fft.local_z_length()) {
+                        continue;
+                    }
+                    for (int y = first[1]; y <= last[1]; y++) {
+                        for (int x = first[0]; x <= last[0]; x++) {
+                            r3::vector<double> dr(double(x) / dims[0] - position[0], double(y) / dims[1] - position[1],
+                                                  double(z) / dims[2] - position[2]);
+                            double r = unit_cell_.get_cartesian_coordinates(dr).length();
+                            if (r > grid.back()) {
+                                continue;
+                            }
+                            int ir = ctx_.fft_grid().index_by_coord(wrap(x, dims[0]), wrap(y, dims[1]), iz);
+                            // The tabulated origin value also defines the unresolved interval below r_min.
+                            r = std::max(r, grid.front());
+                            // Preserve tabulated endpoints exactly, including a zero at the outer boundary.
+                            auto sample = [&](gsl_spline const* spline) {
+                                if (r == grid.front()) {
+                                    return spline->y[0];
+                                }
+                                if (r == grid.back()) {
+                                    return spline->y[grid.size() - 1];
+                                }
+                                return gsl_spline_eval(spline, r, accel.get());
+                            };
+                            rho_pseudo_core_->value(ir) += sample(rho.get());
+                            tau_pseudo_core_->value(ir) += sample(tau.get());
+                        }
+                    }
+                }
+            }
+        }
+    } catch (std::exception const&) {
+        invalid = 1;
+    }
+    ctx_.comm().allreduce<int, mpi::op_t::max>(&invalid, 1);
+    if (invalid) {
+        RTE_THROW("failed to sample pseudo-core density and kinetic density");
+    }
+    rho_pseudo_core_->fft_transform(-1);
+    tau_pseudo_core_->fft_transform(-1);
+}
+
 namespace {
 
 template <typename T>
