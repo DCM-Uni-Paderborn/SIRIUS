@@ -2208,8 +2208,8 @@ sirius_add_atom_type_radial_function(void* const* handler__, char const* atom_ty
                     }
                     type.paw_ae_core_kinetic_density(std::vector<double>(rf__, rf__ + *num_points__));
                 } else if (label == "ps_core_tau") {
-                    if (*num_points__ <= 0) {
-                        RTE_THROW("pseudo-core kinetic density must have a nonempty radial grid");
+                    if (sim_ctx.initialized() || !rf__ || !num_points__ || *num_points__ <= 0) {
+                        RTE_THROW("supply pseudo-core kinetic density before initialization on a nonempty grid");
                     }
                     type.ps_core_kinetic_density(std::vector<double>(rf__, rf__ + *num_points__));
                 } else if (label == "ae_rho") {
