@@ -145,6 +145,23 @@ class XC_point_symmetry
         auto Ainv       = r3::inverse(ctx.unit_cell().lattice_vectors());
         auto const& sym = ctx.unit_cell().symmetry();
         for (int g = 0; g < sym.size(); g++) {
+            bool identity{true};
+            for (int x = 0; x < 3; x++) {
+                identity &= std::abs(sym[g].spg_op.t[x] - std::round(sym[g].spg_op.t[x])) < 1e-12;
+                for (int y = 0; y < 3; y++) {
+                    identity &= sym[g].spg_op.R(x, y) == (x == y ? 1 : 0);
+                }
+            }
+            if (identity) {
+                // Identity preserves point ownership even when distributed blocks share a centre.
+                std::vector<int> indices(nr_);
+                for (int p = 0; p < nr_; p++) {
+                    indices[p] = offsets_[ctx.comm().rank()] + p;
+                }
+                forward_.push_back(indices);
+                inverse_.push_back(std::move(indices));
+                continue;
+            }
             std::vector<int> permutation(total_, -1), transpose(total_, -1);
             for (auto const& source : blocks) {
                 auto target_centre = r3::dot(sym[g].spg_op.R, r3::dot(Ainv, source.centre)) + sym[g].spg_op.t;
