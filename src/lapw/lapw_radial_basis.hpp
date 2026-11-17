@@ -290,6 +290,15 @@ class lapw_radial_basis_t
     void
     generate_radial_integrals(relativity_t rel__);
 
+    /// Physical spherical {H, O} in the full-j radial basis, diagonal in kappa and m_j.
+    /** Uses both Dirac components and the rest-energy-subtracted Hamiltonian in Hartree.
+     *  The kinetic bilinear is Hermitian; sphere boundary fluxes cancel only after matching
+     *  to an interstitial operator with the same convention. No Y00 factor is included.
+     *  A response returns dH/dO, including an optional direction of the physical potential. */
+    std::array<mdarray<double, 2>, 2>
+    dirac_spherical_matrices(radial_basis_response_t const* response__ = nullptr,
+                             std::vector<double> const& direction__    = {}) const;
+
     /// Get m-th order radial derivative of AW functions at the MT surface.
     inline double
     aw_surface_deriv(int l__, int order__, int dm__) const

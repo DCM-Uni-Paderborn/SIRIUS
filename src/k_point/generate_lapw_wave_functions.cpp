@@ -13,6 +13,7 @@
 
 #include "k_point.hpp"
 #include "lapw/generate_alm_block.hpp"
+#include "lapw/dirac_basis.hpp"
 
 namespace sirius {
 
@@ -25,6 +26,9 @@ K_point<T>::generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf
 
     if (!ctx_.full_potential()) {
         return;
+    }
+    if (ctx_.valence_relativity() == relativity_t::dirac) {
+        RTE_THROW("scalar LAPW matching cannot reconstruct a Dirac spinor");
     }
 
     auto const& blacs_grid = ctx_.blacs_grid_band();
@@ -113,6 +117,65 @@ K_point<T>::generate_lapw_wave_functions(wf::Wave_functions<T> const& evec__, wf
         print_checksum("wf_mt", z2, RTE_OUT(this->out(0)));
     }
 }
+
+template <typename T>
+void
+K_point<T>::generate_dirac_wave_functions(mdarray<std::complex<double>, 2> const& evec__,
+                                          LAPW_radial_basis const& lapw_basis__, wf::Wave_functions<T>* target__)
+{
+    if constexpr (!std::is_same_v<T, double>) {
+        RTE_THROW("Dirac LAPW wave functions require fp64");
+    } else {
+        int ng = num_gkvec(), n = 2 * ng + unit_cell_.mt_lo_basis_size(), nb = ctx_.num_bands();
+        auto& psi   = target__ ? *target__ : spinor_wave_functions();
+        int invalid = !ctx_.full_potential() || ctx_.valence_relativity() != relativity_t::dirac ||
+                      evec__.size(0) != static_cast<size_t>(n) || evec__.size(1) != static_cast<size_t>(nb) ||
+                      !evec__.on_host() || &psi.gkvec() != &gkvec() || psi.num_sc() != 2 || psi.num_wf().get() < nb ||
+                      psi.num_mt_coeffs() != spinor_wave_functions().num_mt_coeffs();
+        if (!invalid) {
+            for (size_t i = 0; i < evec__.size(); i++) {
+                invalid |= !std::isfinite(evec__[i].real()) || !std::isfinite(evec__[i].imag());
+            }
+        }
+        comm().template allreduce<int, mpi::op_t::max>(&invalid, 1);
+        if (invalid) {
+            RTE_THROW("Dirac wave-function reconstruction requires finite positive-PW/full-j eigenvectors");
+        }
+        Dirac_lapw_basis basis(unit_cell_, gkvec(), lapw_basis__);
+        for (int s : {0, 1}) {
+            for (int b = 0; b < nb; b++) {
+                for (int ig = 0; ig < gkvec().count(); ig++) {
+                    psi.pw_coeffs(ig, wf::spin_index(s), wf::band_index(b)) = evec__(s * ng + gkvec().offset() + ig, b);
+                }
+            }
+        }
+        auto const& one  = la::constant<std::complex<double>>::one();
+        auto const& zero = la::constant<std::complex<double>>::zero();
+        for (auto atom : psi.spl_num_atoms()) {
+            auto const& a = basis.atom_coefficients(atom.i);
+            int nm        = unit_cell_.atom(atom.i).mt_basis_size();
+            mdarray<std::complex<double>, 2> local({nm, nb});
+            la::wrap(la::lib_t::blas)
+                    .gemm('N', 'N', nm, nb, n, &one, a.at(memory_t::host), a.ld(), evec__.at(memory_t::host),
+                          evec__.ld(), &zero, local.at(memory_t::host), local.ld());
+            for (int b = 0; b < nb; b++) {
+                for (int xi = 0; xi < nm; xi++) {
+                    psi.mt_coeffs(xi, atom.li, wf::spin_index(0), wf::band_index(b)) = local(xi, b);
+                    psi.mt_coeffs(xi, atom.li, wf::spin_index(1), wf::band_index(b)) = 0;
+                }
+            }
+        }
+    }
+}
+
+template void
+K_point<double>::generate_dirac_wave_functions(mdarray<std::complex<double>, 2> const&, LAPW_radial_basis const&,
+                                               wf::Wave_functions<double>*);
+#if defined(SIRIUS_USE_FP32)
+template void
+K_point<float>::generate_dirac_wave_functions(mdarray<std::complex<double>, 2> const&, LAPW_radial_basis const&,
+                                              wf::Wave_functions<float>*);
+#endif
 
 template void
 K_point<double>::generate_lapw_wave_functions(wf::Wave_functions<double> const& evec__,

@@ -3745,11 +3745,12 @@ sirius_set_xc_point_callback:
     Ultrasoft setups additionally supply independent r^2 T_ij^L tables.
     PW, PAW and ultrasoft are supported on CPU. PAW and nonlinear core corrections
     require explicitly supplied positive core tau. FP-LAPW fields are supported on
-    CPU with scalar-relativistic radial functions.
+    CPU with scalar-relativistic or native Dirac radial functions.
     PW, PAW and ultrasoft forces and stress require the point geometry callbacks.
     FP-LAPW supports energy and orbital derivatives, but not forces or stress.
-    Noncollinear states use NR/ZORA second variation with SOC.
-    Explicit cores support NR, ZORA and Dirac relativity.
+    Noncollinear states use NR/ZORA second variation with SOC or native Dirac full
+    variation. Explicit cores support NR, ZORA and Dirac relativity with scalar
+    valence radial functions. Native Dirac valence requires Dirac cores.
   arguments:
     handler:
       type: ctx_handler
@@ -3809,7 +3810,8 @@ sirius_set_xc_spinor_mode:
     initializing the context. Their ns argument becomes four; array storage
     remains (nr,ns) and (nr,3,ns). The energy and any geometry callback must use
     the same convention. No local spin-axis rotation is applied.
-    FP-LAPW spinors use NR/ZORA second variation including SOC.
+    FP-LAPW spinors use NR/ZORA second variation including SOC or native Dirac
+    full variation without a separate SOC correction.
     Scalar and collinear registrations retain their total and up/down fields
     when this mode is disabled.
     Registering a new energy callback resets the mode to disabled.

@@ -233,11 +233,13 @@ Density::Density(Simulation_context& ctx__, bool kinetic_density__)
     }
     if (external_xc_registered_ || kinetic_density__ || ctx_.meta_gga()) {
         bool spinor = ctx_.num_mag_dims() == 3;
-        if ((spinor &&
-             (ctx_.meta_gga() || (!ctx_.full_potential() && unit_cell_.augment() && !external_xc_registered_))) ||
-            (ctx_.so_correction() && !spinor) ||
-            (ctx_.full_potential() && ctx_.valence_relativity() != relativity_t::none &&
-             ((spinor && ctx_.valence_relativity() != relativity_t::zora) || !external_xc_registered_))) {
+        bool dirac  = ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac;
+        if ((dirac && ctx_.meta_gga()) ||
+            (!dirac && ((spinor && (ctx_.meta_gga() ||
+                                    (!ctx_.full_potential() && unit_cell_.augment() && !external_xc_registered_))) ||
+                        (ctx_.so_correction() && !spinor) ||
+                        (ctx_.full_potential() && ctx_.valence_relativity() != relativity_t::none &&
+                         ((spinor && ctx_.valence_relativity() != relativity_t::zora) || !external_xc_registered_))))) {
             RTE_THROW("kinetic-density storage requires scalar/collinear orbitals or reconstructed spinor fields; "
                       "relativistic LAPW requires external XC and NR/ZORA radial functions for spinors");
         }
@@ -1267,19 +1269,21 @@ Density::generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> la
     generate_valence<T>(ks__, lapw_basis_.get());
 
     if (kinetic_density_) {
-        auto tau = generate_smooth_kinetic_density<T>(ks__);
-        for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
-            if (ctx_.num_mag_dims() == 3) {
-                for (int j = 0; j < 4; j++) {
-                    kinetic_density_->component(j).rg().f_pw_local(ig) = tau[j].f_pw_local(ig);
+        if (ctx_.valence_relativity() != relativity_t::dirac) {
+            auto tau = generate_smooth_kinetic_density<T>(ks__);
+            for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
+                if (ctx_.num_mag_dims() == 3) {
+                    for (int j = 0; j < 4; j++) {
+                        kinetic_density_->component(j).rg().f_pw_local(ig) = tau[j].f_pw_local(ig);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            auto up = tau[0].f_pw_local(ig);
-            auto dn = ctx_.num_spins() == 2 ? tau[1].f_pw_local(ig) : std::complex<double>(0);
-            kinetic_density_->scalar().rg().f_pw_local(ig) = up + dn;
-            if (ctx_.num_spins() == 2) {
-                kinetic_density_->vector(0).rg().f_pw_local(ig) = up - dn;
+                auto up = tau[0].f_pw_local(ig);
+                auto dn = ctx_.num_spins() == 2 ? tau[1].f_pw_local(ig) : std::complex<double>(0);
+                kinetic_density_->scalar().rg().f_pw_local(ig) = up + dn;
+                if (ctx_.num_spins() == 2) {
+                    kinetic_density_->vector(0).rg().f_pw_local(ig) = up - dn;
+                }
             }
         }
         if (ctx_.full_potential()) {
@@ -1565,6 +1569,14 @@ Density::generate_valence(K_point_set const& ks__, LAPW_radial_basis const* lapw
     zero();
     for (int i = 0; i < ctx_.num_mag_dims() + 1; i++) {
         rho_mag_coarse_[i]->zero();
+    }
+
+    if (ctx_.full_potential() && ctx_.valence_relativity() == relativity_t::dirac) {
+        if constexpr (!std::is_same_v<T, double>) {
+            RTE_THROW("Dirac density generation requires fp64 wave functions");
+        }
+        generate_dirac_valence(ks__);
+        return;
     }
 
     auto mem = ctx_.processing_unit() == device_t::CPU ? memory_t::host : memory_t::device;
@@ -1878,6 +1890,18 @@ void
 Density::generate_valence_mt(LAPW_radial_basis const& lapw_basis__)
 {
     PROFILE("sirius::Density::generate_valence_mt");
+
+    if (ctx_.valence_relativity() == relativity_t::dirac) {
+        for (auto atom : unit_cell_.spl_num_atoms()) {
+            auto fields = LAPW_xc_atom(unit_cell_.atom(atom.i), lapw_basis__.radial_basis(atom.i), ctx_.lmax_rho())
+                                  .fields(density_matrix(atom.i));
+            for (int s = 0; s <= ctx_.num_mag_dims(); s++) {
+                auto& out = component(s).mt()[atom.i];
+                std::copy_n(fields[0][s].at(memory_t::host), out.size(), out.at(memory_t::host));
+            }
+        }
+        return;
+    }
 
     /* compute occupation matrix */
     if (ctx_.hubbard_correction()) {
