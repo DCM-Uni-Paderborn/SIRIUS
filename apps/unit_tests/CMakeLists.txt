@@ -164,3 +164,11 @@ file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/unit_tests.x" DESTINATION "${CMAKE_CURREN
 install(FILES "unit_tests.x" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
 
 add_subdirectory(multi_cg)
+
+# Reserve CPU threads for the full core response fixtures without changing their accuracy checks.
+set_tests_properties(test_lapw_external_xc_dirac test_lapw_external_xc_core PROPERTIES
+  PROCESSORS 4 ENVIRONMENT "OMP_NUM_THREADS=4;OPENBLAS_NUM_THREADS=1")
+if(MPIEXEC_EXECUTABLE)
+  set_tests_properties(test_lapw_external_xc_core_cell_mpi test_lapw_external_xc_core_mpi PROPERTIES
+    PROCESSORS 8 ENVIRONMENT "OMP_NUM_THREADS=4;OPENBLAS_NUM_THREADS=1")
+endif()
