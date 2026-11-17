@@ -38,11 +38,36 @@ struct radial_solver_result_t
     std::vector<double> rdudr;
     /// Stores surface 0-, 1- and 2-order derivatives u(R), u'(R) and u"(R)
     std::array<double, 3> uderiv;
+    /// Lower Dirac component r*v, r*v' and its surface data; empty for scalar solutions.
+    std::vector<double> small_p, small_rdudr;
+    std::array<double, 3> small_uderiv{};
+    int kappa{0};
+};
+
+/// A radial solution and its directional derivative in potential and linearisation energy.
+struct radial_solver_response_t
+{
+    radial_solver_result_t value;
+    std::vector<double> p, rdudr;
+    std::array<double, 3> uderiv;
+    std::vector<double> small_p, small_rdudr;
+    std::array<double, 3> small_uderiv{};
 };
 
 namespace radial_solver_local {
 
 constexpr double alpha = 1.0 / speed_of_light;
+
+/// Regular scalar-relativistic Coulomb solution p(r) ~ r^b at the nucleus.
+inline double
+scalar_relativistic_origin_power(int l__, double zn__)
+{
+    double square = 1 + l__ * (l__ + 1.0) - std::pow(alpha * zn__, 2);
+    if (l__ < 0 || !std::isfinite(zn__) || zn__ < 0 || square <= 0) {
+        RTE_THROW("scalar radial equation: invalid or supercritical Coulomb nucleus");
+    }
+    return zn__ == 0 ? l__ + 1.0 : std::sqrt(square);
+}
 
 template <relativity_t rel>
 inline double
@@ -90,6 +115,20 @@ rel_mass_deriv(double enu__, double v__, double v_deriv__)
         }
     }
 };
+
+template <relativity_t rel>
+inline double
+rel_mass_response(double enu__, double v__, double dv__, double de__)
+{
+    double result = rel_mass_deriv<rel>(enu__, v__, dv__);
+    if constexpr (rel == relativity_t::koelling_harmon) {
+        result += sq_alpha_half * de__;
+    } else if constexpr (rel == relativity_t::iora) {
+        double K = 1 - sq_alpha_half * enu__ / (1 - sq_alpha_half * v__);
+        result += sq_alpha_half * de__ / (K * K);
+    }
+    return result;
+}
 
 } // namespace radial_solver_local
 
@@ -335,12 +374,28 @@ class Radial_solver
     double epsabs_{1e-3};
     double epsrel_{1e-3};
 
+    struct potential_response_t
+    {
+        Spline<double> potential, source, source_p;
+        std::vector<double> p, dpdr, q, dqdr;
+        double energy_direction;
+
+        potential_response_t(Radial_grid<double> const& grid__, std::vector<double> const& direction__, double de__)
+            : potential(grid__, direction__)
+            , source(grid__)
+            , source_p(grid__)
+            , energy_direction(de__)
+        {
+        }
+    };
+
     /// Integrate system of two first-order differential equations forward starting from the origin.
     template <relativity_t rel>
     int
     integrate_forward_gsl(double enu__, int l__, int k__, Spline<double>& chi_p__, Spline<double>& chi_q__,
                           std::vector<double>& p__, std::vector<double>& dpdr__, std::vector<double>& q__,
-                          std::vector<double>& dqdr__, bool bound_state__) const
+                          std::vector<double>& dqdr__, bool bound_state__,
+                          potential_response_t* response__ = nullptr) const
     {
         struct params
         {
@@ -353,6 +408,7 @@ class Radial_solver
             Spline<double> const* ve;
             Spline<double> const* chi_p;
             Spline<double> const* chi_q;
+            potential_response_t const* response;
         };
 
         auto func = [](double x, double const* y, double* f, void* params__) -> int {
@@ -402,6 +458,23 @@ class Radial_solver
                     f[0] = alpha * (p->enu - V + 2 * rest_energy) * y[1] - y[0] * p->kappa / x;
                     f[1] = -alpha * (p->enu - V) * y[0] + y[1] * p->kappa / x;
                     break;
+                }
+            }
+            if (p->response) {
+                if constexpr (rel == relativity_t::none) {
+                    double a = V - p->enu + p->l * (p->l + 1) / (2 * x * x);
+                    f[2]     = 2 * y[3] + y[2] / x;
+                    f[3]     = a * y[2] - y[3] / x + p->response->potential(p->ir, dx) * y[0] +
+                               p->response->source(p->ir, dx);
+                } else {
+                    double ll_half = p->l * (p->l + 1) / 2.0;
+                    double M       = rel_mass<rel>(p->enu, V);
+                    double dV      = p->response->potential(p->ir, dx);
+                    double de      = p->response->energy_direction;
+                    double dM      = rel_mass_response<rel>(p->enu, V, dV, de);
+                    f[2]           = 2 * M * y[3] + y[2] / x + 2 * dM * y[1] + p->response->source_p(p->ir, dx);
+                    f[3]           = (V - p->enu + ll_half / (M * x * x)) * y[2] - y[3] / x +
+                                     (dV - de - ll_half * dM / (M * M * x * x)) * y[0] + p->response->source(p->ir, dx);
                 }
             }
             return GSL_SUCCESS;
@@ -491,18 +564,27 @@ class Radial_solver
 
         p__ = std::vector<double>(radial_grid_.num_points());
         q__ = std::vector<double>(radial_grid_.num_points());
+        if (response__) {
+            if (rel == relativity_t::dirac || bound_state__) {
+                RTE_THROW("radial potential response requires scalar forward integration");
+            }
+            for (auto* v : {&response__->p, &response__->dpdr, &response__->q, &response__->dqdr}) {
+                v->assign(radial_grid_.num_points(), 0);
+            }
+        }
 
         int last_point{radial_grid_.num_points() - 1};
 
         auto integrate_forward = [&](int last_point) -> std::vector<int> {
             params p;
-            p.enu   = enu__;
-            p.l     = l__;
-            p.kappa = 0;
-            p.zn    = zn_;
-            p.ve    = &ve_;
-            p.chi_p = &chi_p__;
-            p.chi_q = &chi_q__;
+            p.enu      = enu__;
+            p.l        = l__;
+            p.kappa    = 0;
+            p.zn       = zn_;
+            p.ve       = &ve_;
+            p.chi_p    = &chi_p__;
+            p.chi_q    = &chi_q__;
+            p.response = response__;
             if (rel == relativity_t::dirac) {
                 if (k__ == l__) {
                     p.kappa = k__;
@@ -517,25 +599,50 @@ class Radial_solver
 
             /* initial conditions */
             double x = radial_grid_[0];
-            double y[2];
+            double y[4]{};
             switch (rel) {
                 case relativity_t::none: {
                     if (l__ == 0) {
                         y[0] = 2 * x * zn_;
                         y[1] = -std::pow(zn_, 2) * x;
                     } else {
-                        y[0] = std::pow(x, l__ + 1) / (2 * l__ + 1);
-                        y[1] = std::pow(x, l__) / 4;
+                        // Regular Coulomb solution p ~ r^(l+1)(1-Zr/(l+1)), q=(p'-p/r)/2.
+                        double a = 1.0 / (2 * l__ + 1);
+                        y[0]     = a * std::pow(x, l__ + 1) * (1 - zn_ * x / (l__ + 1));
+                        y[1]     = 0.5 * a * std::pow(x, l__) * (l__ - zn_ * x);
                     }
                     break;
                 }
                 case relativity_t::koelling_harmon:
                 case relativity_t::zora:
                 case relativity_t::iora: {
-                    double a = l__ * (l__ + 1) + 1 - std::pow(radial_solver_local::alpha * zn_, 2);
-                    double b = 0.5 * (1 + std::sqrt(1 + 4 * a));
-                    y[0]     = std::pow(x, b);
-                    y[1]     = (x * b * std::pow(x, b - 1) - y[0]) / zn_ / std::pow(radial_solver_local::alpha, 2);
+                    double b     = radial_solver_local::scalar_relativistic_origin_power(l__, zn_);
+                    double power = std::pow(x, b), v0 = ve_(0);
+                    double dv = response__ ? response__->potential(0) : 0;
+                    double de = response__ ? response__->energy_direction : 0;
+                    if (zn_) {
+                        // The first Frobenius coefficient resolves tau at the first radial point.
+                        // IORA and Koelling-Harmon have the same finite term in their Coulomb mass.
+                        double a   = zn_ * std::pow(radial_solver_local::alpha, 2);
+                        double m0  = rel == relativity_t::zora
+                                             ? radial_solver_local::rel_mass<relativity_t::zora>(enu__, v0)
+                                             : radial_solver_local::rel_mass<relativity_t::koelling_harmon>(enu__, v0);
+                        double dm0 = sq_alpha_half * (rel == relativity_t::zora ? -dv : de - dv);
+                        double q0  = (b - 1) / a;
+                        double p1  = (2 * m0 * (q0 - zn_) + a * (v0 - enu__)) / (2 * b + 1);
+                        double q1  = (b * p1 - 2 * m0 * q0) / a;
+                        y[0]       = power * (1 + x * p1);
+                        y[1]       = power * (q0 + x * q1);
+                        double dp1 = (2 * dm0 * (q0 - zn_) + a * (dv - de)) / (2 * b + 1);
+                        y[2]       = power * x * dp1;
+                        y[3]       = power * x * (b * dp1 - 2 * dm0 * q0) / a;
+                    } else {
+                        double m0  = radial_solver_local::rel_mass<rel>(enu__, v0);
+                        double dm0 = radial_solver_local::rel_mass_response<rel>(enu__, v0, dv, de);
+                        y[0]       = power;
+                        y[1]       = l__ * std::pow(x, l__) / (2 * m0);
+                        y[3]       = -y[1] * dm0 / m0;
+                    }
                     break;
                 }
                 case relativity_t::dirac: {
@@ -549,12 +656,13 @@ class Radial_solver
             p__[0] = y[0];
             q__[0] = y[1];
 
-            gsl_odeiv2_system sys = {func, jac, 2, &p};
+            size_t dimension      = response__ ? 4 : 2;
+            gsl_odeiv2_system sys = {func, response__ ? nullptr : +jac, dimension, &p};
 
             const gsl_odeiv2_step_type* T = gsl_odeiv2_step_rk8pd;
-            gsl_odeiv2_step* s            = gsl_odeiv2_step_alloc(T, 2);
+            gsl_odeiv2_step* s            = gsl_odeiv2_step_alloc(T, dimension);
             gsl_odeiv2_control* c         = gsl_odeiv2_control_y_new(epsabs_, epsrel_);
-            gsl_odeiv2_evolve* e          = gsl_odeiv2_evolve_alloc(2);
+            gsl_odeiv2_evolve* e          = gsl_odeiv2_evolve_alloc(dimension);
 
             std::vector<int> ridx;
 
@@ -586,6 +694,10 @@ class Radial_solver
 
                 p__[p.ir + 1] = y[0];
                 q__[p.ir + 1] = y[1];
+                if (response__) {
+                    response__->p[p.ir + 1] = y[2];
+                    response__->q[p.ir + 1] = y[3];
+                }
 
                 double const max_val{1e6};
 
@@ -594,12 +706,25 @@ class Radial_solver
                     for (int j = 0; j <= p.ir + 1; j++) {
                         p__[j] /= max_val;
                         q__[j] /= max_val;
+                        if (response__) {
+                            response__->p[j] /= max_val;
+                            response__->q[j] /= max_val;
+                        }
                     }
                     y[0] /= max_val;
                     y[1] /= max_val;
 
                     chi_p__.scale(1.0 / max_val);
                     chi_q__.scale(1.0 / max_val);
+                    if (response__) {
+                        y[2] /= max_val;
+                        y[3] /= max_val;
+                        response__->source.scale(1.0 / max_val);
+                        response__->source_p.scale(1.0 / max_val);
+                    }
+                    // Cached ODE derivatives refer to the pre-rescaling state.
+                    gsl_odeiv2_evolve_reset(e);
+                    gsl_odeiv2_step_reset(s);
                 }
             }
             gsl_odeiv2_evolve_free(e);
@@ -661,8 +786,29 @@ class Radial_solver
                     break;
                 }
                 case relativity_t::dirac: {
-                    /* Dirac equation is only solved for core states and p' and q' are not needed */
+                    int kappa = k__ == l__ ? k__ : -k__;
+                    double ec = (enu__ - V) / speed_of_light;
+                    dpdr__[i] = (ec + 2 * speed_of_light) * q__[i] - kappa * p__[i] * radial_grid_.x_inv(i);
+                    dqdr__[i] = -ec * p__[i] + kappa * q__[i] * radial_grid_.x_inv(i);
                     break;
+                }
+            }
+            if (response__) {
+                if constexpr (rel == relativity_t::none) {
+                    response__->dpdr[i] = 2 * response__->q[i] + response__->p[i] * radial_grid_.x_inv(i);
+                    response__->dqdr[i] = (V - enu__ + ll_half / std::pow(radial_grid_[i], 2)) * response__->p[i] -
+                                          response__->q[i] * radial_grid_.x_inv(i) + response__->potential(i) * p__[i] +
+                                          response__->source(i);
+                } else {
+                    double dV           = response__->potential(i);
+                    double de           = response__->energy_direction;
+                    double dM           = radial_solver_local::rel_mass_response<rel>(enu__, V, dV, de);
+                    double angular      = ll_half / (M * radial_grid_[i] * radial_grid_[i]);
+                    response__->dpdr[i] = 2 * M * response__->q[i] + response__->p[i] * radial_grid_.x_inv(i) +
+                                          2 * dM * q__[i] + response__->source_p(i);
+                    response__->dqdr[i] = (V - enu__ + angular) * response__->p[i] -
+                                          response__->q[i] * radial_grid_.x_inv(i) +
+                                          (dV - de - angular * dM / M) * p__[i] + response__->source(i);
                 }
             }
         }
@@ -673,7 +819,20 @@ class Radial_solver
             s(i) = std::pow(p__[i], 2);
         }
         auto norm = 1.0 / std::sqrt(s.interpolate().integrate(0));
+        double norm_response{0};
+        if (response__) {
+            for (int i = 0; i < radial_grid_.num_points(); i++) {
+                s(i) = p__[i] * response__->p[i];
+            }
+            norm_response = norm * norm * s.interpolate().integrate(0);
+        }
         for (int i = 0; i < radial_grid_.num_points(); i++) {
+            if (response__) {
+                response__->p[i]    = norm * (response__->p[i] - norm_response * p__[i]);
+                response__->q[i]    = norm * (response__->q[i] - norm_response * q__[i]);
+                response__->dpdr[i] = norm * (response__->dpdr[i] - norm_response * dpdr__[i]);
+                response__->dqdr[i] = norm * (response__->dqdr[i] - norm_response * dqdr__[i]);
+            }
             p__[i] *= norm;
             q__[i] *= norm;
             dpdr__[i] *= norm;
@@ -698,6 +857,11 @@ class Radial_solver
         }
         ve_.interpolate();
     }
+
+  private:
+    radial_solver_response_t
+    solve_dirac_impl(int dme__, int kappa__, double enu__, std::vector<double> const* direction__,
+                     double energy_direction__) const;
 
     /// Integrates the radial equation for a given energy and finds the m-th energy derivative of the radial solution.
     /** \param [in] rel Type of relativity
@@ -725,13 +889,14 @@ class Radial_solver
      *  \f]
      */
     auto
-    solve(relativity_t rel__, int dme__, int l__, double enu__) const
+    solve_impl(relativity_t rel__, int dme__, int l__, double enu__, potential_response_t* response__ = nullptr) const
     {
         int nr = num_points();
         std::vector<std::vector<double>> p;
         std::vector<std::vector<double>> q;
         std::vector<std::vector<double>> dpdr;
         std::vector<std::vector<double>> dqdr;
+        std::vector<std::vector<double>> response_p, response_q;
 
         Spline<double> chi_p(radial_grid_);
         Spline<double> chi_q(radial_grid_);
@@ -831,38 +996,90 @@ class Radial_solver
                 }
                 chi_p.interpolate();
                 chi_q.interpolate();
+                if (response__) {
+                    // Differentiate the energy-derivative sources, including their relativistic masses.
+                    for (int i = 0; i < nr; i++) {
+                        double V                = ve_(i) - zn_ * radial_grid_.x_inv(i);
+                        double dV               = response__->potential(i);
+                        response__->source_p(i) = 0;
+                        response__->source(i)   = -j * response_p[j - 1][i];
+                        if (rel__ == relativity_t::koelling_harmon) {
+                            double M  = rel_mass<relativity_t::koelling_harmon>(enu__, V);
+                            double dM = rel_mass_response<relativity_t::koelling_harmon>(enu__, V, dV,
+                                                                                         response__->energy_direction);
+                            double c  = sq_alpha_half * l__ * (l__ + 1) / (2 * std::pow(radial_grid_[i] * M, 2));
+                            double dc = -2 * c * dM / M;
+                            response__->source_p(i) = 2 * j * sq_alpha_half * response_q[j - 1][i];
+                            response__->source(i)   = -j * ((1 + c) * response_p[j - 1][i] + dc * p[j - 1][i]);
+                            double coefficient      = j;
+                            for (int k = 2; k <= j; k++) {
+                                coefficient *= -(j - k + 1) * sq_alpha_half / M;
+                                response__->source(i) -=
+                                        coefficient * (c * response_p[j - k][i] - (k + 1) * c * dM / M * p[j - k][i]);
+                            }
+                        } else if (rel__ == relativity_t::iora) {
+                            double M0  = rel_mass<relativity_t::zora>(enu__, V);
+                            double dM0 = rel_mass_deriv<relativity_t::zora>(enu__, V, dV);
+                            double U   = 1 - sq_alpha_half * enu__ / M0;
+                            double dU  = sq_alpha_half * (enu__ * dM0 / (M0 * M0) - response__->energy_direction / M0);
+                            double c   = sq_alpha_half * l__ * (l__ + 1) / (2 * std::pow(radial_grid_[i] * M0, 2));
+                            response__->source(i) =
+                                    -j * ((1 + c) * response_p[j - 1][i] - 2 * c * dM0 / M0 * p[j - 1][i]);
+                            double coefficient = 2;
+                            for (int k = 1; k <= j; k++) {
+                                coefficient *= (j - k + 1) * sq_alpha_half;
+                                double factor = coefficient / (std::pow(M0, k - 1) * std::pow(U, k + 1));
+                                response__->source_p(i) +=
+                                        factor *
+                                        (response_q[j - k][i] - q[j - k][i] * ((k - 1) * dM0 / M0 + (k + 1) * dU / U));
+                            }
+                        }
+                    }
+                    response__->source.interpolate();
+                    response__->source_p.interpolate();
+                }
             }
 
             switch (rel__) {
                 case relativity_t::none: {
                     nn = integrate_forward_gsl<relativity_t::none>(enu__, l__, 0, chi_p, chi_q, p[j], dpdr[j], q[j],
-                                                                   dqdr[j], false);
+                                                                   dqdr[j], false, response__);
                     break;
                 }
                 case relativity_t::koelling_harmon: {
-                    nn = integrate_forward_gsl<relativity_t::koelling_harmon>(enu__, l__, 0, chi_p, chi_q, p[j],
-                                                                              dpdr[j], q[j], dqdr[j], false);
+                    nn = integrate_forward_gsl<relativity_t::koelling_harmon>(
+                            enu__, l__, 0, chi_p, chi_q, p[j], dpdr[j], q[j], dqdr[j], false, response__);
                     break;
                 }
                 case relativity_t::zora: {
                     nn = integrate_forward_gsl<relativity_t::zora>(enu__, l__, 0, chi_p, chi_q, p[j], dpdr[j], q[j],
-                                                                   dqdr[j], false);
+                                                                   dqdr[j], false, response__);
                     break;
                 }
                 case relativity_t::iora: {
                     nn = integrate_forward_gsl<relativity_t::iora>(enu__, l__, 0, chi_p, chi_q, p[j], dpdr[j], q[j],
-                                                                   dqdr[j], false);
+                                                                   dqdr[j], false, response__);
                     break;
                 }
                 default: {
                     RTE_THROW("unsupported relativity type");
                 }
             }
+            if (response__) {
+                response_p.push_back(response__->p);
+                response_q.push_back(response__->q);
+            }
         }
-        /* save the results */
+        return make_result(nn, p.back(), dpdr.back());
+    }
+
+    radial_solver_result_t
+    make_result(int nodes__, std::vector<double> const& p__, std::vector<double> const& dpdr__) const
+    {
+        int nr = num_points();
         std::vector<double> rdudr(nr);
         for (int i = 0; i < nr; i++) {
-            rdudr[i] = dpdr.back()[i] - p.back()[i] * radial_grid_.x_inv(i);
+            rdudr[i] = dpdr__[i] - p__[i] * radial_grid_.x_inv(i);
         }
 
         double R = radial_grid_.last();
@@ -870,14 +1087,66 @@ class Radial_solver
         /* 1st radial derivative of u(r) */
         std::array<double, 3> uderiv;
         /* p(r) = u(r)*r -> u(r) = p(r) / r */
-        uderiv[0] = p.back().back() / R;
-        uderiv[1] = (dpdr.back().back() - p.back().back() / R) / R;
+        uderiv[0] = p__.back() / R;
+        uderiv[1] = (dpdr__.back() - p__.back() / R) / R;
         /* 2nd radial derivative of u(r) */
-        Spline<double> sdpdr(radial_grid_, dpdr.back());
+        Spline<double> sdpdr(radial_grid_, dpdr__);
         sdpdr.interpolate();
-        uderiv[2] = (sdpdr.deriv(1, nr - 1) - 2 * dpdr.back().back() / R + 2 * p.back().back() / std::pow(R, 2)) / R;
+        uderiv[2] = (sdpdr.deriv(1, nr - 1) - 2 * dpdr__.back() / R + 2 * p__.back() / std::pow(R, 2)) / R;
 
-        return radial_solver_result_t{nn, p.back(), rdudr, uderiv};
+        return radial_solver_result_t{nodes__, p__, rdudr, uderiv};
+    }
+
+  public:
+    /// Energy derivative of a regular Dirac spinor, normalized jointly before differentiation.
+    radial_solver_result_t
+    solve_dirac(int dme__, int kappa__, double enu__) const
+    {
+        return solve_dirac_impl(dme__, kappa__, enu__, nullptr, 0).value;
+    }
+
+    /// Directional derivative in the local potential and the Dirac linearisation energy.
+    radial_solver_response_t
+    solve_dirac_potential_response(int dme__, int kappa__, double enu__, std::vector<double> const& direction__,
+                                   double energy_direction__ = 0) const
+    {
+        return solve_dirac_impl(dme__, kappa__, enu__, &direction__, energy_direction__);
+    }
+
+    /// Normalized radial solution and its requested energy derivative.
+    auto
+    solve(relativity_t rel__, int dme__, int l__, double enu__) const
+    {
+        return solve_impl(rel__, dme__, l__, enu__);
+    }
+
+    /// Differentiate a scalar solution, including its normalization and energy-derivative sources.
+    auto
+    solve_potential_response(int dme__, int l__, double enu__, std::vector<double> const& direction__,
+                             relativity_t rel__ = relativity_t::none, double energy_direction__ = 0) const
+    {
+        if (dme__ < 0 || l__ < 0 || !std::isfinite(enu__) || !std::isfinite(energy_direction__) ||
+            direction__.size() != static_cast<size_t>(num_points()) ||
+            std::any_of(direction__.begin(), direction__.end(), [](double x) { return !std::isfinite(x); })) {
+            RTE_THROW("invalid radial potential response direction or quantum numbers");
+        }
+        if (rel__ != relativity_t::none && rel__ != relativity_t::koelling_harmon && rel__ != relativity_t::zora &&
+            rel__ != relativity_t::iora) {
+            RTE_THROW("radial potential response requires a supported scalar relativity type");
+        }
+        auto direction = direction__;
+        if (rel__ == relativity_t::none) {
+            // Preserve the original V-E response and its evaluation order in the nonrelativistic case.
+            for (auto& v : direction) {
+                v -= energy_direction__;
+            }
+            energy_direction__ = 0;
+        }
+        potential_response_t response(radial_grid_, direction, energy_direction__);
+        auto value   = solve_impl(rel__, dme__, l__, enu__, &response);
+        auto tangent = make_result(0, response.p, response.dpdr);
+        return radial_solver_response_t{std::move(value), std::move(tangent.p), std::move(tangent.rdudr),
+                                        tangent.uderiv};
     }
 
     inline double
@@ -985,6 +1254,8 @@ class Bound_state : public Radial_solver
     Spline<double> rdudr_;
 
     Spline<double> rho_;
+
+    Spline<double> tau_;
 
     std::vector<double> dpdr_;
 
@@ -1112,10 +1383,19 @@ class Bound_state : public Radial_solver
 
         for (int i = 0; i < np - 1; i++) {
             rho_(i) += std::pow(u_(i), 2);
+            double rinv = radial_grid_.x_inv(i);
+            double du   = rdudr_(i) * rinv;
+            tau_(i)     = 0.5 * (du * du + l_ * (l_ + 1) * std::pow(u_(i) * rinv, 2));
             if (rel__ == relativity_t::dirac) {
-                rho_(i) += std::pow(q_(i) * radial_grid_.x_inv(i), 2);
+                double small = q_(i) * rinv;
+                double ds    = (norm * dqdr[i] - small) * rinv;
+                // The lower spinor component has orbital angular momentum 2j-l.
+                int small_l = 2 * k_ - l_ - 1;
+                rho_(i) += small * small;
+                tau_(i) += 0.5 * (ds * ds + small_l * (small_l + 1) * std::pow(small * rinv, 2));
             }
         }
+        tau_.interpolate();
     }
 
   public:
@@ -1132,6 +1412,7 @@ class Bound_state : public Radial_solver
         , u_(radial_grid__)
         , rdudr_(radial_grid__)
         , rho_(radial_grid__)
+        , tau_(radial_grid__)
     {
         try {
             solve(rel__, enu_start__, alpha0__, alpha1__);
@@ -1156,6 +1437,18 @@ class Bound_state : public Radial_solver
         return rho_;
     }
 
+    /// Positive orbital-gradient kinetic density of this normalized radial state.
+    /** Multiply by occupation/(4*pi) for a spherical shell. Dirac states include
+     *  both spinor components, with their respective angular momenta. For scalar
+     *  equations only the physical radial orbital contributes, not the auxiliary
+     *  first-order variable q. This is not the relativistic kinetic-energy density.
+     */
+    Spline<double> const&
+    positive_kinetic_density() const
+    {
+        return tau_;
+    }
+
     /// Return radial function.
     Spline<double> const&
     u() const
@@ -1168,6 +1461,13 @@ class Bound_state : public Radial_solver
     p() const
     {
         return p_;
+    }
+
+    /// Small Dirac radial component, or the auxiliary variable for scalar equations.
+    Spline<double> const&
+    q() const
+    {
+        return q_;
     }
 
     std::vector<double> const&
@@ -1188,7 +1488,14 @@ struct enu_search_t
 
 enu_search_t
 find_enu(relativity_t rel__, int zn__, int n__, int l__, Radial_grid<double> const& radial_grid__,
-         std::vector<double> const& v__, enu_search_t const& enu__);
+         std::vector<double> const& v__, enu_search_t const& enu__, int kappa__ = 0);
+
+/// Differentiate the boundary conditions defining a stored linearisation energy.
+double
+linearization_energy_response(int zn__, int l__, Radial_grid<double> const& grid__,
+                              std::vector<double> const& potential__, enu_search_t const& enu__,
+                              std::vector<double> const& direction__, relativity_t rel__ = relativity_t::none,
+                              int kappa__ = 0);
 
 }; // namespace sirius
 
