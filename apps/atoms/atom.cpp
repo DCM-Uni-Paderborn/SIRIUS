@@ -830,7 +830,7 @@ generate_atom_file(cmd_args const& args, Free_atom& a)
     for (int l = 0; l < 10; l++) {
         for (int j = 0; j < a.num_lo_descriptors(); j++) {
             if (a.lo_descriptor(j).am.l() == l) {
-                auto s = lo_to_str(rb.lo_descriptors_[j]);
+                auto s = lo_to_str(rb.lo_descriptor(j));
                 if (inc[j]) {
                     dict["lo"].push_back({{"l", a.lo_descriptor(j).am.l()}, {"basis", json::parse(s)}});
                     std::cout << "idxlo : " << idxlo << ", l: " << a.lo_descriptor(j).am.l() << ", basis: " << s
