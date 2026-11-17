@@ -14,6 +14,7 @@
 #ifndef __CHECK_WAVE_FUNCTIONS_HPP__
 #define __CHECK_WAVE_FUNCTIONS_HPP__
 
+#include <cstdio>
 #include "core/wf/wave_functions.hpp"
 #include "hamiltonian/hamiltonian.hpp"
 
@@ -30,7 +31,13 @@ check_wave_functions(Hamiltonian_k<real_type<T>> const& Hk__, wf::Wave_functions
     la::dmatrix<F> ovlp(br__.size(), br__.size());
 
     /* apply Hamiltonian and S operators to the wave-functions */
-    Hk__.template apply_h_s<F>(sr__, br__, psi__, &hpsi, &spsi);
+    {
+        auto mem = Hk__.H0().ctx().processing_unit_memory_t();
+        auto pg  = psi__.memory_guard(mem, wf::copy_to::device);
+        auto hg  = hpsi.memory_guard(mem, wf::copy_to::host);
+        auto sg  = spsi.memory_guard(mem, wf::copy_to::host);
+        Hk__.template apply_h_s<F>(sr__, br__, psi__, &hpsi, &spsi);
+    }
 
     wf::inner(Hk__.H0().ctx().spla_context(), memory_t::host, sr__, psi__, br__, spsi, br__, ovlp, 0, 0);
 
@@ -52,10 +59,10 @@ check_wave_functions(Hamiltonian_k<real_type<T>> const& Hk__, wf::Wave_functions
                          spsi.pw_coeffs(ig, s1, wf::band_index(ib)) * static_cast<real_type<T>>(eval__[ib]);
                 l2norm += std::real(z * std::conj(z));
             }
-            psi__.gkvec().comm().allreduce(&l2norm, 1);
-            l2norm = std::sqrt(l2norm);
-            std::cout << "[check_wave_functions] band : " << ib << ", residual l2norm : " << l2norm << std::endl;
         }
+        psi__.gkvec().comm().allreduce(&l2norm, 1);
+        l2norm = std::sqrt(l2norm);
+        std::printf("[check_wave_functions] band : %d, residual l2norm : %.6e\n", ib, l2norm);
     }
 }
 

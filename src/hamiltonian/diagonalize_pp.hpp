@@ -38,16 +38,16 @@ diagonalize_pp_exact(int ispn__, Hamiltonian_k<T> const& Hk__, K_point<T>& kp__)
         RTE_THROW("exact diagonalization for Gamma-point case is not implemented");
     }
 
-    const int bs = ctx.cyclic_block_size();
-    la::dmatrix<F> hmlt(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs);
-    la::dmatrix<F> ovlp(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs);
-    la::dmatrix<F> evec(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs);
+    auto& gen_solver = ctx.gen_evp_solver();
+    auto& mph        = get_memory_pool(gen_solver.host_memory_t());
+    const int bs     = ctx.cyclic_block_size();
+    la::dmatrix<F> hmlt(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs, mph);
+    la::dmatrix<F> ovlp(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs, mph);
+    la::dmatrix<F> evec(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs, mph);
     std::vector<real_type<F>> eval(kp__.num_gkvec());
 
     hmlt.zero();
     ovlp.zero();
-
-    auto& gen_solver = ctx.gen_evp_solver();
 
     for (int ig = 0; ig < kp__.num_gkvec(); ig++) {
         hmlt.set(ig, ig, 0.5 * std::pow(kp__.gkvec().gkvec_cart(gvec_index_t::global(ig)).length(), 2));
@@ -85,10 +85,10 @@ diagonalize_pp_exact(int ispn__, Hamiltonian_k<T> const& Hk__, K_point<T>& kp__)
 
     mdarray<F, 2> btmp({kp__.num_gkvec_row(), ctx.unit_cell().max_mt_basis_size()});
 
-    auto bp_gen_row    = kp__.beta_projectors_row().make_generator();
+    auto bp_gen_row    = kp__.beta_projectors_row().make_generator(device_t::CPU);
     auto bp_coeffs_row = bp_gen_row.prepare();
 
-    auto bp_gen_col    = kp__.beta_projectors_col().make_generator();
+    auto bp_gen_col    = kp__.beta_projectors_col().make_generator(device_t::CPU);
     auto bp_coeffs_col = bp_gen_col.prepare();
 
     for (int ichunk = 0; ichunk < kp__.beta_projectors_row().num_chunks(); ichunk++) {
@@ -151,21 +151,33 @@ diagonalize_pp_exact(int ispn__, Hamiltonian_k<T> const& Hk__, K_point<T>& kp__)
     if (ctx.cfg().control().verification() >= 2) {
         RTE_OUT(ctx.out()) << "checking eigen-values of S-matrix\n";
 
-        la::dmatrix<F> ovlp1(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs);
-        la::dmatrix<F> evec(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs);
+        auto& solver = ctx.std_evp_solver();
+        auto& pool   = get_memory_pool(solver.host_memory_t());
+        la::dmatrix<F> ovlp1(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs, pool);
+        la::dmatrix<F> evec(kp__.num_gkvec(), kp__.num_gkvec(), ctx.blacs_grid(), bs, bs, pool);
 
         copy(ovlp, ovlp1);
 
         std::vector<real_type<F>> eo(kp__.num_gkvec());
 
-        auto solver = la::Eigensolver_factory("scalapack");
-        solver->solve(kp__.num_gkvec(), ovlp1, eo.data(), evec);
+        if (solver.type() == la::ev_solver_t::cusolver) {
+            ovlp1.allocate(get_memory_pool(memory_t::device));
+        }
+        if (solver.solve(kp__.num_gkvec(), kp__.num_gkvec(), ovlp1, eo.data(), evec)) {
+            RTE_THROW("error in overlap-matrix verification");
+        }
 
         for (int i = 0; i < kp__.num_gkvec(); i++) {
             if (eo[i] < 1e-6) {
                 RTE_OUT(ctx.out()) << "small eigen-value: " << eo[i] << std::endl;
             }
         }
+    }
+
+    if (gen_solver.type() == la::ev_solver_t::cusolver) {
+        auto& mpd = get_memory_pool(memory_t::device);
+        hmlt.allocate(mpd);
+        ovlp.allocate(mpd);
     }
 
     if (gen_solver.solve(kp__.num_gkvec(), ctx.num_bands(), hmlt, ovlp, eval.data(), evec)) {

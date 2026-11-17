@@ -178,9 +178,6 @@ validate_external_xc_context(Simulation_context const& ctx__)
     if (!ctx__.cb().external_xc_) {
         return;
     }
-    if (ctx__.processing_unit() != device_t::CPU) {
-        RTE_THROW("external XC requires CPU execution");
-    }
     auto const& points = ctx__.cb().external_xc_points_;
     int point_min = bool(points), point_max = point_min;
     ctx__.comm().allreduce<int, mpi::op_t::min>(&point_min, 1);
