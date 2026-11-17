@@ -803,8 +803,8 @@ generate_atom_file(cmd_args const& args, Free_atom& a)
 
     std::cout << "=== initializing atom ===" << std::endl;
     a.init();
-    lapw_radial_basis_t rb{a, relativity_t::none, veff};
-    rb.find_enu();
+    lapw_radial_basis_t rb{0, a, relativity_t::none, veff};
+    rb.find_enu(relativity_t::none);
     rb.generate_radial_functions();
     rb.write_enu(std::cout);
 
