@@ -16,6 +16,7 @@
 
 #include <iomanip>
 #include "function3d/field4d.hpp"
+#include "lapw/lapw_radial_basis.hpp"
 #include "function3d/paw_field4d.hpp"
 #include "function3d/periodic_function.hpp"
 #include "function3d/spheric_function_set.hpp"
@@ -234,9 +235,15 @@ class Density : public Field4D
      */
     std::unique_ptr<Smooth_periodic_function<double>> rho_pseudo_core_{nullptr};
 
-    /// Valence tau and its collinear spin difference, mixed with rho/magnetization.
+    /// Fixed pseudo-core tau, excluded from valence mixing and electron counts.
+
+    /// Scalar and spin-vector tau (plus core inside LAPW spheres), mixed with rho/magnetization.
     std::unique_ptr<Field4D> kinetic_density_;
-    bool external_xc_registered_{false};
+    std::shared_ptr<LAPW_radial_basis> lapw_basis_;
+    friend void
+    copy(Density const&, Density&);
+
+    bool external_xc_registered_;
 
     /// Fast mapping between composite lm index and corresponding orbital quantum number.
     std::vector<int> l_by_lm_;
@@ -246,13 +253,19 @@ class Density : public Field4D
         PAW density of atoms. */
     std::unique_ptr<mixer::Mixer<Periodic_function<double>, Periodic_function<double>, Periodic_function<double>,
                                  Periodic_function<double>, density_matrix_t, PAW_density<double>, Hubbard_matrix,
-                                 Periodic_function<double>, Periodic_function<double>>>
+                                 Periodic_function<double>, Periodic_function<double>, Periodic_function<double>,
+                                 Periodic_function<double>>>
             mixer_;
 
     /// Core charge density.
     /** All-electron core charge density of the LAPW method. It is recomputed on every SCF iteration due to
         the change of effective potential. */
     std::vector<std::vector<double>> ae_core_charge_density_;
+
+    /// Positive orbital-gradient core tau on the same radial grids as the core charge.
+    std::vector<std::vector<double>> ae_core_kinetic_density_;
+
+    bool core_kinetic_density_ready_{false};
 
     /// Core eigen-value sum.
     std::vector<double> core_eval_sum_;
@@ -323,8 +336,11 @@ class Density : public Field4D
     generate_pseudo_core_charge_density();
 
   public:
-    /// Meta-GGA enables tau automatically. Other callers can request its storage explicitly.
+    /// External XC enables tau automatically; it can also be requested for orbital-field diagnostics.
     Density(Simulation_context& ctx__, bool kinetic_density__ = false);
+
+    friend void
+    copy(Density const& src__, Density& dest__);
 
     /// Update internal parameters after a change of lattice vectors or atomic coordinates.
     void
@@ -356,8 +372,37 @@ class Density : public Field4D
     check_num_electrons() const;
 
     /// Generate charge density of core states
+    /** Optional raw XC covectors {rho, tau} are in atom-symmetry-class order.
+     *  They differentiate spin-summed spherical core fields, without extra radial
+     *  weights. Supplying them selects the NR/ZORA or native no-pair Dirac variational core solver.
+     */
     void
-    generate_core_charge_density(std::vector<std::vector<double>> const& vs__);
+    generate_core_charge_density(std::vector<std::vector<double>> const& vs__,
+                                 std::vector<std::array<std::vector<double>, 2>> const& core_xc__ = {});
+
+    /// Spherical total LAPW core charge, from the same solve as core tau.
+    std::vector<double> const&
+    core_charge_density(int ia__) const
+    {
+        if (!ctx_.full_potential() || !core_kinetic_density_ready_) {
+            RTE_THROW("LAPW core charge requires a successful radial core solve");
+        }
+        return ae_core_charge_density_.at(unit_cell_.atom(ia__).symmetry_class().id());
+    }
+
+    /// Spherical total core tau for an LAPW atom, including occupation/(4*pi).
+    /** Recomputed with the radial core states, not inferred from charge density.
+     *  The unpolarized core contributes half of this value to each spin channel.
+     *  This is a radial value, not the lm=0 expansion coefficient.
+     */
+    std::vector<double> const&
+    core_kinetic_density(int ia__) const
+    {
+        if (!ctx_.full_potential() || !core_kinetic_density_ready_) {
+            RTE_THROW("LAPW core kinetic density requires a successful radial core solve");
+        }
+        return ae_core_kinetic_density_.at(unit_cell_.atom(ia__).symmetry_class().id());
+    }
 
     /// Generate full charge density (valence + core) and magnetization from the wave functions.
     /** This function calls generate_valence() and then in case of full-potential LAPW method adds a core density
@@ -366,23 +411,38 @@ class Density : public Field4D
      */
     template <typename T>
     void
-    generate(K_point_set const& ks__, LAPW_radial_basis const* lapw_basis__, bool symmetrize__, bool add_core__,
-             bool transform_to_rg__);
+    generate(K_point_set const& ks__, std::shared_ptr<LAPW_radial_basis> lapw_basis__, bool symmetrize__,
+             bool add_core__, bool transform_to_rg__);
 
-    template <typename T>
-    void
-    generate(K_point_set const& ks__, LAPW_radial_basis const& lapw_basis__, bool symmetrize__, bool add_core__,
-             bool transform_to_rg__)
-    {
-        generate<T>(ks__, &lapw_basis__, symmetrize__, add_core__, transform_to_rg__);
-    }
-
-    /// PW density generation does not require a LAPW radial basis.
     template <typename T>
     void
     generate(K_point_set const& ks__, bool symmetrize__, bool add_core__, bool transform_to_rg__)
     {
-        generate<T>(ks__, nullptr, symmetrize__, add_core__, transform_to_rg__);
+        generate<T>(ks__, lapw_basis_, symmetrize__, add_core__, transform_to_rg__);
+    }
+
+    std::shared_ptr<LAPW_radial_basis>
+    lapw_basis_sptr() const
+    {
+        return lapw_basis_;
+    }
+
+    void
+    set_lapw_basis(std::shared_ptr<LAPW_radial_basis> basis__)
+    {
+        if (basis__ && &basis__->unit_cell() != &unit_cell_) {
+            RTE_THROW("LAPW density and radial basis must belong to the same unit cell");
+        }
+        lapw_basis_ = std::move(basis__);
+    }
+
+    LAPW_radial_basis const&
+    lapw_basis() const
+    {
+        if (!lapw_basis_) {
+            RTE_THROW("LAPW density has no radial basis");
+        }
+        return *lapw_basis_;
     }
 
     /// Generate valence charge density and magnetization from the wave functions.
@@ -394,27 +454,26 @@ class Density : public Field4D
     void
     generate_valence(K_point_set const& ks__, LAPW_radial_basis const* basis__);
 
-    template <typename T>
-    void
-    generate_valence(K_point_set const& ks__, LAPW_radial_basis const& basis__)
-    {
-        generate_valence<T>(ks__, &basis__);
-    }
-
     /// Generate unsymmetrized smooth valence kinetic-energy densities from occupied orbitals.
     /** Returns one total component for a nonmagnetic calculation, or separate
      *  up/down components for a collinear calculation, on the fine density grid
      *  in both real and reciprocal space. PAW augmentation, muffin-tin terms,
-     *  and core contributions are not included. Currently requires CPU orbitals
-     *  and FFTs. This does not enable a tau-dependent functional in the SCF loop.
+     *  and core contributions are not included. Scalar/collinear results are spin
+     *  channels; noncollinear results are scalar,z,x,y components. CPU/GPU orbitals
+     *  and FFTs are supported. This does not enable a tau-dependent functional in the SCF loop.
      */
     template <typename T>
     std::vector<Smooth_periodic_function<double>>
     generate_smooth_kinetic_density(K_point_set const& ks__) const;
 
-    /// Thomas-Fermi plus von Weizsaecker starting guess from the current density.
+    /// Thomas-Fermi starting guess, with a spin-covariant von-Weizsaecker term for tau-dependent XC.
     void
     initial_kinetic_density();
+
+    /// Store and synchronize the current LAPW orbital tau, optionally including the solved core.
+    /** Call before mixing, while the density matrix still refers to the current radial basis. */
+    void
+    generate_mt_kinetic_density(bool add_core__);
 
     bool
     has_kinetic_density() const
@@ -439,6 +498,33 @@ class Density : public Field4D
         }
         return *kinetic_density_;
     }
+
+    /// Muffin-tin valence tau from the current LAPW density matrix, in real spherical harmonics.
+    /** Returns total tau, separate up/down fields, or scalar/z/x/y components.
+     *  Core states are excluded. The density matrix must already be accumulated
+     *  over bands and k-points.
+     */
+    std::vector<Flm>
+    generate_mt_valence_kinetic_density(int ia__) const;
+
+    /// PAW partial-wave valence tau from the current projector density matrix.
+    /** Element 0 contains AE fields and element 1 pseudo fields, with the same
+     *  spin convention as generate_mt_valence_kinetic_density(). These are local
+     *  partial-wave contributions, not the smooth FFT tau or a reconstructed full
+     *  field. Charge-compensation Q functions and frozen-core tau are excluded.
+     */
+    std::array<std::vector<Flm>, 2>
+    generate_paw_valence_kinetic_density(int ia__) const;
+
+    /// Local {rho, tau} PAW corrections for a joint reconstructed XC evaluation.
+    /** Each entry has one total, two collinear spin fields, or scalar/z/x/y components. Charge includes
+     *  AE-minus-PS and the explicit AE core; tau includes AE-minus-PS
+     *  and explicit positive core tau. Combine with smooth pseudo-orbital
+     *  charge and tau, WITHOUT Q augmentation or pseudo-core density. These are
+     *  fields, not independent atom-local XC energies.
+     */
+    std::array<std::vector<Flm>, 2>
+    generate_paw_xc_correction(int ia__) const;
 
     /// Add augmentation charge Q(r).
     /** Restore valence density by adding the Q-operator constribution.
@@ -821,9 +907,10 @@ inline void
 copy(Density const& src__, Density& dest__)
 {
     if (src__.has_kinetic_density() != dest__.has_kinetic_density() ||
-        (src__.has_kinetic_density() && &src__.ctx() != &dest__.ctx())) {
+        ((src__.has_kinetic_density() || src__.lapw_basis_) && &src__.ctx() != &dest__.ctx())) {
         RTE_THROW("kinetic-density copy requires matching storage in the same context");
     }
+    dest__.lapw_basis_ = src__.lapw_basis_;
     for (int j = 0; j < src__.ctx().num_mag_dims() + 1; j++) {
         copy(src__.component(j).rg(), dest__.component(j).rg());
         if (src__.has_kinetic_density()) {
@@ -831,7 +918,17 @@ copy(Density const& src__, Density& dest__)
         }
         if (src__.ctx().full_potential()) {
             copy(src__.component(j).mt(), dest__.component(j).mt());
+            if (src__.has_kinetic_density()) {
+                copy(src__.kinetic_density().component(j).mt(), dest__.kinetic_density().component(j).mt());
+            }
         }
+    }
+    if (src__.has_kinetic_density()) {
+        dest__.ae_core_charge_density_     = src__.ae_core_charge_density_;
+        dest__.ae_core_kinetic_density_    = src__.ae_core_kinetic_density_;
+        dest__.core_kinetic_density_ready_ = src__.core_kinetic_density_ready_;
+        dest__.core_eval_sum_              = src__.core_eval_sum_;
+        dest__.core_leakage_               = src__.core_leakage_;
     }
     for (int ia = 0; ia < src__.ctx().unit_cell().num_atoms(); ia++) {
         copy(src__.density_matrix(ia), dest__.density_matrix(ia));
@@ -855,7 +952,7 @@ get_rho_up_dn(Density const& density__, double add_delta_rho_xc__ = 0.0, double 
 
     /* compute "up" and "dn" components and also check for negative values of density */
     double rhomin{0};
-    #pragma omp parallel for reduction(min : rhomin)
+#pragma omp parallel for reduction(min : rhomin)
     for (int ir = 0; ir < num_points; ir++) {
         r3::vector<double> m;
         for (int j = 0; j < ctx.num_mag_dims(); j++) {

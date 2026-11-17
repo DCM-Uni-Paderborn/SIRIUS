@@ -20,6 +20,29 @@
 
 namespace sirius {
 
+std::pair<Radial_grid<double>, std::vector<double>>
+Atom_type::core_radial_problem(std::vector<double> const& spherical_potential__) const
+{
+    int nmtp = num_mt_points();
+    if (spherical_potential__.size() != nmtp) {
+        RTE_THROW("core radial potential has the wrong muffin-tin size");
+    }
+    auto points = radial_grid().values();
+    double x = points.back(), dx = radial_grid().dx(nmtp - 2);
+    while (x + dx < free_atom_radial_grid().last()) {
+        x += dx;
+        points.push_back(x);
+        dx *= 1.025;
+    }
+    Radial_grid_ext<double> grid(static_cast<int>(points.size()), points.data());
+    auto potential = spherical_potential__;
+    double shift   = potential.back() - free_atom_potential(mt_radius());
+    for (int ir = nmtp; ir < grid.num_points(); ir++) {
+        potential.push_back(free_atom_potential(grid[ir]) + shift);
+    }
+    return {std::move(grid), std::move(potential)};
+}
+
 void
 Atom_type::init()
 {
@@ -522,6 +545,7 @@ Atom_type::read_pseudo_uspp(nlohmann::json const& parser)
 
     ps_core_charge_density(
             parser["pseudo_potential"].value("core_charge_density", std::vector<double>(rgrid.size(), 0)));
+    ps_core_kinetic_density_.clear();
     if (parser["pseudo_potential"].contains("core_kinetic_density")) {
         ps_core_kinetic_density(parser["pseudo_potential"]["core_kinetic_density"].get<std::vector<double>>());
     }
@@ -737,6 +761,11 @@ Atom_type::read_input(nlohmann::json const& parser)
     }
 
     if (parameters_.full_potential()) {
+        auto file_symbol = parser.at("symbol").get<std::string>();
+        auto file_zn     = parser.at("number").get<int>();
+        if ((!symbol_.empty() && symbol_ != file_symbol) || (zn_ != 0 && zn_ != file_zn)) {
+            RTE_THROW("Full-potential atom file does not match the requested element for type " + label_);
+        }
         name_     = parser["name"].get<std::string>();
         symbol_   = parser["symbol"].get<std::string>();
         mass_     = parser["mass"].get<double>();
@@ -822,6 +851,8 @@ Atom_type::read_pseudo_uspp(pugi::xml_node const& upf)
     } else {
         ps_core_charge_density(std::vector<double>(rgrid.size(), 0.0));
     }
+    // PP_NLCC specifies charge, not positive orbital-gradient kinetic density.
+    ps_core_kinetic_density_.clear();
 
     ps_total_charge_density(vec_from_str<double>(upf.child("PP_RHOATOM").child_value()));
 
@@ -1307,7 +1338,7 @@ Atom_type::serialize() const
     dict["radial_grid"]              = radial_grid().values();
     dict["local_potential"]          = local_potential();
     dict["core_charge_density"]      = ps_core_charge_density();
-    if (!ps_core_kinetic_density().empty()) {
+    if (has_ps_core_kinetic_density()) {
         dict["core_kinetic_density"] = ps_core_kinetic_density();
     }
     dict["total_charge_density"]  = ps_total_charge_density();

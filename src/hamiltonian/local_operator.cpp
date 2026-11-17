@@ -154,9 +154,30 @@ Local_operator<T>::Local_operator(Simulation_context const& ctx__, fft::spfft_tr
         }
     }
 
-    if (potential__.has_kinetic_potential()) {
-        // v_tau = dE_xc/dtau for each spin channel. Restrict it to the
-        // orbital FFT grid using the adjoint of density-grid prolongation.
+    if (auto const* d = potential__.lapw_xc_derivatives()) {
+        // First-variation scalar and magnetic components, with no second MT mask.
+        for (int j = 0; j < ctx_.num_spins(); j++) {
+            vtau_vec_[j] = std::make_unique<Smooth_periodic_function<T>>(fft_coarse__, gvec_coarse_p__);
+            for (int ig = 0; ig < gvec_coarse_p_->gvec().count(); ig++) {
+                int fine = ctx_.gvec().gvec_base_mapping(ig);
+                std::complex<double> v{0}, t{0};
+                for (int s = 0; s < ctx_.num_spins(); s++) {
+                    double factor = double(j == 0 ? 1 : 1 - 2 * s) / ctx_.num_spins();
+                    v += factor * d->rho[s].f_pw_local(fine);
+                    t += factor * d->tau[s].f_pw_local(fine);
+                }
+                veff_vec_[j]->f_pw_local(ig) += static_cast<std::complex<T>>(v);
+                vtau_vec_[j]->f_pw_local(ig) = static_cast<std::complex<T>>(t);
+            }
+            if (j < 2) {
+                v0_[j]    = veff_vec_[j]->f_0().real();
+                vtau0_[j] = vtau_vec_[j]->f_0().real();
+            }
+            veff_vec_[j]->fft_transform(1);
+            vtau_vec_[j]->fft_transform(1);
+        }
+    } else if (potential__.has_kinetic_potential()) {
+        // Restrict dE_xc/dtau to the orbital FFT grid using the adjoint of density-grid prolongation.
         for (int s = 0; s < ctx_.num_spins(); s++) {
             vtau_vec_[s]  = std::make_unique<Smooth_periodic_function<T>>(fft_coarse__, gvec_coarse_p__);
             auto const& t = potential__.kinetic_potential().scalar().rg();
@@ -168,8 +189,10 @@ Local_operator<T>::Local_operator(Simulation_context const& ctx__, fft::spfft_tr
                 }
                 vtau_vec_[s]->f_pw_local(ig) = static_cast<std::complex<T>>(v);
             }
-            vtau0_[s] = vtau_vec_[s]->f_0().real();
             vtau_vec_[s]->fft_transform(1);
+        }
+        for (int s = 0; s < ctx_.num_spins(); s++) {
+            vtau0_[s] = vtau_vec_[s]->f_0().real();
         }
     }
 
@@ -493,13 +516,15 @@ Local_operator<T>::apply_h(fft::spfft_transform_type<T>& spfftk__, std::shared_p
             vphi_to_G();
             /* add kinetic energy */
             add_to_hphi(spins__.begin().get(), wf::band_index(i));
-            if (tau_op) {
-                // Add the generalized Kohn-Sham term -1/2 div(v_tau grad(psi)).
-                int s = spins__.begin().get();
-                tau_op->add_potential(vtau_vec_[s]->values().at(memory_t::host),
-                                      phi_fft[s].at(memory_t::host, 0, wf::band_index(i)),
-                                      hphi_fft[s].at(memory_t::host, 0, wf::band_index(i)));
-            }
+        }
+    }
+    if (tau_op) {
+        // Add -1/2 div(v_tau grad(psi)), including the spin-matrix form when needed.
+        for (int i = 0; i < spl_num_wf.local_size(); i++) {
+            int s = spins__.begin().get();
+            tau_op->add_potential(vtau_vec_[s]->values().at(memory_t::host),
+                                  phi_fft[s].at(memory_t::host, 0, wf::band_index(i)),
+                                  hphi_fft[s].at(memory_t::host, 0, wf::band_index(i)));
         }
     }
     PROFILE_STOP("sirius::Local_operator::apply_h|bands");
@@ -566,6 +591,11 @@ Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::sha
     auto phi_mem = phi_fft.on_device() ? memory_t::device : memory_t::host;
 
     auto phi_r = buf_rg_.at(spfft_mem);
+
+    std::unique_ptr<wf::Kinetic_density_operator<T>> kinetic;
+    if (vtau_vec_[0]) {
+        kinetic = std::make_unique<wf::Kinetic_density_operator<T>>(spfftk__, *gkvec_fft__);
+    }
 
     for (int j = 0; j < spl_num_wf.local_size(); j++) {
         /* phi(G) -> phi(r) */
@@ -670,6 +700,19 @@ Local_operator<T>::apply_fplapw(fft::spfft_transform_type<T>& spfftk__, std::sha
                                          wf_fft[0].at(memory_t::device, 0, wf::band_index(j)));
                 }
             } // x
+        }
+    }
+    if (kinetic) {
+        for (int j = 0; j < spl_num_wf.local_size(); j++) {
+            auto const* phi = phi_fft.at(memory_t::host, 0, wf::band_index(j));
+            if (hphi__) {
+                kinetic->add_potential(vtau_vec_[0]->values().at(memory_t::host), phi,
+                                       wf_fft[0].at(memory_t::host, 0, wf::band_index(j)));
+            }
+            if (bzphi__ && vtau_vec_[1]) {
+                kinetic->add_potential(vtau_vec_[1]->values().at(memory_t::host), phi,
+                                       wf_fft[2].at(memory_t::host, 0, wf::band_index(j)));
+            }
         }
     }
 }

@@ -4,11 +4,8 @@
  */
 
 #include "potential.hpp"
-#include "density/paw_xc_reconstruction.hpp"
-#include "function3d/smooth_periodic_function_sampler.hpp"
-#include "radial/spline.hpp"
-#include <limits>
-#include <numeric>
+#include "density/lapw_xc_field_map.hpp"
+#include "density/paw_xc_field_map.hpp"
 
 namespace sirius {
 
@@ -20,27 +17,27 @@ xc_point_set_t::xc_point_set_t(Simulation_context const& ctx__)
         }
     }
     for (int ia = 0; ia < ctx__.unit_cell().num_atoms(); ia++) {
-        auto p = ctx__.unit_cell().atom(ia).position();
-        atoms_.push_back({p[0], p[1], p[2]});
+        auto r = ctx__.unit_cell().atom(ia).position();
+        atoms_.push_back({r[0], r[1], r[2]});
     }
 }
 
 void
 xc_point_set_t::validate(Simulation_context const& ctx__) const
 {
-    size_t n   = coordinates.size();
-    int failed = n > static_cast<size_t>(std::numeric_limits<int>::max()) || energy_weights.size() != n ||
-                 descriptor_weights.size() != n || block_sizes.size() != block_centres.size() ||
+    size_t nr  = coordinates.size();
+    int failed = nr > static_cast<size_t>(std::numeric_limits<int>::max()) || energy_weights.size() != nr ||
+                 descriptor_weights.size() != nr || block_sizes.size() != block_centres.size() ||
                  atoms_.size() != static_cast<size_t>(ctx__.unit_cell().num_atoms());
     int64_t count{0};
-    for (int b : block_sizes) {
-        failed |= b <= 0;
-        count += b;
+    for (int n : block_sizes) {
+        failed |= n <= 0;
+        count += n;
     }
-    failed |= count != static_cast<int64_t>(n);
+    failed |= count != static_cast<int64_t>(nr);
     for (auto const* a : {&coordinates, &block_centres}) {
-        for (auto const& p : *a) {
-            for (double x : p) {
+        for (auto const& r : *a) {
+            for (double x : r) {
                 failed |= !std::isfinite(x);
             }
         }
@@ -62,372 +59,349 @@ xc_point_set_t::validate(Simulation_context const& ctx__) const
             }
         }
     }
-    int any = n != 0;
-    ctx__.comm().allreduce<int, mpi::op_t::max>(&any, 1);
-    failed |= !any;
+    int any_points = nr > 0;
+    ctx__.comm().allreduce<int, mpi::op_t::max>(&any_points, 1);
+    failed |= !any_points;
     ctx__.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
     if (failed) {
-        RTE_THROW("external XC requires a finite, fixed point quadrature with complete atom blocks");
+        RTE_THROW("external XC: invalid point quadrature or geometry changed since its construction");
     }
-}
-
-void
-validate_external_xc_context(Simulation_context const& ctx__)
-{
-    int failed = ctx__.full_potential() || ctx__.processing_unit() != device_t::CPU ||
-                 ctx__.spfft<double>().processing_unit() != SPFFT_PU_HOST ||
-                 ctx__.spfft_coarse<double>().processing_unit() != SPFFT_PU_HOST || ctx__.num_mag_dims() == 3 ||
-                 ctx__.so_correction() || ctx__.veff_callback() || ctx__.cfg().parameters().precision_wf() != "fp64" ||
-                 ctx__.cfg().parameters().veff_pw_cutoff() > 0 || !ctx__.xc_functionals().empty() ||
-                 (ctx__.cb().external_xc_points_ && ctx__.use_symmetry());
-    int invalid_setup{0};
-    for (int iat = 0; iat < ctx__.unit_cell().num_atom_types(); iat++) {
-        auto const& type = ctx__.unit_cell().atom_type(iat);
-        failed |= type.spin_orbit_coupling();
-        try {
-            if (type.is_paw()) {
-                type.paw_ae_core_kinetic_density();
-            } else if (type.augment()) {
-                type.check_kinetic_augmentation();
-            } else {
-                type.check_ps_core_kinetic_density();
-            }
-            invalid_setup |= (type.augment() || type.has_ps_core_kinetic_density()) && !ctx__.cb().external_xc_points_;
-        } catch (std::exception const&) {
-            invalid_setup = 1;
-        }
-    }
-    ctx__.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
-    ctx__.comm().allreduce<int, mpi::op_t::max>(&invalid_setup, 1);
-    if (failed) {
-        RTE_THROW("external XC requires CPU scalar/collinear fp64 pseudopotential calculations without "
-                  "other XC functionals or potential callbacks; point quadratures require disabled symmetry");
-    }
-    if (invalid_setup) {
-        RTE_THROW("external XC augmentation and frozen cores require a point quadrature and matching kinetic density "
-                  "data");
-    }
-    if (ctx__.cb().external_xc_points_) {
-        ctx__.cb().external_xc_points_->validate(ctx__);
-    }
-}
-
-namespace {
-
-/// Value and first two radial derivatives of the same spline.
-std::array<double, 3>
-core_radial_sample(Spline<double> const& spline, double r)
-{
-    if (r < spline.first()) {
-        // Continue the innermost segment to second order, as for the spherical l=0 field.
-        double dr = r - spline.first();
-        double d1 = spline.deriv(1, 0), d2 = spline.deriv(2, 0);
-        return {spline(0) + dr * (d1 + 0.5 * dr * d2), d1 + dr * d2, d2};
-    }
-    int i     = spline.index_of(r);
-    double dr = r - spline.x(i);
-    return {spline(i, dr), spline.deriv(1, i, dr), spline.deriv(2, i, dr)};
-}
-
-template <typename F>
-void
-for_each_core_sample(Simulation_context const& ctx, std::vector<r3::vector<double>> const& points, F&& f)
-{
-    auto const& cell = ctx.unit_cell();
-    auto const& a    = cell.lattice_vectors();
-    int failed{0};
-    try {
-        for (int iat = 0; iat < cell.num_atom_types(); iat++) {
-            auto const& type = cell.atom_type(iat);
-            if (type.ps_core_kinetic_density().empty() || points.empty()) {
-                continue;
-            }
-            auto const& grid = type.radial_grid();
-            Spline<double> rho(grid, type.ps_core_charge_density()), tau(grid, type.ps_core_kinetic_density());
-            auto limits = r3::find_translations(grid.last(), a);
-            for (int i = 0; i < type.num_atoms(); i++) {
-                int ia    = type.atom_id(i);
-                auto atom = r3::dot(a, cell.atom(ia).position());
-                for (int p = 0; p < static_cast<int>(points.size()); p++) {
-                    auto displacement = points[p] - atom;
-                    auto image        = r3::dot(cell.inverse_lattice_vectors(), displacement);
-                    for (int x = 0; x < 3; x++) {
-                        image[x] = std::nearbyint(image[x]);
-                    }
-                    displacement -= r3::dot(a, image);
-                    for (int z = -limits[2]; z <= limits[2]; z++) {
-                        for (int y = -limits[1]; y <= limits[1]; y++) {
-                            for (int x = -limits[0]; x <= limits[0]; x++) {
-                                r3::vector<double> shift{double(x), double(y), double(z)};
-                                auto dr  = displacement - r3::dot(a, shift);
-                                double r = dr.length();
-                                if (r > grid.last()) {
-                                    continue;
-                                }
-                                if (!std::isfinite(r) || r < 1e-12) {
-                                    RTE_THROW("invalid pseudo-core sampling point at or near a nucleus");
-                                }
-                                f(p, ia, image + shift, r, (1 / r) * dr, core_radial_sample(rho, r),
-                                  core_radial_sample(tau, r));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } catch (std::exception const&) {
-        failed = 1;
-    }
-    ctx.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
-    if (failed) {
-        RTE_THROW("pseudo-core sampling failed on a context rank");
-    }
-}
-
-void
-add_core_fields(Simulation_context const& ctx, std::vector<r3::vector<double>> const& points, mdarray<double, 2>& rho,
-                mdarray<double, 3>& gradient, mdarray<double, 2>& tau)
-{
-    int ns = ctx.num_spins();
-    for_each_core_sample(ctx, points,
-                         [&](auto p, int, auto const&, double, auto const& u, auto const& n, auto const& t) {
-                             for (int s = 0; s < ns; s++) {
-                                 rho(p, s) += n[0] / ns;
-                                 tau(p, s) += t[0] / ns;
-                                 for (int x = 0; x < 3; x++) {
-                                     gradient(p, x, s) += n[1] * u[x] / ns;
-                                 }
-                             }
-                         });
 }
 
 std::array<std::vector<Smooth_periodic_function<double>>, 2>
-orbital_fields(Simulation_context const& ctx, Density const& density)
+external_xc_smooth_fields(Simulation_context const& ctx, Density const& density)
 {
-    std::array<std::vector<Smooth_periodic_function<double>>, 2> fields;
-    int ns = ctx.num_spins();
     mdarray<std::complex<double>, 2> augmentation;
     if (ctx.unit_cell().augment()) {
+        // Cancel Q in its original Fourier representation, not on a radial grid.
         augmentation = density.generate_rho_aug();
     }
-    for (auto& component : fields) {
-        for (int s = 0; s < ns; s++) {
-            component.emplace_back(ctx.spfft<double>(), ctx.gvec_fft_sptr());
-        }
-    }
-    for (int ig = 0; ig < ctx.gvec().count(); ig++) {
-        auto n = density.rho().rg().f_pw_local(ig);
-        auto t = density.kinetic_density().scalar().rg().f_pw_local(ig);
-        if (ctx.unit_cell().augment()) {
-            n -= augmentation(ig, 0);
-        }
-        if (ctx.gvec().offset() + ig == 0) {
-            n -= ctx.cfg().parameters().extra_charge() / ctx.unit_cell().omega();
-        }
-        if (ns == 1) {
-            fields[0][0].f_pw_local(ig) = n;
-            fields[1][0].f_pw_local(ig) = t;
-        } else { // ns == 2: spin-up and spin-down channels
-            auto mz = density.mag(0).rg().f_pw_local(ig);
-            if (ctx.unit_cell().augment()) {
-                mz -= augmentation(ig, 1);
+    std::array<std::vector<Smooth_periodic_function<double>>, 2> fields;
+    auto& rho = fields[0];
+    auto& tau = fields[1];
+    for (int s = 0; s < ctx.num_mag_dims() + 1; s++) {
+        rho.emplace_back(ctx.spfft<double>(), ctx.gvec_fft_sptr());
+        tau.emplace_back(ctx.spfft<double>(), ctx.gvec_fft_sptr());
+        for (int ig = 0; ig < ctx.gvec().count(); ig++) {
+            auto r = density.rho().rg().f_pw_local(ig);
+            auto t = density.kinetic_density().scalar().rg().f_pw_local(ig);
+            if (!ctx.full_potential() && ctx.gvec().offset() + ig == 0) {
+                // The neutralizing PP background is not an electronic XC field.
+                r -= ctx.cfg().parameters().extra_charge() / ctx.unit_cell().omega();
             }
-            auto tz                     = density.kinetic_density().vector(0).rg().f_pw_local(ig);
-            fields[0][0].f_pw_local(ig) = 0.5 * (n + mz);
-            fields[0][1].f_pw_local(ig) = 0.5 * (n - mz);
-            fields[1][0].f_pw_local(ig) = 0.5 * (t + tz);
-            fields[1][1].f_pw_local(ig) = 0.5 * (t - tz);
+            if (ctx.unit_cell().augment()) {
+                r -= augmentation(ig, 0);
+            }
+            if (ctx.num_mag_dims() == 1) {
+                auto m = density.mag(0).rg().f_pw_local(ig);
+                if (ctx.unit_cell().augment()) {
+                    m -= augmentation(ig, 1);
+                }
+                r = 0.5 * (r + (1.0 - 2 * s) * m);
+                t = 0.5 * (t + (1.0 - 2 * s) * density.kinetic_density().vector(0).rg().f_pw_local(ig));
+            }
+            rho.back().f_pw_local(ig) = r;
+            tau.back().f_pw_local(ig) = t;
         }
     }
     return fields;
 }
 
+namespace {
+
 void
-evaluate(Simulation_context const& ctx, xc_callback_input_t const& in, xc_callback_output_t& out,
-         xc_callback_t const& callback)
+evaluate_external_xc(Simulation_context const& ctx, xc_callback_input_t const& input, xc_callback_output_t& output)
 {
-    auto finite = [](double const* p, size_t n) {
-        if (n == 0) {
-            return true;
-        }
-        return std::all_of(p, p + n, [](double v) { return std::isfinite(v); });
-    };
-    size_t n   = static_cast<size_t>(in.num_points) * in.num_spins;
-    int failed = !finite(in.rho, n) || !finite(in.gradient, 3 * n) || !finite(in.tau, n);
-    ctx.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
-    if (failed) {
-        RTE_THROW("external XC received nonfinite fields");
-    }
-    std::string error;
-    try {
-        callback(ctx, in, out);
-    } catch (std::exception const& e) {
-        failed = 1;
-        error  = e.what();
-    }
-    failed |=
-            !std::isfinite(out.energy) || !finite(out.vrho, n) || !finite(out.vgradient, 3 * n) || !finite(out.vtau, n);
-    if (out.geometry) {
-        auto const& d = *out.geometry;
-        failed |= !in.points || d.coordinates.size() != static_cast<size_t>(in.num_points) ||
-                  d.energy_weights.size() != static_cast<size_t>(in.num_points) ||
-                  d.descriptor_weights.size() != static_cast<size_t>(in.num_points) ||
-                  (in.points && d.block_centres.size() != in.points->block_sizes.size());
-        failed |= !finite(d.energy_weights.data(), d.energy_weights.size()) ||
-                  !finite(d.descriptor_weights.data(), d.descriptor_weights.size());
-        for (auto const* values : {&d.coordinates, &d.block_centres}) {
-            for (auto const& row : *values) {
-                failed |= !finite(row.data(), row.size());
+    size_t n    = static_cast<size_t>(input.num_points) * input.num_spins;
+    auto finite = [](double const* p, size_t count) {
+        for (size_t i = 0; i < count; i++) {
+            if (!std::isfinite(p[i])) {
+                return false;
             }
         }
+        return true;
+    };
+    int failed = !finite(input.rho, n) || !finite(input.gradient, 3 * n) || !finite(input.tau, n);
+    ctx.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external XC received nonfinite reconstructed fields on a context rank");
+    }
+    std::string message;
+    try {
+        auto const& callback = output.geometry ? ctx.cb().external_xc_geometry_ : ctx.cb().external_xc_;
+        callback(ctx, input, output);
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    failed |= !std::isfinite(output.energy) || !finite(output.vrho, n) || !finite(output.vgradient, 3 * n) ||
+              !finite(output.vtau, n);
+    if (output.geometry) {
+        auto const& d = *output.geometry;
+        failed |= !input.points || d.coordinates.size() != static_cast<size_t>(input.num_points) ||
+                  d.energy_weights.size() != d.coordinates.size() ||
+                  d.descriptor_weights.size() != d.coordinates.size();
+        if (input.points) {
+            failed |= d.block_centres.size() != input.points->block_centres.size();
+        }
+        for (auto const* v : {&d.coordinates, &d.block_centres}) {
+            for (auto const& r : *v) {
+                failed |= !finite(r.data(), r.size());
+            }
+        }
+        failed |= !finite(d.energy_weights.data(), d.energy_weights.size()) ||
+                  !finite(d.descriptor_weights.data(), d.descriptor_weights.size());
     }
     ctx.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
     if (failed) {
-        RTE_THROW("external XC evaluation failed on a context rank: " + error);
+        RTE_THROW("external XC failed or returned nonfinite output on a context rank: " + message);
     }
-    double lo = out.energy, hi = out.energy;
-    ctx.comm().allreduce<double, mpi::op_t::min>(&lo, 1);
-    ctx.comm().allreduce<double, mpi::op_t::max>(&hi, 1);
-    if (hi - lo > 1e-12 * std::max(1.0, std::max(std::abs(lo), std::abs(hi)))) {
-        RTE_THROW("external XC must return the same globally summed energy on every context rank");
+    double emin = output.energy, emax = output.energy;
+    ctx.comm().allreduce<double, mpi::op_t::min>(&emin, 1);
+    ctx.comm().allreduce<double, mpi::op_t::max>(&emax, 1);
+    if (emax - emin > 1e-12 * std::max(1.0, std::max(std::abs(emin), std::abs(emax)))) {
+        RTE_THROW("external XC must return the same total energy on every context rank");
     }
 }
 
 } // namespace
 
-/// Evaluate the external functional and its variational orbital contribution.
-/** FFT derivatives give v_sigma=dE/drho_sigma-div(dE/dgrad rho_sigma) and
- *  v_tau,sigma=dE/dtau_sigma after division by the grid weight. For arbitrary
- *  points the Fourier sampler applies the adjoint to raw discrete derivatives.
- *  Since tau_sigma=1/2 sum_nk w_k f_nk,sigma |grad psi_nk,sigma|^2,
- *  the orbital Hamiltonian receives -1/2 div(v_tau,sigma grad psi).
- *  Store total/up-minus-down potentials with the inverse spin transformation
- *  so SIRIUS applies the same spin-channel operator in exact and Davidson solves.
- */
+void
+validate_external_xc_context(Simulation_context const& ctx__)
+{
+    if (!ctx__.cb().external_xc_) {
+        return;
+    }
+    if (ctx__.processing_unit() != device_t::CPU) {
+        RTE_THROW("external XC requires CPU execution");
+    }
+    auto const& points = ctx__.cb().external_xc_points_;
+    int point_min = bool(points), point_max = point_min;
+    ctx__.comm().allreduce<int, mpi::op_t::min>(&point_min, 1);
+    ctx__.comm().allreduce<int, mpi::op_t::max>(&point_max, 1);
+    if (point_min != point_max) {
+        RTE_THROW("external XC point/FFT quadrature mode differs between context ranks");
+    }
+    if ((ctx__.full_potential() || ctx__.unit_cell().augment()) && !points) {
+        RTE_THROW("external XC: PAW and full potential require reconstructed point quadrature");
+    }
+    if (ctx__.num_mag_dims() == 3 || ctx__.so_correction()) {
+        RTE_THROW("external XC requires scalar or collinear spin");
+    }
+    if (!ctx__.xc_functionals().empty() || ctx__.cb().veff_) {
+        RTE_THROW("external XC cannot be combined with built-in XC or an effective-potential callback");
+    }
+    if (ctx__.cfg().parameters().veff_pw_cutoff() > 0) {
+        RTE_THROW("external XC does not support an additional potential-only Fourier filter");
+    }
+    if (points) {
+        points->validate(ctx__);
+        if (ctx__.cfg().parameters().use_symmetry()) {
+            RTE_THROW("external XC point quadrature requires disabled crystal symmetry");
+        }
+    }
+    if (ctx__.full_potential()) {
+        if (ctx__.cfg().parameters().precision_wf() != "fp64") {
+            RTE_THROW("external LAPW XC requires fp64 valence orbitals");
+        }
+        if (ctx__.unit_cell().num_core_electrons() != 0 && ctx__.core_relativity() != relativity_t::none &&
+            ctx__.core_relativity() != relativity_t::zora && ctx__.core_relativity() != relativity_t::dirac) {
+            RTE_THROW("external LAPW XC: tau-dependent radial core response requires nonrelativistic, ZORA or "
+                      "Dirac core states");
+        }
+        return;
+    }
+    int failed{0};
+    std::string message;
+    try {
+        for (int iat = 0; iat < ctx__.unit_cell().num_atom_types(); iat++) {
+            auto const& type = ctx__.unit_cell().atom_type(iat);
+            if (type.augment() && !type.is_paw()) {
+                type.check_kinetic_augmentation();
+                if (!points) {
+                    RTE_THROW("external XC: ultrasoft augmentation requires reconstructed point quadrature");
+                }
+            }
+            if (!type.is_paw()) {
+                type.check_ps_core_kinetic_density();
+                if (type.has_ps_core_kinetic_density() && !points) {
+                    RTE_THROW("external XC: nonlinear core correction requires reconstructed point quadrature");
+                }
+            }
+            if (type.is_paw() && (!points || !type.has_paw_core_kinetic_density())) {
+                RTE_THROW("external XC: PAW requires a point quadrature and explicitly supplied positive core tau");
+            }
+        }
+    } catch (std::exception const& e) {
+        failed  = 1;
+        message = e.what();
+    }
+    ctx__.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
+    if (failed) {
+        RTE_THROW("external XC: invalid atomic setup on a context rank: " + message);
+    }
+}
+
 void
 Potential::xc_external(Density const& density__)
 {
+    PROFILE("sirius::Potential::xc_external");
     validate_external_xc_context(ctx_);
-    if (add_delta_rho_xc_ != 0 || add_delta_mag_xc_ != 0) {
-        RTE_THROW("external XC does not support scaled-density diagnostic perturbations");
-    }
-    auto const& points = ctx_.cb().external_xc_points_;
-    std::vector<r3::vector<double>> coordinates;
-    if (points) {
-        for (auto const& p : points->coordinates) {
-            coordinates.emplace_back(p);
-        }
-    }
-    std::unique_ptr<Smooth_periodic_function_sampler> sampler;
-    if (points) {
-        sampler = std::make_unique<Smooth_periodic_function_sampler>(ctx_.gvec(), coordinates);
+    if (ctx_.cb().external_xc_points_) {
+        xc_external_points(density__);
+        return;
     }
     auto& fft = ctx_.spfft<double>();
-    int nr    = points ? static_cast<int>(coordinates.size()) : fft.local_slice_size();
+    int nr    = fft.local_slice_size();
     int ns    = ctx_.num_spins();
-    mdarray<double, 2> rho({nr, ns}), tau({nr, ns});
-    mdarray<double, 3> grad({nr, 3, ns});
-    xc_point_fields_t derivatives(nr, ns);
-    auto& [vrho, vgrad, vtau] = derivatives;
+    mdarray<double, 2> rho({nr, ns}), tau({nr, ns}), vrho({nr, ns}), vtau({nr, ns});
+    mdarray<double, 3> grad({nr, 3, ns}), vgrad({nr, 3, ns});
     vrho.zero();
     vtau.zero();
     vgrad.zero();
-    auto fields = orbital_fields(ctx_, density__);
-    for (int s = 0; s < ns; s++) {
-        auto& r = fields[0][s];
-        auto& t = fields[1][s];
-        if (sampler) {
-            auto sampled_r = sampler->sample(r), sampled_t = sampler->sample(t);
-            for (int p = 0; p < nr; p++) {
-                rho(p, s) = sampled_r[p][0];
-                tau(p, s) = sampled_t[p][0];
-                for (int x = 0; x < 3; x++) {
-                    grad(p, x, s) = sampled_r[p][x + 1];
-                }
-            }
-        } else {
-            auto g = to_rg(gradient(r));
-            r.fft_transform(1);
-            t.fft_transform(1);
-            for (int p = 0; p < nr; p++) {
-                rho(p, s) = r.value(p);
-                tau(p, s) = t.value(p);
-                for (int x = 0; x < 3; x++) {
-                    grad(p, x, s) = g[x].value(p);
-                }
-            }
-        }
-    }
-    std::unique_ptr<PAW_xc_reconstruction> reconstruction;
-    if (ctx_.unit_cell().augment()) {
-        reconstruction = std::make_unique<PAW_xc_reconstruction>(density__, coordinates);
-        reconstruction->add_to(rho, grad, tau);
-    } else if (points) {
-        add_core_fields(ctx_, coordinates, rho, grad, tau);
-    }
-    xc_callback_input_t in{nr,
-                           ns,
-                           unit_cell_.omega() / ctx_.fft_grid().num_points(),
-                           rho.at(memory_t::host),
-                           grad.at(memory_t::host),
-                           tau.at(memory_t::host),
-                           points.get()};
-    xc_callback_output_t out{0, vrho.at(memory_t::host), vgrad.at(memory_t::host), vtau.at(memory_t::host)};
-    evaluate(ctx_, in, out, ctx_.cb().external_xc_);
-    external_xc_energy_ = out.energy;
-    if (reconstruction) {
-        external_projector_d_mtrx_ = reconstruction->projector_matrices(vrho, vgrad, vtau);
-    }
-    kinetic_potential_->zero();
-    // Reuse sampled-field buffers for the spin-channel potentials.
-    auto potentials = std::move(fields);
-    for (int s = 0; s < ns; s++) {
-        auto& v = potentials[0][s];
-        auto& t = potentials[1][s];
-        if (sampler) {
-            std::vector<std::array<double, 4>> dr(nr), dt(nr);
-            for (int p = 0; p < nr; p++) {
-                dr[p] = {vrho(p, s), vgrad(p, 0, s), vgrad(p, 1, s), vgrad(p, 2, s)};
-                dt[p] = {vtau(p, s), 0, 0, 0};
-            }
-            sampler->adjoint(dr, v);
-            sampler->adjoint(dt, t);
-            v.fft_transform(1);
-            t.fft_transform(1);
-        } else {
-            Smooth_periodic_vector_function<double> g(fft, ctx_.gvec_fft_sptr());
-            for (int x = 0; x < 3; x++) {
-                for (int p = 0; p < nr; p++) {
-                    g[x].value(p) = vgrad(p, x, s);
-                }
-                g[x].fft_transform(-1);
-            }
-            auto div = to_rg(divergence(g));
-            for (int p = 0; p < nr; p++) {
-                v.value(p) = vrho(p, s) - div.value(p);
-                t.value(p) = vtau(p, s);
-            }
-        }
-    }
-    for (int p = 0; p < fft.local_slice_size(); p++) {
+
+    for (int ir = 0; ir < nr; ir++) {
+        double n = (1 + add_delta_rho_xc_) *
+                   (density__.rho().rg().value(ir) - ctx_.cfg().parameters().extra_charge() / unit_cell_.omega());
+        double t = density__.kinetic_density().scalar().rg().value(ir);
         if (ns == 1) {
-            xc_potential_->rg().value(p) += potentials[0][0].value(p);
-            kinetic_potential_->scalar().rg().value(p) += potentials[1][0].value(p);
-        } else { // ns == 2: transform spin channels to scalar and magnetic potentials
-            auto v_up = potentials[0][0].value(p), v_dn = potentials[0][1].value(p);
-            auto t_up = potentials[1][0].value(p), t_dn = potentials[1][1].value(p);
-            xc_potential_->rg().value(p) += 0.5 * (v_up + v_dn);
-            effective_magnetic_field(0).rg().value(p) += 0.5 * (v_up - v_dn);
-            kinetic_potential_->scalar().rg().value(p) += 0.5 * (t_up + t_dn);
-            kinetic_potential_->vector(0).rg().value(p) += 0.5 * (t_up - t_dn);
+            rho(ir, 0) = n;
+            tau(ir, 0) = t;
+        } else {
+            auto mz    = (1 + add_delta_mag_xc_) * density__.mag(0).rg().value(ir);
+            auto tz    = density__.kinetic_density().vector(0).rg().value(ir);
+            rho(ir, 0) = 0.5 * (n + mz);
+            rho(ir, 1) = 0.5 * (n - mz);
+            tau(ir, 0) = 0.5 * (t + tz);
+            tau(ir, 1) = 0.5 * (t - tz);
+        }
+    }
+    for (int s = 0; s < ns; s++) {
+        Smooth_periodic_function<double> r(fft, ctx_.gvec_fft_sptr());
+        for (int ir = 0; ir < nr; ir++) {
+            r.value(ir) = rho(ir, s);
+        }
+        r.fft_transform(-1);
+        auto g = to_rg(gradient(r));
+        for (int x = 0; x < 3; x++) {
+            for (int ir = 0; ir < nr; ir++) {
+                grad(ir, x, s) = g[x].value(ir);
+            }
+        }
+    }
+
+    xc_callback_input_t input{nr,
+                              ns,
+                              unit_cell_.omega() / ctx_.fft_grid().num_points(),
+                              rho.at(memory_t::host),
+                              grad.at(memory_t::host),
+                              tau.at(memory_t::host)};
+    xc_callback_output_t output{0, vrho.at(memory_t::host), vgrad.at(memory_t::host), vtau.at(memory_t::host)};
+    evaluate_external_xc(ctx_, input, output);
+    external_xc_energy_ = output.energy;
+    xc_potential_->zero();
+    kinetic_potential_->zero();
+
+    for (int s = 0; s < ns; s++) {
+        Smooth_periodic_vector_function<double> g(fft, ctx_.gvec_fft_sptr());
+        for (int x = 0; x < 3; x++) {
+            for (int ir = 0; ir < nr; ir++) {
+                g[x].value(ir) = vgrad(ir, x, s);
+            }
+            g[x].fft_transform(-1);
+        }
+        auto div = to_rg(divergence(g));
+        for (int ir = 0; ir < nr; ir++) {
+            vrho(ir, s) -= div.value(ir);
+        }
+    }
+    for (int ir = 0; ir < nr; ir++) {
+        if (ns == 1) {
+            xc_potential_->rg().value(ir) += vrho(ir, 0);
+            kinetic_potential_->scalar().rg().value(ir) += vtau(ir, 0);
+        } else {
+            xc_potential_->rg().value(ir) += 0.5 * (vrho(ir, 0) + vrho(ir, 1));
+            effective_magnetic_field(0).rg().value(ir) += 0.5 * (vrho(ir, 0) - vrho(ir, 1));
+            kinetic_potential_->scalar().rg().value(ir) += 0.5 * (vtau(ir, 0) + vtau(ir, 1));
+            kinetic_potential_->vector(0).rg().value(ir) += 0.5 * (vtau(ir, 0) - vtau(ir, 1));
         }
     }
     kinetic_potential_->fft_transform(-1);
 }
 
+void
+Potential::xc_external_points(Density const& density__)
+{
+    PROFILE("sirius::Potential::xc_external_points");
+    if (add_delta_rho_xc_ != 0 || add_delta_mag_xc_ != 0) {
+        RTE_THROW("external XC point reconstruction does not support scaled-density diagnostic perturbations");
+    }
+    auto const& quadrature = *ctx_.cb().external_xc_points_;
+    std::vector<r3::vector<double>> points;
+    for (auto const& r : quadrature.coordinates) {
+        points.push_back({r[0], r[1], r[2]});
+    }
+    int nr      = static_cast<int>(points.size());
+    int ns      = ctx_.num_mag_dims() + 1;
+    auto smooth = external_xc_smooth_fields(ctx_, density__);
+    auto& rho   = smooth[0];
+    auto& tau   = smooth[1];
+    xc_point_fields_t derivatives(nr, ns);
+    auto evaluate = [&](auto const& map) {
+        auto fields = map.sample(rho, tau);
+        derivatives.rho.zero();
+        derivatives.gradient.zero();
+        derivatives.tau.zero();
+        xc_callback_input_t input{nr,
+                                  ns,
+                                  0,
+                                  fields.rho.at(memory_t::host),
+                                  fields.gradient.at(memory_t::host),
+                                  fields.tau.at(memory_t::host),
+                                  &quadrature};
+        xc_callback_output_t output{0, derivatives.rho.at(memory_t::host), derivatives.gradient.at(memory_t::host),
+                                    derivatives.tau.at(memory_t::host)};
+        evaluate_external_xc(ctx_, input, output);
+        return output.energy;
+    };
+    xc_potential_->zero();
+    kinetic_potential_->zero();
+    if (ctx_.full_potential()) {
+        LAPW_xc_field_map map(density__, points);
+        double energy = evaluate(map);
+        set_lapw_xc_derivatives(map.adjoint(derivatives), energy);
+        return;
+    }
+    PAW_xc_field_map map(density__, points);
+    double energy              = evaluate(map);
+    auto adjoint               = map.adjoint(derivatives);
+    external_xc_energy_        = energy;
+    external_projector_d_mtrx_ = std::move(adjoint.local_matrices);
+    for (int s = 0; s < ns; s++) {
+        for (int ig = 0; ig < ctx_.gvec().count(); ig++) {
+            auto v = adjoint.rho[s].f_pw_local(ig) / double(ns);
+            auto t = adjoint.tau[s].f_pw_local(ig) / double(ns);
+            xc_potential_->rg().f_pw_local(ig) += v;
+            kinetic_potential_->scalar().rg().f_pw_local(ig) += t;
+            if (ns == 2) {
+                effective_magnetic_field(0).rg().f_pw_local(ig) += (1.0 - 2 * s) * v;
+                kinetic_potential_->vector(0).rg().f_pw_local(ig) += (1.0 - 2 * s) * t;
+            }
+        }
+    }
+    xc_potential_->rg().fft_transform(1);
+    kinetic_potential_->fft_transform(1);
+    for (int s = 0; s < ctx_.num_mag_dims(); s++) {
+        effective_magnetic_field(s).rg().fft_transform(1);
+    }
+}
+
 xc_geometry_derivatives_t
 Potential::external_xc_geometry(Density const& density__) const
 {
+    if (ctx_.full_potential()) {
+        RTE_THROW("external XC geometry derivatives are not available for FP-LAPW");
+    }
     int failed = !ctx_.cb().external_xc_ || !ctx_.cb().external_xc_points_ || !ctx_.cb().external_xc_geometry_ ||
                  !ctx_.cb().external_xc_pullback_ || !density__.has_kinetic_density() || add_delta_rho_xc_ != 0 ||
                  add_delta_mag_xc_ != 0;
@@ -436,99 +410,40 @@ Potential::external_xc_geometry(Density const& density__) const
         RTE_THROW("external XC geometry requires point, field-geometry and quadrature-pullback callbacks");
     }
     validate_external_xc_context(ctx_);
-    auto const& q = *ctx_.cb().external_xc_points_;
+    auto const& quadrature = *ctx_.cb().external_xc_points_;
     std::vector<r3::vector<double>> points;
-    for (auto const& r : q.coordinates) {
-        points.emplace_back(r);
+    for (auto const& r : quadrature.coordinates) {
+        points.emplace_back(r[0], r[1], r[2]);
     }
-    Smooth_periodic_function_sampler sampler(ctx_.gvec(), points);
-    auto fields = orbital_fields(ctx_, density__);
-    int nr = static_cast<int>(points.size()), ns = ctx_.num_spins();
-    mdarray<double, 2> rho({nr, ns}), tau({nr, ns});
-    mdarray<double, 3> grad({nr, 3, ns});
-    xc_point_fields_t derivatives(nr, ns);
-    auto& [vrho, vgrad, vtau] = derivatives;
-    vrho.zero();
-    vtau.zero();
-    vgrad.zero();
-    for (int s = 0; s < ns; s++) {
-        auto n = sampler.sample(fields[0][s]), t = sampler.sample(fields[1][s]);
-        for (int p = 0; p < nr; p++) {
-            rho(p, s) = n[p][0];
-            tau(p, s) = t[p][0];
-            for (int x = 0; x < 3; x++) {
-                grad(p, x, s) = n[p][x + 1];
-            }
+    auto smooth = external_xc_smooth_fields(ctx_, density__);
+    xc_point_derivatives_t geometry(quadrature);
+    auto evaluate = [&](auto const& map) {
+        auto fields = map.sample(smooth[0], smooth[1]);
+        xc_point_fields_t derivatives(points.size(), ctx_.num_mag_dims() + 1);
+        derivatives.rho.zero();
+        derivatives.gradient.zero();
+        derivatives.tau.zero();
+        xc_callback_input_t input{static_cast<int>(points.size()),
+                                  ctx_.num_mag_dims() + 1,
+                                  0,
+                                  fields.rho.at(memory_t::host),
+                                  fields.gradient.at(memory_t::host),
+                                  fields.tau.at(memory_t::host),
+                                  &quadrature};
+        xc_callback_output_t output{0, derivatives.rho.at(memory_t::host), derivatives.gradient.at(memory_t::host),
+                                    derivatives.tau.at(memory_t::host), &geometry};
+        evaluate_external_xc(ctx_, input, output);
+        return map.geometry_adjoint(smooth[0], smooth[1], derivatives);
+    };
+    auto mapped = evaluate(PAW_xc_field_map(density__, points));
+    for (size_t p = 0; p < points.size(); p++) {
+        for (int x = 0; x < 3; x++) {
+            geometry.coordinates[p][x] += mapped.points[p][x];
         }
     }
-    std::unique_ptr<PAW_xc_reconstruction> reconstruction;
-    if (ctx_.unit_cell().augment()) {
-        reconstruction = std::make_unique<PAW_xc_reconstruction>(density__, points);
-        reconstruction->add_to(rho, grad, tau);
-    } else {
-        add_core_fields(ctx_, points, rho, grad, tau);
-    }
-    xc_point_derivatives_t d(q);
-    xc_callback_input_t in{nr, ns, 0, rho.at(memory_t::host), grad.at(memory_t::host), tau.at(memory_t::host), &q};
-    xc_callback_output_t out{0, vrho.at(memory_t::host), vgrad.at(memory_t::host), vtau.at(memory_t::host), &d};
-    evaluate(ctx_, in, out, ctx_.cb().external_xc_geometry_);
-    r3::matrix<double> lattice;
-    for (int s = 0; s < ns; s++) {
-        std::vector<std::array<double, 4>> dn(nr), dt(nr);
-        for (int p = 0; p < nr; p++) {
-            dn[p] = {vrho(p, s), vgrad(p, 0, s), vgrad(p, 1, s), vgrad(p, 2, s)};
-            dt[p] = {vtau(p, s), 0, 0, 0};
-        }
-        auto n = sampler.geometry_adjoint(fields[0][s], dn), t = sampler.geometry_adjoint(fields[1][s], dt);
-        lattice += n.lattice + t.lattice;
-        for (int p = 0; p < nr; p++) {
-            for (int x = 0; x < 3; x++) {
-                d.coordinates[p][x] += n.points[p][x] + t.points[p][x];
-            }
-        }
-    }
-    int nat = unit_cell_.num_atoms();
-    mdarray<double, 2> core_atoms({3, nat});
-    core_atoms.zero();
-    r3::matrix<double> core_lattice;
-    // For d = r_p - R_a - A n, the point derivative is the radial gradient
-    // contraction plus H(rho_core) times the gradient covector. The atom
-    // derivative has the opposite sign, and the cell derivative is -dE/dd * n^T.
-    if (reconstruction) {
-        auto local = reconstruction->geometry_adjoint(derivatives);
-        core_atoms = std::move(local.atoms);
-        lattice += local.lattice;
-        for (int p = 0; p < nr; p++) {
-            for (int x = 0; x < 3; x++) {
-                d.coordinates[p][x] += local.points[p][x];
-            }
-        }
-    } else {
-        for_each_core_sample(
-                ctx_, points,
-                [&](auto p, int ia, auto const& image, double r, auto const& u, auto const& n, auto const& t) {
-                    r3::vector<double> v{0, 0, 0};
-                    double transverse = n[1] / r;
-                    for (int s = 0; s < ns; s++) {
-                        r3::vector<double> g{vgrad(p, 0, s), vgrad(p, 1, s), vgrad(p, 2, s)};
-                        double radial = vrho(p, s) * n[1] + vtau(p, s) * t[1] + (n[2] - transverse) * r3::dot(g, u);
-                        v += (1.0 / ns) * (radial * u + transverse * g);
-                    }
-                    for (int x = 0; x < 3; x++) {
-                        d.coordinates[p][x] += v[x];
-                        core_atoms(x, ia) -= v[x];
-                        for (int y = 0; y < 3; y++) {
-                            core_lattice(x, y) -= v[x] * image[y];
-                        }
-                    }
-                });
-        ctx_.comm().allreduce(core_atoms.at(memory_t::host), core_atoms.size());
-        ctx_.comm().allreduce(&core_lattice(0, 0), 9);
-        lattice += core_lattice;
-    }
-    xc_geometry_derivatives_t result(nat);
+    xc_geometry_derivatives_t result(unit_cell_.num_atoms());
     try {
-        ctx_.cb().external_xc_pullback_(ctx_, q, d, result);
+        ctx_.cb().external_xc_pullback_(ctx_, quadrature, geometry, result);
     } catch (std::exception const&) {
         failed = 1;
     }
@@ -537,36 +452,34 @@ Potential::external_xc_geometry(Density const& density__) const
     for (auto const& atom : result.atoms) {
         values.insert(values.end(), atom.begin(), atom.end());
     }
-    for (double x : values) {
-        failed |= !std::isfinite(x);
+    for (double value : values) {
+        failed |= !std::isfinite(value);
     }
     ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
     if (failed) {
-        RTE_THROW("external XC quadrature pullback returned invalid geometry derivatives");
+        RTE_THROW("external XC quadrature pullback failed or returned invalid derivatives on a context rank");
     }
     auto minimum = values, maximum = values;
     ctx_.comm().allreduce<double, mpi::op_t::min>(minimum.data(), minimum.size());
     ctx_.comm().allreduce<double, mpi::op_t::max>(maximum.data(), maximum.size());
     for (size_t i = 0; i < values.size(); i++) {
-        if (maximum[i] - minimum[i] > 1e-12 * std::max(1.0, std::abs(minimum[i]))) {
+        if (maximum[i] - minimum[i] > 1e-12 * std::max({1.0, std::abs(minimum[i]), std::abs(maximum[i])})) {
             RTE_THROW("external XC quadrature pullback must return globally summed derivatives on every rank");
         }
     }
-    for (int j = 0; j < 3; j++) {
-        for (int i = 0; i < 3; i++) {
-            result.lattice[i + 3 * j] += lattice(i, j);
-            failed |= !std::isfinite(result.lattice[i + 3 * j]);
-        }
-    }
-    for (int ia = 0; ia < nat; ia++) {
-        for (int x = 0; x < 3; x++) {
-            result.atoms[ia][x] += core_atoms(x, ia);
+    for (int x = 0; x < 3; x++) {
+        for (int ia = 0; ia < unit_cell_.num_atoms(); ia++) {
+            result.atoms[ia][x] += mapped.atoms(x, ia);
             failed |= !std::isfinite(result.atoms[ia][x]);
+        }
+        for (int y = 0; y < 3; y++) {
+            result.lattice[x + 3 * y] += mapped.lattice(x, y);
+            failed |= !std::isfinite(result.lattice[x + 3 * y]);
         }
     }
     ctx_.comm().allreduce<int, mpi::op_t::max>(&failed, 1);
     if (failed) {
-        RTE_THROW("external XC geometry returned nonfinite derivatives");
+        RTE_THROW("external XC geometry returned nonfinite combined derivatives");
     }
     return result;
 }

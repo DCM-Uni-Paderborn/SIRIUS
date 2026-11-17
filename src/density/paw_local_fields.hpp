@@ -63,7 +63,7 @@ class PAW_local_fields
         , lmax_(2 * type_.indexr().lmax())
         , gaunt_(type_.indexr().lmax(), lmax_, type_.indexr().lmax(), SHT::gaunt_rrr)
         , tau_(type_.radial_grid(), type_.indexb(), ae_ ? type_.ae_paw_wfs_array() : type_.ps_paw_wfs_array(), lmax_,
-               radial_wave_function_t::r_times_R, radial_sizes(type_, ae_))
+               radial_wave_function_t::r_times_R, radial_sizes(type_, ae_), {}, type_.spin_orbit_coupling())
     {
     }
 
@@ -126,7 +126,7 @@ class PAW_local_fields
                 }
                 for (int ir = 0; ir < grid.num_points(); ir++) {
                     double core_spins = spinor ? 1 : ns;
-                    rho(0, ir) += (static_cast<size_t>(ir) < core.size() ? core[ir] : 0) / (core_spins * y00);
+                    rho(0, ir) += (core.empty() ? 0 : core[ir]) / (core_spins * y00);
                     double t = ae_ ? type_.paw_ae_core_kinetic_density()[ir]
                                    : (type_.has_ps_core_kinetic_density() ? type_.ps_core_kinetic_density()[ir] : 0);
                     tau(0, ir) += t / (core_spins * y00);

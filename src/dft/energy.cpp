@@ -82,10 +82,12 @@ energy_vha(Potential const& potential)
 double
 energy_bxc(Density const& density, Potential const& potential)
 {
+    potential.require_xc_energy();
     double ebxc{0};
     for (int j = 0; j < density.ctx().num_mag_dims(); j++) {
         ebxc += sirius::inner(density.mag(j), potential.effective_magnetic_field(j));
     }
+    ebxc += potential.lapw_xc_contractions(density).magnetic;
     return ebxc;
 }
 
@@ -107,11 +109,12 @@ energy_enuc(Simulation_context const& ctx, Potential const& potential)
 double
 energy_vloc(Density const& density, Potential const& potential)
 {
-    double result = sirius::inner(potential.local_potential(), density.rho().rg());
-    if (density.ctx().cb().external_xc_) {
-        result -= density.ctx().cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
+    double energy   = sirius::inner(potential.local_potential(), density.rho().rg());
+    auto const& ctx = density.ctx();
+    if (ctx.cb().external_xc_ && !ctx.full_potential() && ctx.cfg().parameters().extra_charge() != 0) {
+        energy -= ctx.cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
     }
-    return result;
+    return energy;
 }
 
 double
@@ -123,13 +126,16 @@ eval_sum(Density const& density, K_point_set const& kset)
 double
 energy_veff(Density const& density, Potential const& potential)
 {
-    double result = sirius::inner(density.rho(), potential.effective_potential()) -
-                    potential.external_xc_background_contraction() + potential.energy_external_augmentation(density);
-    if (density.ctx().cb().external_xc_) {
-        // The Hartree potential has zero cell average; the remaining background is the local PP term.
-        result -= density.ctx().cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
+    potential.require_xc_energy();
+    double energy   = sirius::inner(density.rho(), potential.effective_potential()) +
+                      potential.lapw_xc_contractions(density).rho - potential.external_xc_background_contraction() +
+                      potential.energy_external_augmentation(density);
+    auto const& ctx = density.ctx();
+    if (ctx.cb().external_xc_ && !ctx.full_potential() && ctx.cfg().parameters().extra_charge() != 0) {
+        // Hartree has zero G=0; the remaining background is the local PP term.
+        energy -= ctx.cfg().parameters().extra_charge() * potential.local_potential().f_0().real();
     }
-    return result;
+    return energy;
 }
 
 double
@@ -161,14 +167,14 @@ ks_energy(Simulation_context const& ctx, std::map<std::string, double> const& en
             if (ctx.hubbard_correction()) {
                 tot_en += energies.at("hubbard_energy") - energies.at("hubbard_one_el_contribution");
             }
-            if (ctx.cfg().parameters().dftd3_correction()) {
-                tot_en += energies.at("dftd3_energy");
-            }
-            if (ctx.cfg().parameters().dftd4_correction()) {
-                tot_en += energies.at("dftd4_energy");
-            }
             break;
         }
+    }
+    if (ctx.cfg().parameters().dftd3_correction()) {
+        tot_en += energies.at("dftd3_energy");
+    }
+    if (ctx.cfg().parameters().dftd4_correction()) {
+        tot_en += energies.at("dftd4_energy");
     }
 
     return tot_en;
@@ -231,7 +237,7 @@ total_energy_components(Simulation_context const& ctx, K_point_set const& kset, 
     }
 
     table["entropy"] = kset.entropy_sum();
-    if (potential.has_kinetic_potential()) {
+    if (potential.has_kinetic_potential() || potential.lapw_xc_derivatives()) {
         table["vtau"] = potential.energy_vtau(density);
     }
 

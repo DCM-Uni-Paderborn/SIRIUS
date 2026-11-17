@@ -14,6 +14,7 @@
 #ifndef __DFT_GROUND_STATE_HPP__
 #define __DFT_GROUND_STATE_HPP__
 
+#include <array>
 #include "k_point/k_point_set.hpp"
 #include "core/json.hpp"
 #include "hubbard/hubbard.hpp"

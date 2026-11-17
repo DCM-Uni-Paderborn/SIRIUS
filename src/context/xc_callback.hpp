@@ -1,4 +1,5 @@
 /* This file is part of SIRIUS electronic structure library.
+ *
  * Copyright (c), ETH Zurich. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -6,25 +7,27 @@
 #ifndef __XC_CALLBACK_HPP__
 #define __XC_CALLBACK_HPP__
 
-#include <array>
 #include <functional>
 #include <memory>
+#include <array>
 #include <vector>
 
 namespace sirius {
 
 class Simulation_context;
 
-/// A fixed quadrature with each complete atom block owned by one context rank.
-/** Coordinates and block centres are Cartesian bohr. Energy and descriptor
- *  weights are independent inputs and do not scale the physical fields.
- *  Construct after defining the cell and atoms. Changing the geometry requires
- *  a new point set. Registration copies the arrays into the context.
+/// A fixed distributed quadrature, grouped into complete local atom blocks.
+/** Coordinates and block centres are Cartesian bohr. Blocks and their rows
+ *  belong to exactly one context rank, independent of FFT replicas. Energy and
+ *  descriptor weights are distinct and never multiply the physical fields.
+ *  Construct after defining the cell/atoms, populate the arrays, then register
+ *  as immutable callback state. Geometry changes require a new point set.
  */
 struct xc_point_set_t
 {
     std::vector<std::array<double, 3>> coordinates;
-    std::vector<double> energy_weights, descriptor_weights;
+    std::vector<double> energy_weights;
+    std::vector<double> descriptor_weights;
     std::vector<int> block_sizes;
     std::vector<std::array<double, 3>> block_centres;
 
@@ -37,64 +40,77 @@ struct xc_point_set_t
     std::vector<std::array<double, 3>> atoms_;
 };
 
-/// Physical orbital fields on the local FFT slab or supplied point rows.
-/** Atomic units, Fortran shapes (num_points,num_spins) for rho and tau and
- *  (num_points,3,num_spins) for gradient. One spin means total fields, two
- *  mean up/down fields. No clipping, renormalization or quadrature weighting
- *  is applied. The neutralizing charged-cell background is excluded.
- *  All context ranks participate, including ranks with no local points.
+/// Primitive fields on the local FFT slab or explicit point rows, in atomic units.
+/** Scalar arrays have Fortran shape (num_points, num_spins), gradients
+ *  (num_points, 3, num_spins). One spin component denotes total density/tau,
+ *  two components denote up/down. The neutralizing PP background is excluded.
+ *  No density clipping or renormalization is applied.
+ *  The context supplies the cell, atoms, FFT layout and communicators.
  */
 struct xc_callback_input_t
 {
-    int num_points, num_spins;
+    int num_points;
+    int num_spins;
     double point_weight;
     double const* rho;
     double const* gradient;
     double const* tau;
-    /// Non-null for supplied points. point_weight is then unused.
+    /// Non-null for arbitrary points. point_weight is then unused.
     xc_point_set_t const* points{nullptr};
 };
 
-/// Local derivatives of the discrete energy with respect to independent quadrature inputs.
-/** All explicit atom/cell dependence of the evaluator must enter through these
- *  inputs, rather than through hidden context-dependent terms in the energy.
- */
+/// Local raw derivatives with respect to the independent quadrature inputs.
 struct xc_point_derivatives_t
 {
     std::vector<std::array<double, 3>> coordinates, block_centres;
     std::vector<double> energy_weights, descriptor_weights;
 
-    explicit xc_point_derivatives_t(xc_point_set_t const& points)
-        : coordinates(points.coordinates.size())
-        , block_centres(points.block_centres.size())
-        , energy_weights(points.energy_weights.size())
-        , descriptor_weights(points.descriptor_weights.size())
+    explicit xc_point_derivatives_t(xc_point_set_t const& points__)
+        : coordinates(points__.coordinates.size())
+        , block_centres(points__.block_centres.size())
+        , energy_weights(points__.energy_weights.size())
+        , descriptor_weights(points__.descriptor_weights.size())
     {
     }
 };
 
-/// Globally summed dE/dR and dE/dA, with Cartesian atoms fixed in the cell derivative.
-/** Lattice vectors are columns. No force sign or volume normalization is applied. */
+/// Globally summed energy derivatives, not force or stress components.
+/** Cell columns vary at fixed Cartesian atoms. No sign or volume factor applies. */
 struct xc_geometry_derivatives_t
 {
     std::vector<std::array<double, 3>> atoms;
     std::array<double, 9> lattice{};
 
-    explicit xc_geometry_derivatives_t(int num_atoms)
-        : atoms(num_atoms)
+    explicit xc_geometry_derivatives_t(int num_atoms__)
+        : atoms(num_atoms__)
     {
     }
 };
 
-/// Globally reduced XC energy and its local primitive-field derivatives.
-/** For a possibly nonlocal discrete energy E=F({rho_p,g_p,tau_p},weights),
- *  the point callback returns raw dE/drho_p, dE/dg_p and dE/dtau_p.
- *  The FFT callback returns these derivatives divided by the uniform grid
- *  weight. Return the same total energy on every context rank. Derivatives
- *  have the input shapes and are initially zero. They must include all
- *  cross-point and cross-rank dependencies of F, including contributions at
- *  zero energy-weight points. SIRIUS applies the sampling/gradient adjoint
- *  and -1/2 div(v_tau grad(psi)); the evaluator must not apply them itself.
+/// Replicated Cartesian atom and lattice-column directions, in bohr.
+/** Atom and cell directions are independent; no affine atom displacement is implied. */
+struct xc_geometry_direction_t
+{
+    std::vector<std::array<double, 3>> atoms;
+    std::array<double, 9> lattice{};
+
+    explicit xc_geometry_direction_t(int num_atoms__)
+        : atoms(num_atoms__)
+    {
+    }
+};
+
+/// Total XC energy and primitive-field derivatives.
+/** energy is the same globally reduced energy on every context rank.
+ *  For the FFT callback, derivatives are divided by the grid quadrature weight.
+ *  With input.points != nullptr, return raw discrete covectors, NOT derivatives
+ *  divided by a quadrature weight. Zero energy-weight rows may have nonzero
+ *  derivatives through the nonlocal descriptors.
+ *  vrho/vtau and vgradient have the corresponding input shapes.
+ *  The caller initializes all outputs to zero.
+ *  A nonlocal evaluator must return derivatives of the entire discrete energy,
+ *  not derivatives of independent local energy terms. SIRIUS applies the
+ *  gradient adjoint and the tau operator; the callback must not apply them.
  */
 struct xc_callback_output_t
 {
@@ -102,17 +118,15 @@ struct xc_callback_output_t
     double* vrho;
     double* vgradient;
     double* vtau;
-    /// Present only during geometry evaluation. Physical fields and quadrature inputs are independent.
+    /// Non-null only for the geometry callback. Fields and weights are independent inputs.
     xc_point_derivatives_t* geometry{nullptr};
 };
 
-/// Register before constructing Density/Potential and retain throughout SCF.
+/// Called collectively on the context communicator, including empty local work.
+/** Register before constructing Density/Potential and keep it fixed during SCF. */
 using xc_callback_t = std::function<void(Simulation_context const&, xc_callback_input_t const&, xc_callback_output_t&)>;
 
-/// Contract local point covectors with the host's quadrature derivatives.
-/** Includes the SIRIUS field-sampling contribution to the coordinate covectors.
- *  Return replicated Cartesian atom/cell energy derivatives, summing each point once.
- */
+/// Pull back local point covectors, including field sampling, to replicated atom/cell derivatives.
 using xc_quadrature_pullback_t = std::function<void(Simulation_context const&, xc_point_set_t const&,
                                                     xc_point_derivatives_t const&, xc_geometry_derivatives_t&)>;
 
@@ -120,4 +134,5 @@ void
 validate_external_xc_context(Simulation_context const& ctx__);
 
 } // namespace sirius
+
 #endif

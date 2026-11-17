@@ -45,6 +45,36 @@ accumulate_pw_diag(mdarray<T, 2>& diag__, matrix<std::complex<T>> const& beta_gk
     }
 }
 
+// d(A* M A) = dA* M A + A* dM A + A* M dA, including LO identity blocks.
+template <typename T>
+void
+add_lapw_atom_matrix_response(mdarray<std::complex<T>, 2> const& row__, mdarray<std::complex<T>, 2> const& col__,
+                              mdarray<std::complex<T>, 2> const& drow__, mdarray<std::complex<T>, 2> const& dcol__,
+                              mdarray<std::complex<T>, 2> const& mt__, mdarray<std::complex<T>, 2> const* delta__,
+                              la::dmatrix<std::complex<T>>& out__)
+{
+    int nr = row__.size(0), nc = col__.size(0), nb = mt__.size(0);
+    mdarray<std::complex<T>, 2> work({nr, nb});
+    auto const one = la::constant<std::complex<T>>::one(), zero = la::constant<std::complex<T>>::zero();
+    la::wrap(la::lib_t::blas)
+            .gemm('N', 'N', nr, nb, nb, &one, row__.at(memory_t::host), row__.ld(), mt__.at(memory_t::host), mt__.ld(),
+                  &zero, work.at(memory_t::host), work.ld());
+    la::wrap(la::lib_t::blas)
+            .gemm('N', 'T', nr, nc, nb, &one, work.at(memory_t::host), work.ld(), dcol__.at(memory_t::host),
+                  dcol__.ld(), &one, out__.at(memory_t::host), out__.ld());
+    la::wrap(la::lib_t::blas)
+            .gemm('N', 'N', nr, nb, nb, &one, drow__.at(memory_t::host), drow__.ld(), mt__.at(memory_t::host),
+                  mt__.ld(), &zero, work.at(memory_t::host), work.ld());
+    if (delta__) {
+        la::wrap(la::lib_t::blas)
+                .gemm('N', 'N', nr, nb, nb, &one, row__.at(memory_t::host), row__.ld(), delta__->at(memory_t::host),
+                      delta__->ld(), &one, work.at(memory_t::host), work.ld());
+    }
+    la::wrap(la::lib_t::blas)
+            .gemm('N', 'T', nr, nc, nb, &one, work.at(memory_t::host), work.ld(), col__.at(memory_t::host), col__.ld(),
+                  &one, out__.at(memory_t::host), out__.ld());
+}
+
 } // namespace
 
 template <typename T>
@@ -216,7 +246,7 @@ Hamiltonian_k<T>::get_h_o_diag_lapw() const
         if (what & 1) {
             auto gvc      = kp_.gkvec().gkvec_cart(gvec_index_t::local(igloc));
             T ekin        = 0.5 * dot(gvc, gvc);
-            h_diag[igloc] = H0_.local_op().v0(0) + ekin * ctx.theta_pw(0).real();
+            h_diag[igloc] = H0_.local_op().v0(0) + ekin * (ctx.theta_pw(0).real() + H0_.local_op().vtau0(0));
         }
         if (what & 2) {
             o_diag[igloc] = ctx.theta_pw(0).real();
@@ -344,7 +374,8 @@ Hamiltonian_k<T>::get_h_o_diag_lapw() const
 
 template <typename T>
 void
-Hamiltonian_k<T>::set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const
+Hamiltonian_k<T>::set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                             bool physical_overlap__) const
 {
     PROFILE("sirius::Hamiltonian_k::set_fv_h_o");
 
@@ -483,10 +514,10 @@ Hamiltonian_k<T>::set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::
                 }
 
                 /* setup apw-lo and lo-apw blocks */
-                set_fv_h_o_apw_lo(atom, ia, ispn__, alm_row_atom, alm_col_atom, h__, o__);
+                set_fv_h_o_apw_lo(atom, ia, ispn__, alm_row_atom, alm_col_atom, h__, o__, physical_overlap__);
 
                 /* finally, modify alm coefficients for iora */
-                if (H0_.ctx().valence_relativity() == relativity_t::iora) {
+                if (H0_.ctx().valence_relativity() == relativity_t::iora && !physical_overlap__) {
                     // TODO: check if we can modify alm_col with IORA eralier and then not apply it in
                     // set_fv_h_o_apw_lo()
                     H0_.add_o1mt_to_apw(atom, rb, kp_.num_gkvec_col(), alm_col_atom);
@@ -538,10 +569,10 @@ Hamiltonian_k<T>::set_fv_h_o(int ispn__, la::dmatrix<std::complex<T>>& h__, la::
     }
 
     /* add interstitial contributon */
-    set_fv_h_o_it(ispn__, h__, o__);
+    set_fv_h_o_it(ispn__, h__, o__, physical_overlap__);
 
     /* setup lo-lo block */
-    set_fv_h_o_lo_lo(ispn__, h__, o__);
+    set_fv_h_o_lo_lo(ispn__, h__, o__, physical_overlap__);
 
     /*  copy back to GPU */ // TODO: optimize the copies
     // if (pu == device_t::GPU) {
@@ -557,7 +588,7 @@ template <typename T>
 void
 Hamiltonian_k<T>::set_fv_h_o_apw_lo(Atom const& atom__, int ia__, int ispn__, mdarray<std::complex<T>, 2>& alm_row__,
                                     mdarray<std::complex<T>, 2>& alm_col__, mdarray<std::complex<T>, 2>& h__,
-                                    mdarray<std::complex<T>, 2>& o__) const
+                                    mdarray<std::complex<T>, 2>& o__, bool physical_overlap__) const
 {
     auto& type     = atom__.type();
     auto const& rb = H0_.lapw_basis().radial_basis(atom_index_t::global(ia__));
@@ -585,7 +616,7 @@ Hamiltonian_k<T>::set_fv_h_o_apw_lo(Atom const& atom__, int ia__, int ispn__, md
         for (int order1 = 0; order1 < type.aw_order(l); order1++) {
             int xi1 = type.indexb().index_by_lm_order(lm, order1);
             T ori   = rb.o_radial_integral(l, order1, order);
-            if (H0_.ctx().valence_relativity() == relativity_t::iora) {
+            if (H0_.ctx().valence_relativity() == relativity_t::iora && !physical_overlap__) {
                 auto idxrf1 = type.indexr().index_of(angular_momentum(l), order1);
                 ori += rb.o1_radial_integral(idxrf1, idxrf);
             }
@@ -628,7 +659,7 @@ Hamiltonian_k<T>::set_fv_h_o_apw_lo(Atom const& atom__, int ia__, int ispn__, md
         for (int order1 = 0; order1 < type.aw_order(l); order1++) {
             int xi1 = type.indexb().index_by_lm_order(lm, order1);
             T ori   = rb.o_radial_integral(l, order, order1);
-            if (H0_.ctx().valence_relativity() == relativity_t::iora) {
+            if (H0_.ctx().valence_relativity() == relativity_t::iora && !physical_overlap__) {
                 int idxrf1 = type.indexr().index_of(angular_momentum(l), order1);
                 ori += rb.o1_radial_integral(idxrf, idxrf1);
             }
@@ -642,8 +673,8 @@ Hamiltonian_k<T>::set_fv_h_o_apw_lo(Atom const& atom__, int ia__, int ispn__, md
 
 template <typename T>
 void
-Hamiltonian_k<T>::set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__,
-                                   la::dmatrix<std::complex<T>>& o__) const
+Hamiltonian_k<T>::set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                                   bool physical_overlap__) const
 {
     PROFILE("sirius::Hamiltonian_k::set_fv_h_o_lo_lo");
 
@@ -677,7 +708,7 @@ Hamiltonian_k<T>::set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__
                     int order2 = kp.lo_basis_descriptor_col(icol).order;
                     o__(kp.num_gkvec_row() + irow, kp.num_gkvec_col() + icol) +=
                             rb.o_radial_integral(l, order1, order2);
-                    if (H0_.ctx().valence_relativity() == relativity_t::iora) {
+                    if (H0_.ctx().valence_relativity() == relativity_t::iora && !physical_overlap__) {
                         auto idxrf1 = atom.type().indexr().index_of(angular_momentum(l), order1);
                         auto idxrf2 = atom.type().indexr().index_of(angular_momentum(l), order2);
                         o__(kp.num_gkvec_row() + irow, kp.num_gkvec_col() + icol) +=
@@ -691,7 +722,8 @@ Hamiltonian_k<T>::set_fv_h_o_lo_lo(int ispn__, la::dmatrix<std::complex<T>>& h__
 
 template <typename T>
 void
-Hamiltonian_k<T>::set_fv_h_o_it(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__) const
+Hamiltonian_k<T>::set_fv_h_o_it(int ispn__, la::dmatrix<std::complex<T>>& h__, la::dmatrix<std::complex<T>>& o__,
+                                bool physical_overlap__) const
 {
     PROFILE("sirius::Hamiltonian_k::set_fv_h_o_it");
 
@@ -715,10 +747,15 @@ Hamiltonian_k<T>::set_fv_h_o_it(int ispn__, la::dmatrix<std::complex<T>>& h__, l
 
             /* pw kinetic energy */
             double t1 = 0.5 * r3::dot(gkvec_row_cart, gkvec_col_cart);
+            if (H0().potential().lapw_xc_derivatives()) {
+                h__(igk_row, igk_col) += t1 * H0().vtau_pw(ig12, ispn__);
+            }
 
             switch (H0().ctx().valence_relativity()) {
                 case relativity_t::iora: {
-                    o__(igk_row, igk_col) += t1 * sq_alpha_half * H0().rm2_inv_pw(ig12);
+                    if (!physical_overlap__) {
+                        o__(igk_row, igk_col) += t1 * sq_alpha_half * H0().rm2_inv_pw(ig12);
+                    }
                 }
                 case relativity_t::zora: {
                     h__(igk_row, igk_col) += t1 * H0().rm_inv_pw(ig12);

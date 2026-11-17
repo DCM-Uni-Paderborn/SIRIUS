@@ -51,6 +51,14 @@ end interface
 
 contains
 
+!> Borrow the C API handle. It remains owned by the ground-state wrapper.
+function sirius_get_ground_state_handle(handler) result(res)
+    implicit none
+    type(sirius_ground_state_handler), intent(in) :: handler
+    type(C_PTR) :: res
+    res = handler%handler_ptr_
+end function sirius_get_ground_state_handle
+
 !> Internal function that adds trailing null character to the string to make it C-style.
 function string_f2c(f_string) result(res)
     implicit none
@@ -3734,7 +3742,7 @@ call sirius_generate_coulomb_potential_aux(gs_handler_ptr,vh_el_ptr,error_code_p
 end subroutine sirius_generate_coulomb_potential
 
 !
-!> @brief Generate XC potential using LibXC
+!> @brief Generate XC potential using LibXC or the registered external evaluator.
 !> @param [in] gs_handler Ground state handler
 !> @param [out] error_code Error code
 subroutine sirius_generate_xc_potential(gs_handler,error_code)
@@ -7115,7 +7123,7 @@ call sirius_set_xc_callback_aux(handler_ptr,fptr,user_data,error_code_ptr)
 end subroutine sirius_set_xc_callback
 
 !
-!> @brief Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature before initializing the context, after defining all atoms and lattice vectors. These are real-space integration points, not k points. SIRIUS reconstructs the fields from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. SIRIUS maps these derivatives back to the PW Hamiltonian. Each complete atom block is owned once across the context communicator. Empty local arrays are permitted. The callback has the C signature void callback(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, double* energy, double* drho, double* dgradient, double* dtau, int* status). Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr. Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units. ns=1 denotes total fields and ns=2 up/down fields. Weights do not scale the physical fields. Return the same globally summed energy on every rank and raw derivatives of the complete discrete energy, including nonlocal descriptor contributions and weights. Do not divide by quadrature weights or apply the sampling/gradient adjoint in the callback. Output arrays and status are initially zero. On failure set status nonzero after completing callback collectives. Never unwind across the C ABI. The caller retains user_data until the context is destroyed. Supports CPU scalar/collinear fp64 norm-conserving, PAW and ultrasoft calculations without SOC or symmetry reduction. PAW requires setup-consistent AE core tau. Ultrasoft requires the independent kinetic augmentation tables. For nonlinear core correction, supply the matching spin-summed pseudo-core kinetic density as ps_core_tau or core_kinetic_density in the pseudopotential JSON. SIRIUS adds both frozen-core fields before evaluation. Forces and stress require the additional point geometry callbacks.
+!> @brief Collectively register a reconstructed-field XC evaluator and copy its fixed point quadrature before initializing the context, after defining all atoms and lattice vectors. These are real-space integration points, not k points. SIRIUS reconstructs the fields from its orbitals. The caller evaluates XC in the same process and returns the energy and primitive-field derivatives. SIRIUS maps these derivatives back to the PW, PAW or LAPW Hamiltonian. Each complete atom block is owned once across the context communicator. Empty local arrays are permitted. The callback has the C signature void callback(void* user_data, int nr, int ns, int nb, int fcomm, const double* coordinates, const double* energy_weights, const double* descriptor_weights, const int* block_sizes, const double* block_centres, const double* rho, const double* gradient, const double* tau, double* energy, double* drho, double* dgradient, double* dtau, int* status). Coordinates and block centres have Fortran shapes (3,nr) and (3,nb) in bohr. Fields have shapes (nr,ns), (nr,3,ns), (nr,ns) in atomic units, with ns=1 total fields or ns=2 up/down fields. The energy and descriptor weights do not scale those fields. Return raw covectors of the complete discrete energy, including model weights, without dividing by quadrature weights or applying host adjoints. Return the same globally summed energy on every rank, including empty ranks. Arrays and status are initially zero. Set status nonzero on failure after completing callback collectives. Never unwind across the C ABI. The caller retains user_data until the context is destroyed. Geometry changes invalidate the supplied quadrature. Disable crystal symmetry for point XC. Ultrasoft setups additionally supply independent r^2 T_ij^L tables. PW, PAW and ultrasoft are supported on CPU. PAW and nonlinear core corrections require explicitly supplied positive core tau. FP-LAPW fields are supported on CPU with scalar-relativistic radial functions. PW, PAW and ultrasoft forces and stress require the point geometry callbacks. FP-LAPW supports energy and orbital derivatives, but not forces or stress. Explicit cores support NR, ZORA and Dirac relativity.
 !> @param [in] handler Simulation context handler.
 !> @param [in] fptr C-interoperable point callback. Null disables external XC.
 !> @param [in] user_data Opaque callback state, which may be null.

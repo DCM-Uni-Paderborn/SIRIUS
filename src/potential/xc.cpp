@@ -569,15 +569,16 @@ Potential::xc(Density const& density__)
 {
     PROFILE("sirius::Potential::xc");
 
+    if (bool(ctx_.cb().external_xc_) != external_xc_registered_) {
+        RTE_THROW("external XC registration cannot change after constructing the potential");
+    }
+
     /* zero all fields */
     xc_potential_->zero();
     xc_energy_density_->zero();
 
     for (int i = 0; i < ctx_.num_mag_dims(); i++) {
         effective_magnetic_field(i).zero();
-    }
-    if (bool(ctx_.cb().external_xc_) != external_xc_registered_) {
-        RTE_THROW("external XC registration cannot change during SCF");
     }
     if (external_xc_registered_) {
         xc_external(density__);
