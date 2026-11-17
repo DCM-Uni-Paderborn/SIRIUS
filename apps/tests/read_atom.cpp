@@ -33,8 +33,8 @@ read_atom(cmd_args const& args__)
         for (int i = 0; i < atype.radial_grid().num_points(); i++) {
             veff[i] = -atype.zn() / atype.radial_grid().x(i);
         }
-        lapw_radial_basis_t rb{atype, relativity_t::none, veff};
-        rb.find_enu();
+        lapw_radial_basis_t rb{0, atype, relativity_t::none, veff};
+        rb.find_enu(relativity_t::none);
         rb.generate_radial_functions();
         rb.check_lo_linear_independence(1e-5);
     }
